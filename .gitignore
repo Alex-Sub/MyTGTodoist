@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtualenv
+.venv/
+venv/
+
+# Env & secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Logs
+logs/
+*.log
+
+# OS / IDE
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Build / temp
+temp/
+tmp/
+*.zip
+
+# Local data
+data/
