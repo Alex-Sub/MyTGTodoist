@@ -1,0 +1,47 @@
+[tool.poetry]
+name = "todo-telegram-calendar"
+version = "0.1.0"
+description = "Personal Todo manager with Telegram, Google Calendar sync and Excel export"
+authors = ["Alexey Subbotin"]
+readme = "README.md"
+packages = [{ include = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+
+# Web / API
+fastapi = "^0.111.0"
+uvicorn = { extras = ["standard"], version = "^0.30.0" }
+
+# Telegram
+aiogram = "^3.5.0"
+
+# Config & logging
+python-dotenv = "^1.0.1"
+pydantic-settings = "^2.3.0"
+loguru = "^0.7.2"
+
+# Database
+sqlalchemy = "^2.0.30"
+alembic = "^1.13.1"
+
+# Scheduler
+apscheduler = "^3.10.4"
+
+# Excel export
+openpyxl = "^3.1.3"
+
+# HTTP / integrations
+httpx = "^0.27.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2.0"
+pytest-asyncio = "^0.23.7"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
