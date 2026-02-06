@@ -22,7 +22,7 @@ services:
       DT_MARKER_HOUR: ${DT_MARKER_HOUR:-6}
       DT_MARKER_MINUTE: ${DT_MARKER_MINUTE:-0}
     volumes:
-      - db_data:/data
+      - db_data:/data:ro
       - ./migrations:/app/migrations:ro
     ports:
       - "${API_PORT:-8000}:8000"
