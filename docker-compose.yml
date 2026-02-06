@@ -14,15 +14,18 @@ services:
   organizer-api:
     build:
       context: ./organizer-api
+    env_file:
+      - deploy/tenants/.env.alexey
     environment:
-      DB_PATH: /data/organizer.db
+      DB_PATH: ${DB_PATH:-/data/organizer.db}
       LOCAL_TZ_OFFSET_MIN: ${LOCAL_TZ_OFFSET_MIN:-180}
       DT_MARKER_HOUR: ${DT_MARKER_HOUR:-6}
       DT_MARKER_MINUTE: ${DT_MARKER_MINUTE:-0}
     volumes:
       - db_data:/data
+      - ./migrations:/app/migrations:ro
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
     depends_on:
       database:
         condition: service_healthy
@@ -37,10 +40,13 @@ services:
   organizer-worker:
     build:
       context: ./organizer-worker
+    env_file:
+      - deploy/tenants/.env.alexey
     environment:
-      DB_PATH: /data/organizer.db
+      DB_PATH: ${DB_PATH:-/data/organizer.db}
       GOOGLE_CALENDAR_ID: ${GOOGLE_CALENDAR_ID}
-      GOOGLE_SERVICE_ACCOUNT_FILE: /secrets/service-account.json
+      GOOGLE_SERVICE_ACCOUNT_FILE: /data/google_sa.json
+      TIMEZONE_NAME: ${TIMEZONE_NAME:-Europe/Moscow}
       TIMEZONE: ${TIMEZONE:-Europe/Moscow}
       WORKER_INTERVAL_SEC: 5
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
@@ -49,7 +55,10 @@ services:
       WORKER_TG_SEND_MAX_RETRIES: ${WORKER_TG_SEND_MAX_RETRIES:-2}
       WORKER_NOTIFY_ON_DEAD: ${WORKER_NOTIFY_ON_DEAD:-1}
       ORGANIZER_API_URL: ${ORGANIZER_API_URL:-http://organizer-api:8000}
+      TG_HTTP_CONNECT_TIMEOUT: ${TG_HTTP_CONNECT_TIMEOUT:-10}
       TG_HTTP_READ_TIMEOUT: ${TG_HTTP_READ_TIMEOUT:-90}
+      TG_HTTP_RETRIES: ${TG_HTTP_RETRIES:-3}
+      TG_HTTP_RETRY_SLEEP: ${TG_HTTP_RETRY_SLEEP:-1.0}
       ASR_HTTP_READ_TIMEOUT: ${ASR_HTTP_READ_TIMEOUT:-180}
       DT_DEFAULT_HOUR: ${DT_DEFAULT_HOUR:-10}
       DT_DEFAULT_MINUTE: ${DT_DEFAULT_MINUTE:-0}
@@ -77,6 +86,7 @@ services:
       - ./migrations:/app/migrations:ro
       - db_data:/data
       - ./secrets:/secrets:ro
+      - D:/My_AI_Prodgekt/MyTGTodoist/secrets/alexey/google_sa.json:/data/google_sa.json:ro
     depends_on:
       database:
         condition: service_healthy
@@ -93,7 +103,7 @@ services:
     build:
       context: ./asr-service
     ports:
-      - "8001:8001"
+      - "${ASR_PORT}:8001"
     environment:
       WHISPER_MODEL: /app/models/ggml-large-v3.bin
       WHISPER_LANG: ru
@@ -112,6 +122,8 @@ services:
   telegram-bot:
     build:
       context: ./telegram-bot
+    env_file:
+      - deploy/tenants/.env.alexey
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       ASR_SERVICE_URL: http://asr-service:8001
@@ -119,16 +131,22 @@ services:
       STATE_PATH: /data/bot.offset
       TG_DRAIN_ON_START: "0"
       TG_LONGPOLL_SEC: "25"
-      TG_HTTP_READ_TIMEOUT: "90"
+      TG_HTTP_CONNECT_TIMEOUT: ${TG_HTTP_CONNECT_TIMEOUT:-10}
+      TG_HTTP_READ_TIMEOUT: ${TG_HTTP_READ_TIMEOUT:-20}
+      TG_HTTP_RETRIES: ${TG_HTTP_RETRIES:-3}
+      TG_HTTP_RETRY_SLEEP: ${TG_HTTP_RETRY_SLEEP:-1.0}
       LOCAL_TZ_OFFSET_MIN: ${LOCAL_TZ_OFFSET_MIN:-180}
       MEETING_DEFAULT_MINUTES: ${MEETING_DEFAULT_MINUTES:-30}
       CLARIFY_STATE_PATH: ${CLARIFY_STATE_PATH:-/data/bot.clarify.json}
       CLARIFY_TTL_SEC: ${CLARIFY_TTL_SEC:-180}
+      CONFIRM_ENABLED: ${CONFIRM_ENABLED:-1}
+      CONFIRM_STATE_PATH: ${CONFIRM_STATE_PATH:-/data/bot.confirm.json}
+      CONFIRM_TTL_SEC: ${CONFIRM_TTL_SEC:-120}
       B2_QUEUE_MAX_NEW: ${B2_QUEUE_MAX_NEW:-50}
       B2_QUEUE_MAX_TOTAL: ${B2_QUEUE_MAX_TOTAL:-500}
       B2_BACKPRESSURE_MODE: ${B2_BACKPRESSURE_MODE:-reject}
       B2_SCHEMA_PATH: /app/migrations/001_inbox_queue.sql
-      DB_PATH: /data/organizer.db
+      DB_PATH: ${DB_PATH:-/data/organizer.db}
     depends_on:
       organizer-api:
         condition: service_healthy
