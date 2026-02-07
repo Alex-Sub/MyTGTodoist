@@ -154,9 +154,10 @@ Implementation notes:
 
 ---
 
-## 8. P3: States & Calendar
+## 8. P3–P5: Task States & Calendar (актуально)
 
 ### 8.0 FSM: Task state machine (canonical)
+
 States (canonical):
 - NEW
 - PLANNED
@@ -173,104 +174,164 @@ PLANNED | SCHEDULED | calendar create/patch success
 SCHEDULED | PLANNED | re-plan (plan_task)
 SCHEDULED | DONE | complete_task
 SCHEDULED | FAILED | terminal failure (reserved)
-SCHEDULED | CANCELLED | cancel (P4; explicit tick)
+SCHEDULED | CANCELLED | cancel (explicit tick)
 PLANNED | DONE | complete_task
-PLANNED | CANCELLED | cancel (P4; explicit tick)
+PLANNED | CANCELLED | cancel (explicit tick)
 
 Forbidden transitions:
 - DONE / FAILED / CANCELLED → NEW / PLANNED / SCHEDULED
 - Any Calendar → Task transitions
 
 Notes:
-- `tasks.state` is the single source of truth for task lifecycle.
-- `planned_at` represents planning intent only.
+- tasks.state is the single source of truth for task lifecycle.
+- planned_at represents planning intent only.
 - Calendar is a side-effect, managed explicitly by worker ticks.
-
-### 8.1 P3: Calendar sync responsibilities
+### 8.1 P3: Calendar sync responsibilities (DONE)
 Responsibilities are explicitly split:
 
 Task domain:
-- Owns `tasks.state` and `planned_at`.
+- Owns tasks.state and planned_at.
 - Enforces terminal states.
 - Has no knowledge of Calendar.
 
 Calendar adapter:
-- Performs side-effects: create / patch.
-- Returns structured results (`ok`, `http_status`, `err`).
+- Performs side-effects: create / patch / cancel.
+- Returns structured results (ok, http_status, err).
 - Never mutates task state directly.
 
 Sync ticks:
-- `create_tick` — creates calendar event for PLANNED tasks.
-- `update_tick` — updates calendar event for re-planned tasks.
-- `cancel_tick` — NOT active in P3 (scaffold only).
+- create_tick — creates calendar event for PLANNED tasks.
+- update_tick — updates calendar event for re-planned tasks.
+- cancel_tick — cancels calendar event for CANCELLED tasks.
 
 Control flag:
-- `CALENDAR_SYNC_MODE = off | create | full`
-  - `off` — calendar disabled
-  - `create` — `create_tick` only
-  - `full` — `create_tick` + `update_tick` (P3 default)
+- CALENDAR_SYNC_MODE = off | create | full
+  - off    — calendar disabled
+  - create — create_tick only
+  - full   — create_tick + update_tick + cancel_tick
 
 Unknown values default to `full`.
 
-### 8.2 P4: Cancel flow (explicit tick)
-Status: DONE
+### 8.2 P4: Cancel flow (explicit tick) — DONE
 Purpose:
 Provide a safe, idempotent cancellation of calendar events for tasks in CANCELLED state.
 
 Trigger conditions:
-- `tasks.state == CANCELLED`
-- `calendar_event_id IS NOT NULL`
+- tasks.state == CANCELLED
+- calendar_event_id IS NOT NULL
 
 Flow:
-1. `cancel_tick` selects tasks matching trigger conditions.
+1. cancel_tick selects tasks matching trigger conditions.
 2. Calendar adapter attempts to cancel/delete the event.
 3. Result handling:
-   - Success (2xx) → clear `calendar_event_id`.
-   - Not found (404) → treated as success, clear `calendar_event_id`.
+   - Success (2xx) → clear calendar_event_id.
+   - Not found (404) → treated as success, clear calendar_event_id.
    - Any other error → no data change; retry in next tick.
 
 Idempotency:
 - Repeated cancel attempts are safe.
 - 404 is not an error.
-- Clearing `calendar_event_id` terminates the cancel loop.
-Clearing `calendar_event_id` is the terminal step of cancel flow.
+- Clearing calendar_event_id is the terminal step of cancel flow.
 
 Data rules:
-- `tasks.state` is NOT changed.
-- `planned_at` is NOT changed.
+- tasks.state is NOT changed.
+- planned_at is NOT changed.
 - No new fields or migrations.
 
 Execution control:
-- `cancel_tick` runs only when `CALENDAR_SYNC_MODE == full`.
+- cancel_tick runs only when CALENDAR_SYNC_MODE == full.
 
 Guarantees:
 - No Calendar → Task autologic.
 - No implicit state transitions.
 - All actions are explicit and observable.
 
-### 8.3 Logging & observability
-P3 log prefixes:
-- `P3_CALENDAR_CREATE`
-- `P3_CALENDAR_UPDATE`
+Status: DONE
 
-P4 log prefix:
-- `P4_CALENDAR_CANCEL`
+### 8.3 P5: Calendar drift detection (log-only) — PLANNED
+Purpose:
+Detect and log inconsistencies (drift) between Task state and Calendar state
+without applying any automatic corrections.
+
+Principle:
+- tasks.state is the source of truth.
+- Calendar may be modified manually.
+- P5 observes only; it never mutates data.
+
+Drift types:
+- missing_event:
+  - tasks.state == SCHEDULED
+  - calendar_event_id IS NOT NULL
+  - Calendar API returns 404
+
+- time_mismatch:
+  - tasks.state == SCHEDULED
+  - planned_at != calendar_event.start
+
+- unexpected_event:
+  - tasks.state IN (DONE, FAILED, CANCELLED)
+  - calendar_event_id IS NOT NULL
+  - Calendar API returns an existing event
+
+- state_mismatch (reserved):
+  - Calendar event status == cancelled
+  - tasks.state == SCHEDULED
+
+Detector tick:
+- p5_calendar_drift_tick (log-only)
+- No database writes.
+- No Calendar mutations.
+
+Execution control:
+- Runs only when CALENDAR_SYNC_MODE == full.
+
+Logging:
+- Prefix: P5_CALENDAR_DRIFT
+- Logs detected drift type and task identifiers.
+
+Guarantees:
+- No side-effects except logs.
+- No Calendar → Task autologic.
+- Safe to run repeatedly.
+
+Status: PLANNED
+
+### 8.4 Logging & observability (P3–P5)
+Log prefixes:
+- P3_CALENDAR_CREATE
+- P3_CALENDAR_UPDATE
+- P4_CALENDAR_CANCEL
+- P5_CALENDAR_DRIFT
 
 Log semantics:
-- `action=*` — attempt without state change
-- `transition=*` — explicit task state transition
+- action=*        — attempt without state change
+- transition=*   — explicit task state transition
+- drift_type=*   — detected inconsistency (P5)
 
 Required log fields:
-- `task_id`
-- `calendar_event_id` (when applicable)
-- `state_from` / `state_to` (for transitions)
-- `http_status`
-- `err`
+- task_id
+- calendar_event_id (when applicable)
+- planned_at / calendar_start (for drift)
+- http_status
+- err
 
 Logs are informational and do not affect control flow.
 
----
+### 8.5 Status summary
+P3:
+- FSM formalized.
+- Calendar sync responsibilities explicit.
+- Status: DONE.
 
+P4:
+- Explicit cancel flow implemented.
+- Idempotent and safe.
+- Status: DONE.
+
+P5:
+- Drift detection designed.
+- Log-only, no side-effects.
+- Status: PLANNED.
 ## 9. Status summary
 
 P3:
