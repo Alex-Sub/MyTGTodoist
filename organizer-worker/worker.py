@@ -6,12 +6,20 @@ import re
 import sqlite3
 import time
 import socket
+import sys
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta, timezone, date
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.request
 
 import requests
 
+
+_SRC_DIR = os.path.join(os.path.dirname(__file__), "src")
+if _SRC_DIR not in sys.path:
+    sys.path.append(_SRC_DIR)
+import p2_tasks_runtime as p2
 
 DB_PATH = os.getenv("DB_PATH", "/data/organizer.db")
 TIMEZONE_NAME = os.getenv("TIMEZONE_NAME", os.getenv("TIMEZONE", "Europe/Moscow"))
@@ -24,6 +32,13 @@ GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "")
 CALENDAR_DEBUG = os.getenv("CALENDAR_DEBUG", "0") == "1"
 CALENDAR_SMOKE_TEST = os.getenv("CALENDAR_SMOKE_TEST", "0") == "1"
+_CALENDAR_SYNC_MODE_RAW = os.getenv("CALENDAR_SYNC_MODE", "full")
+_CALENDAR_SYNC_MODE_NORM = (_CALENDAR_SYNC_MODE_RAW or "").strip().lower()
+CALENDAR_SYNC_MODE = (
+    _CALENDAR_SYNC_MODE_NORM
+    if _CALENDAR_SYNC_MODE_NORM in {"off", "create", "full"}
+    else "full"
+)
 ASR_DT_SELF_CHECK = os.getenv("ASR_DT_SELF_CHECK", "0") == "1"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ASR_SERVICE_URL = os.getenv("ASR_SERVICE_URL", "http://asr-service:8001")
@@ -61,6 +76,9 @@ B2_REQUEUE_FAILED_EVERY_SEC = int(os.getenv("B2_REQUEUE_FAILED_EVERY_SEC", "15")
 B2_REQUEUE_FAILED_BATCH = int(os.getenv("B2_REQUEUE_FAILED_BATCH", "10"))
 B2_IDLE_SLEEP_SEC = float(os.getenv("B2_IDLE_SLEEP_SEC", "0.5"))
 SCHEMA_PATH = os.getenv("B2_SCHEMA_PATH", "/app/migrations/001_inbox_queue.sql")
+MIGRATIONS_DIR = os.getenv("MIGRATIONS_DIR", "/app/migrations")
+P2_ENFORCE_STATUS = os.getenv("P2_ENFORCE_STATUS", "0") == "1"
+WORKER_COMMAND_PORT = int(os.getenv("WORKER_COMMAND_PORT", "8002"))
 
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
@@ -471,11 +489,18 @@ def _init_db() -> None:
                 type TEXT,
                 title TEXT,
                 status TEXT,
+                parent_id INTEGER NULL,
+                parent_id_int INTEGER NULL,
                 start_at DATETIME NULL,
                 end_at DATETIME NULL,
                 source TEXT,
+                tg_update_id INTEGER NULL,
                 tg_chat_id INTEGER NULL,
                 tg_message_id INTEGER NULL,
+                tg_voice_file_id TEXT NULL,
+                tg_voice_unique_id TEXT NULL,
+                tg_voice_duration INTEGER NULL,
+                asr_text TEXT NULL,
                 created_at DATETIME,
                 ingested_at DATETIME NULL,
                 calendar_event_id TEXT NULL,
@@ -489,10 +514,29 @@ def _init_db() -> None:
             """
         )
         columns = {as_dict(row).get("name") for row in conn.execute("PRAGMA table_info(items)").fetchall()}
+        if "parent_id" not in columns:
+            conn.execute("ALTER TABLE items ADD COLUMN parent_id INTEGER NULL")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_items_parent_id ON items(parent_id)")
+        if "parent_id_int" not in columns:
+            conn.execute("ALTER TABLE items ADD COLUMN parent_id_int INTEGER NULL")
+            conn.execute(
+                "UPDATE items SET parent_id_int = CAST(parent_id AS INTEGER) WHERE parent_id IS NOT NULL"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_items_parent_id_int ON items(parent_id_int)")
+        if "tg_update_id" not in columns:
+            conn.execute("ALTER TABLE items ADD COLUMN tg_update_id INTEGER NULL")
         if "tg_chat_id" not in columns:
             conn.execute("ALTER TABLE items ADD COLUMN tg_chat_id INTEGER NULL")
         if "tg_message_id" not in columns:
             conn.execute("ALTER TABLE items ADD COLUMN tg_message_id INTEGER NULL")
+        if "tg_voice_file_id" not in columns:
+            conn.execute("ALTER TABLE items ADD COLUMN tg_voice_file_id TEXT NULL")
+        if "tg_voice_unique_id" not in columns:
+            conn.execute("ALTER TABLE items ADD COLUMN tg_voice_unique_id TEXT NULL")
+        if "tg_voice_duration" not in columns:
+            conn.execute("ALTER TABLE items ADD COLUMN tg_voice_duration INTEGER NULL")
+        if "asr_text" not in columns:
+            conn.execute("ALTER TABLE items ADD COLUMN asr_text TEXT NULL")
         if "ingested_at" not in columns:
             conn.execute("ALTER TABLE items ADD COLUMN ingested_at DATETIME NULL")
         if "calendar_event_id" not in columns:
@@ -513,10 +557,101 @@ def _init_db() -> None:
         sql = Path(SCHEMA_PATH).read_text(encoding="utf-8")
         conn.executescript(sql)
         conn.commit()
+        _apply_sql_migrations(conn)
         columns_q = {as_dict(row).get("name") for row in conn.execute("PRAGMA table_info(inbox_queue)").fetchall()}
         if "ingested_at" not in columns_q:
             conn.execute("ALTER TABLE inbox_queue ADD COLUMN ingested_at TEXT")
             conn.commit()
+
+
+def _apply_sql_migrations(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            name TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+    mig_name = "005_items_tg_voice_meta.sql"
+    row = conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE name = ?",
+        (mig_name,),
+    ).fetchone()
+    if row:
+        return
+
+    columns = {as_dict(r).get("name") for r in conn.execute("PRAGMA table_info(items)").fetchall()}
+    stmts: list[str] = []
+    if "tg_update_id" not in columns:
+        stmts.append("ALTER TABLE items ADD COLUMN tg_update_id INTEGER NULL")
+    if "tg_voice_file_id" not in columns:
+        stmts.append("ALTER TABLE items ADD COLUMN tg_voice_file_id TEXT NULL")
+    if "tg_voice_unique_id" not in columns:
+        stmts.append("ALTER TABLE items ADD COLUMN tg_voice_unique_id TEXT NULL")
+    if "tg_voice_duration" not in columns:
+        stmts.append("ALTER TABLE items ADD COLUMN tg_voice_duration INTEGER NULL")
+    if "asr_text" not in columns:
+        stmts.append("ALTER TABLE items ADD COLUMN asr_text TEXT NULL")
+    if stmts:
+        for stmt in stmts:
+            conn.execute(stmt)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_items_tg_voice_unique_id ON items(tg_voice_unique_id)"
+        )
+        conn.commit()
+
+    conn.execute(
+        "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+        (mig_name, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+    mig_name = "0009_items_tasks_subtasks.sql"
+    row = conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE name = ?",
+        (mig_name,),
+    ).fetchone()
+    if row:
+        return
+
+    columns = {as_dict(r).get("name") for r in conn.execute("PRAGMA table_info(items)").fetchall()}
+    if "type" not in columns:
+        conn.execute("ALTER TABLE items ADD COLUMN type TEXT NOT NULL DEFAULT 'task'")
+        conn.execute(
+            """
+            UPDATE items
+            SET type = CASE
+                WHEN start_at IS NOT NULL OR end_at IS NOT NULL THEN 'meeting'
+                ELSE 'task'
+            END
+            WHERE type IS NULL OR type = ''
+            """
+        )
+        conn.commit()
+
+    if "parent_id" in columns:
+        if "parent_id_int" not in columns:
+            conn.execute("ALTER TABLE items ADD COLUMN parent_id_int INTEGER NULL")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_items_parent_id_int ON items(parent_id_int)")
+            conn.commit()
+        conn.execute(
+            "UPDATE items SET parent_id_int = CAST(parent_id AS INTEGER) "
+            "WHERE parent_id IS NOT NULL AND (parent_id_int IS NULL OR parent_id_int = 0)"
+        )
+        conn.commit()
+    else:
+        conn.execute("ALTER TABLE items ADD COLUMN parent_id INTEGER NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_items_parent_id ON items(parent_id)")
+        conn.commit()
+
+    conn.execute(
+        "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+        (mig_name, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
 
 
 def reap_claims(conn: sqlite3.Connection, now_ts: float) -> tuple[int, int]:
@@ -819,6 +954,17 @@ def _format_start_at_local(start_at: str | None) -> str | None:
             month = ["янв","фев","мар","апр","мая","июн","июл","авг","сен","окт","ноя","дек"][mon - 1]
             return f"{day} {month}, {hh}:{mi}"
         return None
+
+
+def _compute_item_fields_from_text(text: str) -> tuple[str, str, str | None, str | None, datetime | None, bool]:
+    dt = _extract_datetime(text)
+    item_type = "meeting" if (dt is not None or MEETING_HINT_RE.search(text or "")) else "task"
+    time_ambiguous = _is_time_ambiguous(text or "")
+    has_time = _parse_time_ru(text or "") is not None
+    status = "active" if (dt and has_time and not time_ambiguous) else "inbox"
+    start_at = dt.isoformat() if dt else None
+    end_at = (dt + timedelta(minutes=MEETING_DEFAULT_MINUTES)).isoformat() if dt else None
+    return item_type, status, start_at, end_at, dt, time_ambiguous
 
 
 def _tg_notify_calendar_success(item_id: int) -> None:
@@ -1126,15 +1272,13 @@ def _insert_item_from_text(
     ingested_at: str | None,
     tg_chat_id: int | None,
     tg_message_id: int | None,
+    tg_update_id: int | None = None,
+    tg_voice_file_id: str | None = None,
+    tg_voice_unique_id: str | None = None,
+    tg_voice_duration: int | None = None,
+    asr_text: str | None = None,
 ) -> tuple[int, str, str]:
-    dt = _extract_datetime(text)   # важно: должна вернуть datetime или None
-    item_type = "meeting" if (dt is not None or MEETING_HINT_RE.search(text or "")) else "task"
-
-    time_ambiguous = _is_time_ambiguous(text or "")
-    has_time = _parse_time_ru(text or "") is not None
-    status = "active" if (dt and has_time and not time_ambiguous) else "inbox"
-    start_at = dt.isoformat() if dt else None
-    end_at = (dt + timedelta(minutes=MEETING_DEFAULT_MINUTES)).isoformat() if dt else None
+    item_type, status, start_at, end_at, _, _ = _compute_item_fields_from_text(text)
 
     created_at = datetime.now(timezone.utc).isoformat()
     ingested_at = ingested_at or created_at
@@ -1143,11 +1287,13 @@ def _insert_item_from_text(
             """
             INSERT INTO items (
                 type, title, status, start_at, end_at, source,
-                tg_chat_id, tg_message_id,
+                tg_update_id, tg_chat_id, tg_message_id,
+                tg_voice_file_id, tg_voice_unique_id, tg_voice_duration,
+                asr_text,
                 tg_accepted_sent, tg_result_sent,
                 created_at, ingested_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
             """,
             (
                 item_type,
@@ -1156,8 +1302,13 @@ def _insert_item_from_text(
                 start_at,
                 end_at,
                 source,
+                tg_update_id,
                 tg_chat_id,
                 tg_message_id,
+                tg_voice_file_id,
+                tg_voice_unique_id,
+                tg_voice_duration,
+                asr_text,
                 created_at,
                 ingested_at,
             ),
@@ -1171,6 +1322,481 @@ def _insert_item_from_text(
         return item_id, item_type, status
 
 
+def _insert_voice_placeholder(
+    source: str,
+    ingested_at: str | None,
+    tg_chat_id: int | None,
+    tg_message_id: int | None,
+    tg_update_id: int | None,
+    tg_voice_file_id: str | None,
+    tg_voice_unique_id: str | None,
+    tg_voice_duration: int | None,
+) -> int:
+    created_at = datetime.now(timezone.utc).isoformat()
+    ingested_at = ingested_at or created_at
+    with _get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO items (
+                type, title, status, start_at, end_at, source,
+                tg_update_id, tg_chat_id, tg_message_id,
+                tg_voice_file_id, tg_voice_unique_id, tg_voice_duration,
+                tg_accepted_sent, tg_result_sent,
+                created_at, ingested_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+            """,
+            (
+                "task",
+                "",
+                "inbox",
+                None,
+                None,
+                source,
+                tg_update_id,
+                tg_chat_id,
+                tg_message_id,
+                tg_voice_file_id,
+                tg_voice_unique_id,
+                tg_voice_duration,
+                created_at,
+                ingested_at,
+            ),
+        )
+        conn.commit()
+        last_id = cur.lastrowid
+        if last_id is None:
+            raise RuntimeError("insert failed: no rowid")
+        item_id = int(last_id)
+        _tg_notify_created(item_id)
+        return item_id
+
+
+def _update_item_from_asr(
+    item_id: int,
+    text: str,
+    item_type: str,
+    status: str,
+    start_at: str | None,
+    end_at: str | None,
+) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE items
+            SET title = ?,
+                type = ?,
+                status = ?,
+                start_at = ?,
+                end_at = ?,
+                asr_text = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                text.strip(),
+                item_type,
+                status,
+                start_at,
+                end_at,
+                text.strip(),
+                datetime.now(timezone.utc).isoformat(),
+                int(item_id),
+            ),
+        )
+        conn.commit()
+
+
+def _ensure_voice_meta(
+    item_id: int,
+    tg_update_id: int | None,
+    tg_message_id: int | None,
+    tg_voice_file_id: str | None,
+    tg_voice_unique_id: str | None,
+    tg_voice_duration: int | None,
+) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE items
+            SET tg_update_id = COALESCE(tg_update_id, ?),
+                tg_message_id = COALESCE(tg_message_id, ?),
+                tg_voice_file_id = COALESCE(tg_voice_file_id, ?),
+                tg_voice_unique_id = COALESCE(tg_voice_unique_id, ?),
+                tg_voice_duration = COALESCE(tg_voice_duration, ?),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                tg_update_id,
+                tg_message_id,
+                tg_voice_file_id,
+                tg_voice_unique_id,
+                tg_voice_duration,
+                datetime.now(timezone.utc).isoformat(),
+                int(item_id),
+            ),
+        )
+        conn.commit()
+
+
+def _mark_item_failed_asr_dedup(item_id: int) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE items
+            SET status = 'inbox',
+                start_at = NULL,
+                end_at = NULL,
+                calendar_event_id = NULL,
+                last_error = 'FAILED_ASR_DEDUP',
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (datetime.now(timezone.utc).isoformat(), int(item_id)),
+        )
+        conn.commit()
+
+
+def _log_voice_meta(
+    label: str,
+    item_id: int | None,
+    tg_update_id: int | None,
+    tg_message_id: int | None,
+    tg_voice_unique_id: str | None,
+    tg_voice_duration: int | None,
+    queue_id: int | None,
+) -> None:
+    logging.info(
+        "%s item_id=%s upd=%s msg=%s uniq=%s dur=%s queue_id=%s",
+        label,
+        item_id,
+        tg_update_id,
+        tg_message_id,
+        tg_voice_unique_id,
+        tg_voice_duration,
+        queue_id,
+    )
+
+
+def _get_parent_id_from_row(row: dict) -> int | None:
+    if row.get("parent_id_int") is not None:
+        try:
+            return int(row.get("parent_id_int"))
+        except Exception:
+            return None
+    if row.get("parent_id") is not None:
+        try:
+            return int(row.get("parent_id"))
+        except Exception:
+            return None
+    return None
+
+
+def _p2_task_row(task_id: int) -> dict:
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, title, status, state, planned_at, calendar_event_id, source_msg_id,
+                   created_at, updated_at, completed_at
+            FROM tasks
+            WHERE id = ?
+            """,
+            (int(task_id),),
+        ).fetchone()
+    row = as_dict(row)
+    if not row:
+        raise ValueError("task not found")
+    return row
+
+
+def _p2_subtask_row(subtask_id: int) -> dict:
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, task_id, title, status, source_msg_id,
+                   created_at, updated_at, completed_at
+            FROM subtasks
+            WHERE id = ?
+            """,
+            (int(subtask_id),),
+        ).fetchone()
+    row = as_dict(row)
+    if not row:
+        raise ValueError("subtask not found")
+    return row
+
+
+def cmd_create_task(title: str, status: str, source_msg_id: str | None = None) -> dict:
+    task = p2.create_task(title, status=status, source_msg_id=source_msg_id)
+    return _p2_task_row(task.id)
+
+
+def cmd_create_subtask(
+    task_id: int,
+    title: str,
+    status: str,
+    source_msg_id: str | None = None,
+) -> dict:
+    sub = p2.create_subtask(task_id, title, status=status, source_msg_id=source_msg_id)
+    return _p2_subtask_row(sub.id)
+
+
+def cmd_complete_subtask(subtask_id: int) -> dict:
+    sub = p2.complete_subtask(subtask_id)
+    return _p2_subtask_row(sub.id)
+
+
+def cmd_complete_task(task_id: int) -> dict:
+    task = p2.complete_task(task_id)
+    return _p2_task_row(task.id)
+
+
+def cmd_plan_task(task_id: int, planned_at: str) -> dict:
+    task = p2.plan_task(task_id, planned_at)
+    return _p2_task_row(task.id)
+
+
+class _CommandHandler(BaseHTTPRequestHandler):
+    def _send_json(self, status: int, payload: dict) -> None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_json(self) -> dict:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("invalid json body")
+        return data
+
+    def do_GET(self):  # noqa: N802 - stdlib API
+        if self.path == "/health":
+            self._send_json(200, {"ok": True})
+            return
+        self._send_json(404, {"error": "not found"})
+
+    def do_POST(self):  # noqa: N802 - stdlib API
+        try:
+            data = self._read_json()
+            if self.path == "/p2/commands/create_task":
+                res = cmd_create_task(
+                    data.get("title") or "",
+                    data.get("status") or "NEW",
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/create_subtask":
+                if data.get("task_id") is None:
+                    raise ValueError("task_id is required")
+                res = cmd_create_subtask(
+                    int(data.get("task_id")),
+                    data.get("title") or "",
+                    data.get("status") or "NEW",
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/complete_task":
+                if data.get("task_id") is None:
+                    raise ValueError("task_id is required")
+                res = cmd_complete_task(int(data.get("task_id")))
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/complete_subtask":
+                if data.get("subtask_id") is None:
+                    raise ValueError("subtask_id is required")
+                res = cmd_complete_subtask(int(data.get("subtask_id")))
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/plan_task":
+                if data.get("task_id") is None:
+                    raise ValueError("task_id is required")
+                if not data.get("planned_at"):
+                    raise ValueError("planned_at is required")
+                res = cmd_plan_task(int(data.get("task_id")), str(data.get("planned_at")))
+                self._send_json(200, res)
+                return
+            self._send_json(404, {"error": "not found"})
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)[:200]})
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)[:200]})
+
+    def log_message(self, format, *args):  # noqa: A003 - stdlib API
+        return
+
+
+def _start_command_server() -> None:
+    server = HTTPServer(("0.0.0.0", WORKER_COMMAND_PORT), _CommandHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logging.info("worker_cmd_server started port=%s", WORKER_COMMAND_PORT)
+
+
+def validate_task_status(item: dict, new_status: str, open_subtasks: int) -> None:
+    """
+    Validate task/subtask status transitions.
+    - task: inbox -> active -> done -> archived
+    - subtask: todo -> done
+    - task cannot be done if any subtask is not done
+    """
+    if item.get("type") != "task":
+        return
+    is_subtask = _get_parent_id_from_row(item) is not None
+    if is_subtask:
+        allowed = {"todo": {"done"}, "done": set()}
+    else:
+        allowed = {"inbox": {"active"}, "active": {"done"}, "done": {"archived"}, "archived": set()}
+
+    current = str(item.get("status") or "")
+    if new_status == current:
+        return
+    if current not in allowed or new_status not in allowed[current]:
+        raise ValueError(f"invalid status transition: {current} -> {new_status}")
+
+    if not is_subtask and new_status == "done" and open_subtasks > 0:
+        raise ValueError("cannot complete task with open subtasks")
+
+
+def _update_item_status(item_id: int, new_status: str) -> None:
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, type, status, parent_id, parent_id_int
+            FROM items
+            WHERE id = ?
+            """,
+            (int(item_id),),
+        ).fetchone()
+        row = as_dict(row)
+        if not row:
+            raise ValueError("item not found")
+        if P2_ENFORCE_STATUS:
+            open_subtasks = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM items
+                WHERE (parent_id_int = ? OR parent_id = ?)
+                  AND status != 'done'
+                """,
+                (int(item_id), int(item_id)),
+            ).fetchone()
+            open_cnt = int(as_dict(open_subtasks).get("cnt") or 0)
+            validate_task_status(row, new_status, open_cnt)
+        conn.execute(
+            """
+            UPDATE items
+            SET status = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (new_status, datetime.now(timezone.utc).isoformat(), int(item_id)),
+        )
+        conn.commit()
+
+
+def create_task(
+    title: str,
+    *,
+    status: str = "inbox",
+    from_inbox_item_id: int | None = None,
+) -> int:
+    if from_inbox_item_id is not None:
+        with _get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT id, status, parent_id, parent_id_int
+                FROM items
+                WHERE id = ?
+                """,
+                (int(from_inbox_item_id),),
+            ).fetchone()
+            row = as_dict(row)
+            if not row:
+                raise ValueError("inbox item not found")
+            if _get_parent_id_from_row(row) is not None:
+                raise ValueError("cannot promote a subtask to task")
+            if str(row.get("status") or "") != "inbox":
+                raise ValueError("only inbox items can be promoted to task")
+            if P2_ENFORCE_STATUS:
+                validate_task_status(row, status, 0)
+            conn.execute(
+                """
+                UPDATE items
+                SET type = 'task',
+                    status = ?,
+                    title = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (status, title, datetime.now(timezone.utc).isoformat(), int(from_inbox_item_id)),
+            )
+            conn.commit()
+        return int(from_inbox_item_id)
+
+    if status not in {"inbox", "active"}:
+        raise ValueError("task status must be inbox or active on create")
+    with _get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO items (
+                type, title, status, parent_id, parent_id_int, created_at
+            )
+            VALUES ('task', ?, ?, NULL, NULL, ?)
+            """,
+            (title, status, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def create_subtask(
+    parent_id: int,
+    title: str,
+    *,
+    status: str = "todo",
+) -> int:
+    with _get_conn() as conn:
+        parent = conn.execute(
+            """
+            SELECT id, type, status, parent_id, parent_id_int
+            FROM items
+            WHERE id = ?
+            """,
+            (int(parent_id),),
+        ).fetchone()
+        parent = as_dict(parent)
+        if not parent:
+            raise ValueError("parent not found")
+        if _get_parent_id_from_row(parent) is not None:
+            raise ValueError("cannot create subtask under subtask")
+        if str(parent.get("type") or "") != "task":
+            raise ValueError("parent must be task")
+        if str(parent.get("status") or "") == "done":
+            raise ValueError("cannot add subtask to done task")
+        if status not in {"todo", "done"}:
+            raise ValueError("subtask status must be todo or done")
+
+        cur = conn.execute(
+            """
+            INSERT INTO items (
+                type, title, status, parent_id, parent_id_int, created_at
+            )
+            VALUES ('task', ?, ?, ?, ?, ?)
+            """,
+            (title, status, int(parent_id), int(parent_id), datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
 def _process_queue_item(row: dict) -> None:
     row = as_dict(row)
     queue_id = row["id"]
@@ -1211,12 +1837,13 @@ def _process_queue_item(row: dict) -> None:
                 ingested_at,
                 int(chat_id) if chat_id else None,
                 int(message_id) if message_id is not None else None,
+                int(row.get("tg_update_id")) if row.get("tg_update_id") is not None else None,
             )
             logging.info("tg meta kind=%s item_id=%s tg_chat_id=%s", kind, item_id, chat_id)
             try:
                 with _get_conn() as conn:
                     row_item = conn.execute(
-                        "SELECT id, title, type, start_at, end_at, calendar_event_id FROM items WHERE id=?",
+                        "SELECT id, title, type, start_at, end_at, calendar_event_id, parent_id, parent_id_int FROM items WHERE id=?",
                         (item_id,),
                     ).fetchone()
                 row_item = as_dict(row_item)
@@ -1326,11 +1953,127 @@ def _process_queue_item(row: dict) -> None:
             _queue_mark(queue_id, "DONE", None)
             logging.info("queue done id=%s kind=%s attempts=%s (noop)", queue_id, kind, attempts)
             return
+        meta = payload.get("_meta") or {}
+        tg_update_id = meta.get("tg_update_id") or row.get("tg_update_id")
+        tg_message_id = meta.get("tg_message_id") or row.get("tg_message_id")
         file_id = payload.get("file_id")
+        voice_unique_id = payload.get("file_unique_id")
+        voice_duration = payload.get("duration")
         if not file_id:
             raise RuntimeError("missing file_id")
-        audio = _tg_download_voice(file_id)
-        text = _asr_transcribe(audio)
+
+        ingested_at = row.get("ingested_at") or row.get("created_at")
+        existing_item_id: int | None = None
+        existing_asr_text: str | None = None
+        if voice_unique_id:
+            with _get_conn() as conn:
+                r = conn.execute(
+                    """
+                    SELECT id, asr_text
+                    FROM items
+                    WHERE tg_voice_unique_id = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (str(voice_unique_id),),
+                ).fetchone()
+            r = as_dict(r)
+            existing_item_id = int(r.get("id")) if r.get("id") is not None else None
+            existing_asr_text = (r.get("asr_text") or None) if r else None
+        elif tg_update_id is not None and tg_message_id is not None:
+            with _get_conn() as conn:
+                r = conn.execute(
+                    """
+                    SELECT id, asr_text
+                    FROM items
+                    WHERE tg_update_id = ? AND tg_message_id = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (int(tg_update_id), int(tg_message_id)),
+                ).fetchone()
+            r = as_dict(r)
+            existing_item_id = int(r.get("id")) if r.get("id") is not None else None
+            existing_asr_text = (r.get("asr_text") or None) if r else None
+
+        if existing_item_id is not None:
+            item_id = existing_item_id
+            _ensure_voice_meta(
+                item_id,
+                int(tg_update_id) if tg_update_id is not None else None,
+                int(tg_message_id) if tg_message_id is not None else None,
+                str(file_id) if file_id else None,
+                str(voice_unique_id) if voice_unique_id else None,
+                int(voice_duration) if voice_duration is not None else None,
+            )
+            _log_voice_meta(
+                "voice_dedup hit",
+                item_id,
+                int(tg_update_id) if tg_update_id is not None else None,
+                int(tg_message_id) if tg_message_id is not None else None,
+                str(voice_unique_id) if voice_unique_id else None,
+                int(voice_duration) if voice_duration is not None else None,
+                int(queue_id) if queue_id is not None else None,
+            )
+        else:
+            item_id = _insert_voice_placeholder(
+                "telegram",
+                ingested_at,
+                int(chat_id) if chat_id else None,
+                int(tg_message_id) if tg_message_id is not None else None,
+                int(tg_update_id) if tg_update_id is not None else None,
+                str(file_id) if file_id else None,
+                str(voice_unique_id) if voice_unique_id else None,
+                int(voice_duration) if voice_duration is not None else None,
+            )
+            _log_voice_meta(
+                "voice_meta",
+                item_id,
+                int(tg_update_id) if tg_update_id is not None else None,
+                int(tg_message_id) if tg_message_id is not None else None,
+                str(voice_unique_id) if voice_unique_id else None,
+                int(voice_duration) if voice_duration is not None else None,
+                int(queue_id) if queue_id is not None else None,
+            )
+
+        if voice_unique_id:
+            with _get_conn() as conn:
+                r_other = conn.execute(
+                    """
+                    SELECT id, asr_text
+                    FROM items
+                    WHERE tg_voice_unique_id = ?
+                      AND id != ?
+                      AND asr_text IS NOT NULL
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (str(voice_unique_id), int(item_id)),
+                ).fetchone()
+            if r_other:
+                _log_voice_meta(
+                    "voice_dedup mismatch",
+                    item_id,
+                    int(tg_update_id) if tg_update_id is not None else None,
+                    int(tg_message_id) if tg_message_id is not None else None,
+                    str(voice_unique_id) if voice_unique_id else None,
+                    int(voice_duration) if voice_duration is not None else None,
+                    int(queue_id) if queue_id is not None else None,
+                )
+                _mark_item_failed_asr_dedup(int(item_id))
+                _queue_mark(queue_id, "DONE", None)
+                if chat_id:
+                    _tg_send_message(
+                        chat_id,
+                        "⚠️ Похоже, голосовое сообщение обработалось некорректно. Отправь ещё раз voice. [VOICE-GUARD]",
+                    )
+                return
+
+        if existing_asr_text:
+            text = existing_asr_text
+        else:
+            audio = _tg_download_voice(file_id)
+            text = _asr_transcribe(audio)
         if not text or len(text.strip()) < 3:
             raise RuntimeError("empty text")
         pending = _get_pending_clarify(chat_id)
@@ -1390,22 +2133,23 @@ def _process_queue_item(row: dict) -> None:
                     ),
                 )
             return
-        dt = _extract_datetime(text)
+        item_type, item_status, start_at, end_at, dt, time_ambiguous = _compute_item_fields_from_text(text)
         logging.info("asr text=%r dt=%r", text[:200], dt)
-        time_ambiguous = _is_time_ambiguous(text)
-        ingested_at = row.get("ingested_at") or row.get("created_at")
-        item_id, item_type, item_status = _insert_item_from_text(
-            text,
-            "telegram",
-            ingested_at,
-            int(chat_id) if chat_id else None,
-            int(message_id) if message_id is not None else None,
+        _update_item_from_asr(int(item_id), text, item_type, item_status, start_at, end_at)
+        _log_voice_meta(
+            "voice_asr",
+            item_id,
+            int(tg_update_id) if tg_update_id is not None else None,
+            int(tg_message_id) if tg_message_id is not None else None,
+            str(voice_unique_id) if voice_unique_id else None,
+            int(voice_duration) if voice_duration is not None else None,
+            int(queue_id) if queue_id is not None else None,
         )
         logging.info("tg meta kind=%s item_id=%s tg_chat_id=%s", kind, item_id, chat_id)
         try:
             with _get_conn() as conn:
                 row_item = conn.execute(
-                    "SELECT id, title, type, start_at, end_at, calendar_event_id FROM items WHERE id=?",
+                    "SELECT id, title, type, start_at, end_at, calendar_event_id, parent_id, parent_id_int FROM items WHERE id=?",
                     (item_id,),
                 ).fetchone()
             row_item = as_dict(row_item)
@@ -1524,6 +2268,38 @@ def _process_queue_item(row: dict) -> None:
                 "⚠️ Не удалось добавить в календарь. Задача сохранена, верну в Inbox. [CAL-DEAD]",
             )
 
+
+# === P3: Task Domain (pure-ish) =============================================
+# Helpers only for logging / context (no behavior changes).
+def _is_terminal_state(state: str) -> bool:
+    return str(state or "").upper() in {"DONE", "FAILED", "CANCELLED"}
+
+
+def _can_transition(state_from: str, state_to: str) -> bool:
+    sf = str(state_from or "").upper()
+    st = str(state_to or "").upper()
+    allowed = {
+        ("NEW", "PLANNED"),
+        ("PLANNED", "SCHEDULED"),
+        ("SCHEDULED", "PLANNED"),
+        ("SCHEDULED", "DONE"),
+        ("SCHEDULED", "FAILED"),
+        ("SCHEDULED", "CANCELLED"),
+        ("PLANNED", "DONE"),
+        ("PLANNED", "CANCELLED"),
+    }
+    return (sf, st) in allowed
+
+
+def _describe_transition(state_from: str, state_to: str) -> str:
+    sf = str(state_from or "").upper()
+    st = str(state_to or "").upper()
+    return f"{sf}->{st}"
+
+
+# === P3: Calendar Adapter (side-effect boundary) ============================
+P3_CALENDAR_CREATE = "P3_CALENDAR_CREATE"
+P3_CALENDAR_UPDATE = "P3_CALENDAR_UPDATE"
 
 def _get_calendar_service():
     global _CAL_NOT_CONFIGURED_REASON
@@ -1662,6 +2438,394 @@ def _calendar_smoke_test() -> None:
     except Exception as exc:
         logging.warning("calendar_smoke failed err=%s", str(exc)[:200])
 
+
+def _patch_event(event_id: str, start: datetime, end: datetime) -> str:
+    service = _get_calendar_service()
+    if service is None:
+        return "no_service"
+    body = {
+        "start": {"dateTime": start.isoformat(), "timeZone": TIMEZONE_NAME},
+        "end": {"dateTime": end.isoformat(), "timeZone": TIMEZONE_NAME},
+    }
+    try:
+        service.events().patch(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id, body=body).execute()
+        return "ok"
+    except Exception as exc:
+        try:
+            err_mod = importlib.import_module("googleapiclient.errors")
+            HttpError = getattr(err_mod, "HttpError", None)
+        except Exception:
+            HttpError = None
+        if HttpError is not None and isinstance(exc, HttpError):
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status == 404:
+                return "not_found"
+            return "error"
+        return "error"
+
+
+def _calendar_http_status(exc: Exception) -> int | None:
+    resp = getattr(exc, "resp", None)
+    status = getattr(resp, "status", None) if resp is not None else None
+    try:
+        return int(status) if status is not None else None
+    except Exception:
+        return None
+
+
+def _calendar_result(
+    ok: bool,
+    event_id: str | None,
+    http_status: int | None,
+    err: str | None,
+    etag: str | None,
+) -> dict:
+    return {
+        "ok": bool(ok),
+        "event_id": event_id,
+        "http_status": http_status,
+        "err": err,
+        "etag": etag,
+    }
+
+
+def _calendar_create_event(title: str, start: datetime, end: datetime) -> dict:
+    # TODO(P4): store calendar_etag when schema allows.
+    try:
+        event_id = _create_event(title, start, end)
+    except Exception as exc:
+        status = _calendar_http_status(exc)
+        return _calendar_result(False, None, status, f"exception:{type(exc).__name__}", None)
+    if not event_id:
+        return _calendar_result(False, None, None, "no_event_id", None)
+    return _calendar_result(True, str(event_id), None, None, None)
+
+
+def _calendar_patch_event(event_id: str, start: datetime, end: datetime) -> dict:
+    # TODO(P4): store calendar_etag when schema allows.
+    try:
+        res = _patch_event(event_id, start, end)
+    except Exception as exc:
+        status = _calendar_http_status(exc)
+        return _calendar_result(False, None, status, f"exception:{type(exc).__name__}", None)
+    if res == "ok":
+        return _calendar_result(True, event_id, None, None, None)
+    if res == "not_found":
+        return _calendar_result(False, None, 404, "not_found", None)
+    if res == "no_service":
+        return _calendar_result(False, None, None, "no_service", None)
+    return _calendar_result(False, None, None, "error", None)
+
+
+def _calendar_cancel_event(event_id: str) -> dict:
+    # P4: scaffold only.
+    return _calendar_result(False, None, None, "not_implemented", None)
+
+
+# === P3: Sync Ticks ==========================================================
+# TODO(P4): infinite-loop protection concept only (no implementation in P3).
+# Suggestion: last_sync_at, sync_counter, or max N state flips per task per hour.
+def _p3_calendar_create_tick(limit: int = 10) -> None:
+    # P3: for current logic (create_tick).
+    try:
+        with _get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, title, planned_at
+                FROM tasks
+                WHERE state = 'PLANNED'
+                  AND planned_at IS NOT NULL
+                  AND calendar_event_id IS NULL
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+    except Exception as exc:
+        logging.warning("%s err=%s", P3_CALENDAR_CREATE, str(exc)[:200])
+        return
+
+    for row in rows:
+        try:
+            task_id = int(row["id"])
+            title = str(row["title"] or "").strip()
+            planned_at = str(row["planned_at"] or "").strip()
+            if not planned_at:
+                continue
+            try:
+                dt = datetime.fromisoformat(planned_at)
+            except Exception:
+                logging.warning(
+                    "%s task_id=%s state_from=PLANNED state_to=PLANNED planned_at=%s calendar_event_id=%s "
+                    "err=bad_planned_at",
+                    P3_CALENDAR_CREATE,
+                    task_id,
+                    planned_at,
+                    "",
+                )
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+
+            claim_id = f"PENDING:{datetime.now(timezone.utc).isoformat()}:{os.getpid()}"
+            with _get_conn() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                    SET calendar_event_id = ?
+                    WHERE id = ?
+                      AND calendar_event_id IS NULL
+                    """,
+                    (claim_id, task_id),
+                )
+                conn.commit()
+            if cur.rowcount != 1:
+                continue
+
+            end = dt + timedelta(minutes=MEETING_DEFAULT_MINUTES)
+            res = _calendar_create_event(f"Task #{task_id}: {title}", dt, end)
+            logging.info(
+                "%s action=create_attempt task_id=%s planned_at=%s calendar_event_id=%s "
+                "ok=%s http_status=%s err=%s",
+                P3_CALENDAR_CREATE,
+                task_id,
+                planned_at,
+                claim_id,
+                res.get("ok"),
+                res.get("http_status"),
+                res.get("err"),
+            )
+            if not res.get("ok"):
+                err = res.get("err") or ""
+                if err.startswith("exception:"):
+                    logging.warning(
+                        "%s action=create_attempt task_id=%s planned_at=%s calendar_event_id=%s "
+                        "ok=%s http_status=%s err=%s",
+                        P3_CALENDAR_CREATE,
+                        task_id,
+                        planned_at,
+                        claim_id,
+                        res.get("ok"),
+                        res.get("http_status"),
+                        res.get("err"),
+                    )
+                    continue
+                with _get_conn() as conn:
+                    conn.execute(
+                        """
+                        UPDATE tasks
+                        SET calendar_event_id = NULL,
+                            updated_at = ?
+                        WHERE id = ?
+                          AND calendar_event_id = ?
+                        """,
+                        (datetime.now(timezone.utc).isoformat(), task_id, claim_id),
+                    )
+                    conn.commit()
+                logging.warning(
+                    "%s action=create_attempt task_id=%s planned_at=%s calendar_event_id=%s "
+                    "reason=service_unavailable ok=%s http_status=%s err=%s",
+                    P3_CALENDAR_CREATE,
+                    task_id,
+                    planned_at,
+                    claim_id,
+                    res.get("ok"),
+                    res.get("http_status"),
+                    res.get("err"),
+                )
+                break
+
+            event_id = res.get("event_id")
+            with _get_conn() as conn:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET calendar_event_id = ?,
+                        state = 'SCHEDULED',
+                        updated_at = ?
+                    WHERE id = ?
+                      AND calendar_event_id = ?
+                    """,
+                    (event_id, datetime.now(timezone.utc).isoformat(), task_id, claim_id),
+                )
+                conn.commit()
+            logging.info(
+                "%s transition=PLANNED->SCHEDULED reason=create_success task_id=%s planned_at=%s "
+                "calendar_event_id=%s ok=%s http_status=%s err=%s",
+                P3_CALENDAR_CREATE,
+                task_id,
+                planned_at,
+                event_id,
+                res.get("ok"),
+                res.get("http_status"),
+                res.get("err"),
+            )
+        except Exception as exc:
+            logging.warning(
+                "%s action=create_attempt task_id=%s planned_at=%s calendar_event_id=%s err=%s",
+                P3_CALENDAR_CREATE,
+                task_id,
+                planned_at,
+                "",
+                str(exc)[:200],
+            )
+            continue
+
+
+def _p3_calendar_update_tick(limit: int = 3) -> None:
+    # P3: for current logic (update_tick).
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    try:
+        with _get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, title, planned_at, calendar_event_id, state, updated_at
+                FROM tasks
+                WHERE calendar_event_id IS NOT NULL
+                  AND planned_at IS NOT NULL
+                  AND updated_at >= ?
+                  AND state = 'PLANNED'
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (cutoff, int(limit)),
+            ).fetchall()
+    except Exception as exc:
+        logging.warning("%s err=%s", P3_CALENDAR_UPDATE, str(exc)[:200])
+        return
+
+    for row in rows:
+        try:
+            task_id = int(row["id"])
+            title = str(row["title"] or "").strip()
+            planned_at = str(row["planned_at"] or "").strip()
+            event_id = str(row["calendar_event_id"] or "").strip()
+            state = str(row["state"] or "").strip().upper()
+            if state == "CANCELLED":
+                # TODO(P4): plan cancel_event (do not perform).
+                pass
+            if not planned_at or not event_id:
+                continue
+            try:
+                dt = datetime.fromisoformat(planned_at)
+            except Exception:
+                logging.warning(
+                    "%s task_id=%s state_from=PLANNED state_to=PLANNED planned_at=%s calendar_event_id=%s "
+                    "err=bad_planned_at",
+                    P3_CALENDAR_UPDATE,
+                    task_id,
+                    planned_at,
+                    event_id,
+                )
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            end = dt + timedelta(minutes=MEETING_DEFAULT_MINUTES)
+            res = _calendar_patch_event(event_id, dt, end)
+            logging.info(
+                "%s action=patch_attempt task_id=%s planned_at=%s calendar_event_id=%s "
+                "ok=%s http_status=%s err=%s",
+                P3_CALENDAR_UPDATE,
+                task_id,
+                planned_at,
+                event_id,
+                res.get("ok"),
+                res.get("http_status"),
+                res.get("err"),
+            )
+            if res.get("err") == "not_found":
+                with _get_conn() as conn:
+                    conn.execute(
+                        """
+                        UPDATE tasks
+                        SET calendar_event_id = NULL,
+                            state = 'PLANNED',
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (datetime.now(timezone.utc).isoformat(), task_id),
+                    )
+                    conn.commit()
+                logging.warning(
+                    "%s action=patch_attempt task_id=%s planned_at=%s calendar_event_id=%s "
+                    "reason=patch_404_reset ok=%s http_status=%s err=%s",
+                    P3_CALENDAR_UPDATE,
+                    task_id,
+                    planned_at,
+                    event_id,
+                    res.get("ok"),
+                    res.get("http_status"),
+                    res.get("err"),
+                )
+                continue
+            if not res.get("ok"):
+                logging.warning(
+                    "%s action=patch_attempt task_id=%s planned_at=%s calendar_event_id=%s "
+                    "reason=patch_failed ok=%s http_status=%s err=%s",
+                    P3_CALENDAR_UPDATE,
+                    task_id,
+                    planned_at,
+                    event_id,
+                    res.get("ok"),
+                    res.get("http_status"),
+                    res.get("err"),
+                )
+                continue
+            with _get_conn() as conn:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET state = 'SCHEDULED',
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (datetime.now(timezone.utc).isoformat(), task_id),
+                )
+                conn.commit()
+            logging.info(
+                "%s transition=PLANNED->SCHEDULED reason=patch_success task_id=%s planned_at=%s "
+                "calendar_event_id=%s ok=%s http_status=%s err=%s",
+                P3_CALENDAR_UPDATE,
+                task_id,
+                planned_at,
+                event_id,
+                res.get("ok"),
+                res.get("http_status"),
+                res.get("err"),
+            )
+        except Exception as exc:
+            logging.warning(
+                "%s action=patch_attempt task_id=%s planned_at=%s calendar_event_id=%s err=%s",
+                P3_CALENDAR_UPDATE,
+                row["id"],
+                "",
+                "",
+                str(exc)[:200],
+            )
+            continue
+
+
+def _p4_calendar_cancel_tick(limit: int = 3) -> None:
+    # P4: for future scaffold (cancel_tick). Do not call yet.
+    try:
+        with _get_conn() as conn:
+            _ = conn.execute(
+                """
+                SELECT id, title, planned_at, calendar_event_id, state, updated_at
+                FROM tasks
+                WHERE state = 'CANCELLED'
+                  AND calendar_event_id IS NOT NULL
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+    except Exception as exc:
+        logging.warning("p4_calendar_cancel_tick_error err=%s", str(exc)[:200])
+        return
+    # TODO(P4): plan cancel_event (do not perform).
+    return
+
 def _sync_calendar_for_item(item: dict) -> None:
     # accept sqlite3.Row too
     if not isinstance(item, dict):
@@ -1670,6 +2834,9 @@ def _sync_calendar_for_item(item: dict) -> None:
     title = (item.get("title") or "").strip()
     cal_id = item.get("calendar_event_id")  # None | 'PENDING' | 'FAILED' | '<id>'
     attempts = int(item.get("attempts") or 0)
+    if _get_parent_id_from_row(item) is not None:
+        logging.info("[%s] calendar_state after=SKIP (subtask)", item_id)
+        return
 
     logging.info("[%s] calendar_state before=%s", item_id, cal_id)
 
@@ -1767,7 +2934,7 @@ def _process_items() -> None:
     with _get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT id, title
+            SELECT id, title, type, status, parent_id, parent_id_int
             FROM items
             WHERE status = 'inbox'
               AND (start_at IS NULL OR start_at = '')
@@ -1782,6 +2949,8 @@ def _process_items() -> None:
         item_id = row.get("id")
         if item_id is None:
             continue
+        if _get_parent_id_from_row(row) is not None:
+            continue
         title = row.get("title") or ""
         start = _extract_datetime(title)
         if not start or _is_time_ambiguous(title):
@@ -1790,6 +2959,8 @@ def _process_items() -> None:
         reserved = False
         with _get_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if P2_ENFORCE_STATUS:
+                validate_task_status(row, "active", 0)
             cur = conn.execute(
                 """
                 UPDATE items
@@ -1876,7 +3047,7 @@ def _retry_pending_events() -> None:
     with _get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT id, title, start_at, end_at, attempts
+            SELECT id, title, start_at, end_at, attempts, parent_id, parent_id_int
             FROM items
             WHERE calendar_event_id = 'PENDING'
               AND attempts < ?
@@ -1894,6 +3065,8 @@ def _retry_pending_events() -> None:
         row = as_dict(row)
         item_id = row.get("id")
         if item_id is None:
+            continue
+        if _get_parent_id_from_row(row) is not None:
             continue
         title = row.get("title") or ""
         start_at = row.get("start_at")
@@ -2013,6 +3186,12 @@ def main() -> None:
         marker.write("ok\n")
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     logging.info("organizer-worker started")
+    logging.info(
+        "P3_CALENDAR_MODE mode=%s raw=%s",
+        CALENDAR_SYNC_MODE,
+        _CALENDAR_SYNC_MODE_RAW,
+    )
+    _start_command_server()
     if ASR_DT_SELF_CHECK:
         _selfcheck_asr_datetime()
 
@@ -2033,6 +3212,10 @@ def main() -> None:
             else:
                 time.sleep(B2_IDLE_SLEEP_SEC)
             _process_items()
+            if CALENDAR_SYNC_MODE != "off":
+                _p3_calendar_create_tick()
+                if CALENDAR_SYNC_MODE == "full":
+                    _p3_calendar_update_tick()
         except Exception as exc:
             logging.exception("worker error: %s", exc)
         now = time.time()
