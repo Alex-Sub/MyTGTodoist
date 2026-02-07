@@ -173,69 +173,121 @@ PLANNED | SCHEDULED | calendar create/patch success
 SCHEDULED | PLANNED | re-plan (plan_task)
 SCHEDULED | DONE | complete_task
 SCHEDULED | FAILED | terminal failure (reserved)
-SCHEDULED | CANCELLED | cancel (P4; scaffold only)
+SCHEDULED | CANCELLED | cancel (P4; explicit tick)
 PLANNED | DONE | complete_task
-PLANNED | CANCELLED | cancel (P4; scaffold only)
+PLANNED | CANCELLED | cancel (P4; explicit tick)
 
 Forbidden transitions:
-- DONE / FAILED / CANCELLED → NEW / PLANNED / SCHEDULED (any planning states)
-- Any Calendar-originated state changes (explicitly: no Calendar → Task transitions)
+- DONE / FAILED / CANCELLED → NEW / PLANNED / SCHEDULED
+- Any Calendar → Task transitions
 
-Note:
-- `tasks.state` is the source of truth for lifecycle.
-- `planned_at` is planning intent; calendar sync is explicit ticks.
+Notes:
+- `tasks.state` is the single source of truth for task lifecycle.
+- `planned_at` represents planning intent only.
+- Calendar is a side-effect, managed explicitly by worker ticks.
 
-### 8.1 Task state (source of truth)
-`tasks.state` is the lifecycle indicator used by calendar automation.
+### 8.1 P3: Calendar sync responsibilities
+Responsibilities are explicitly split:
 
-Currently used states:
-- `NEW` (default on create)
-- `PLANNED` (set by `/plan` / plan_task)
-- `SCHEDULED` (set after successful calendar create/patch)
-- `DONE` (set on complete_task)
-- `FAILED` (reserved)
+Task domain:
+- Owns `tasks.state` and `planned_at`.
+- Enforces terminal states.
+- Has no knowledge of Calendar.
 
-### 8.2 Planning
-Worker op: `plan_task(task_id, planned_at_iso)`
-- stores `planned_at`
-- sets `state='PLANNED'` unless task already terminal (DONE/FAILED/CANCELLED)
+Calendar adapter:
+- Performs side-effects: create / patch.
+- Returns structured results (`ok`, `http_status`, `err`).
+- Never mutates task state directly.
 
-Bot command:
-- `/plan <task_id> YYYY-MM-DD HH:MM` (local TZ display; stored as ISO UTC)
+Sync ticks:
+- `create_tick` — creates calendar event for PLANNED tasks.
+- `update_tick` — updates calendar event for re-planned tasks.
+- `cancel_tick` — NOT active in P3 (scaffold only).
 
-### 8.3 Google Calendar integration (in organizer-worker/worker.py)
-Credential source:
-- Service account JSON file: `GOOGLE_SERVICE_ACCOUNT_FILE` (mounted to `/data/google_sa.json`)
-- Calendar id: `GOOGLE_CALENDAR_ID`
+Control flag:
+- `CALENDAR_SYNC_MODE = off | create | full`
+  - `off` — calendar disabled
+  - `create` — `create_tick` only
+  - `full` — `create_tick` + `update_tick` (P3 default)
 
-Create:
-- `_create_event(...)` uses Google API `events().insert(...)`
-- Tick `_p3_calendar_create_tick()`:
-  - selects tasks with `state='PLANNED' AND planned_at IS NOT NULL AND calendar_event_id IS NULL`
-  - claim pattern: sets `calendar_event_id='PENDING:<utc_iso>:<pid>'` to avoid duplicates
-  - on success: `calendar_event_id=<google_event_id>`, `state='SCHEDULED'`
+Unknown values default to `full`.
 
-Update/Patch:
-- `_patch_event(...)` uses Google API `events().patch(...)`
-- Tick `_p3_calendar_update_tick()`:
-  - selects tasks with `state='PLANNED' AND planned_at IS NOT NULL AND calendar_event_id IS NOT NULL`
-  - on success: sets `state='SCHEDULED'`
-  - on 404: clears `calendar_event_id`, sets `state='PLANNED'` (allow recreate)
+### 8.2 P4: Cancel flow (explicit tick)
+Purpose:
+Provide a safe, idempotent cancellation of calendar events for tasks in CANCELLED state.
+
+Trigger conditions:
+- `tasks.state == CANCELLED`
+- `calendar_event_id IS NOT NULL`
+
+Flow:
+1. `cancel_tick` selects tasks matching trigger conditions.
+2. Calendar adapter attempts to cancel/delete the event.
+3. Result handling:
+   - Success (2xx) → clear `calendar_event_id`.
+   - Not found (404) → treated as success, clear `calendar_event_id`.
+   - Any other error → no data change; retry in next tick.
+
+Idempotency:
+- Repeated cancel attempts are safe.
+- 404 is not an error.
+- Clearing `calendar_event_id` terminates the cancel loop.
+
+Data rules:
+- `tasks.state` is NOT changed.
+- `planned_at` is NOT changed.
+- No new fields or migrations.
+
+Execution control:
+- `cancel_tick` runs only when `CALENDAR_SYNC_MODE == full`.
+
+Guarantees:
+- No Calendar → Task autologic.
+- No implicit state transitions.
+- All actions are explicit and observable.
+
+### 8.3 Logging & observability
+P3 log prefixes:
+- `P3_CALENDAR_CREATE`
+- `P3_CALENDAR_UPDATE`
+
+P4 log prefix:
+- `P4_CALENDAR_CANCEL`
+
+Log semantics:
+- `action=*` — attempt without state change
+- `transition=*` — explicit task state transition
+
+Required log fields:
+- `task_id`
+- `calendar_event_id` (when applicable)
+- `state_from` / `state_to` (for transitions)
+- `http_status`
+- `err`
+
+Logs are informational and do not affect control flow.
 
 ---
 
-## 9. Compose / secrets hardening
+## 9. Status summary
+
+P3:
+- FSM formalized and enforced by convention.
+- Calendar sync responsibilities explicit.
+- No side-effects introduced.
+- Status: DONE.
+
+P4:
+- Cancel flow designed and documented.
+- Implementation in progress.
+- Status: IN PROGRESS.
+
+---
+
+## 10. Compose / secrets hardening
 - secrets mount uses **relative** path:
   - `./secrets/alexey/google_sa.json:/data/google_sa.json:ro`
 - `.gitignore` excludes secrets (`secrets/**/*.json`, `.env*`, token/key patterns), keeps `.gitkeep`
 - worker startup check warns if SA path missing/is dir (warn-only)
 
 ---
-
-## 10. Status (as of 2026-02-06)
-- P2 Stages 1–9: ✅
-- P3:
-  - `state` column: ✅
-  - `planned_at` + `/plan` flow: ✅
-  - Calendar create tick: ✅ (creates event, moves to SCHEDULED)
-  - Calendar update tick: ✅ (patches event on replan; one update per plan after filter change)
