@@ -2300,6 +2300,7 @@ def _describe_transition(state_from: str, state_to: str) -> str:
 # === P3: Calendar Adapter (side-effect boundary) ============================
 P3_CALENDAR_CREATE = "P3_CALENDAR_CREATE"
 P3_CALENDAR_UPDATE = "P3_CALENDAR_UPDATE"
+P4_CALENDAR_CANCEL = "P4_CALENDAR_CANCEL"
 
 def _get_calendar_service():
     global _CAL_NOT_CONFIGURED_REASON
@@ -2518,8 +2519,17 @@ def _calendar_patch_event(event_id: str, start: datetime, end: datetime) -> dict
 
 
 def _calendar_cancel_event(event_id: str) -> dict:
-    # P4: scaffold only.
-    return _calendar_result(False, None, None, "not_implemented", None)
+    service = _get_calendar_service()
+    if service is None:
+        return _calendar_result(False, None, None, "no_service", None)
+    try:
+        service.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id).execute()
+        return _calendar_result(True, None, 204, None, None)
+    except Exception as exc:
+        status = _calendar_http_status(exc)
+        if status == 404:
+            return _calendar_result(True, None, 404, "not_found", None)
+        return _calendar_result(False, None, status, f"exception:{type(exc).__name__}", None)
 
 
 # === P3: Sync Ticks ==========================================================
@@ -2809,22 +2819,75 @@ def _p4_calendar_cancel_tick(limit: int = 3) -> None:
     # P4: for future scaffold (cancel_tick). Do not call yet.
     try:
         with _get_conn() as conn:
-            _ = conn.execute(
+            rows = conn.execute(
                 """
                 SELECT id, title, planned_at, calendar_event_id, state, updated_at
                 FROM tasks
                 WHERE state = 'CANCELLED'
                   AND calendar_event_id IS NOT NULL
-                ORDER BY updated_at DESC
+                  AND calendar_event_id != ''
+                ORDER BY updated_at ASC
                 LIMIT ?
                 """,
                 (int(limit),),
             ).fetchall()
     except Exception as exc:
-        logging.warning("p4_calendar_cancel_tick_error err=%s", str(exc)[:200])
+        logging.warning("%s err=%s", P4_CALENDAR_CANCEL, str(exc)[:200])
         return
-    # TODO(P4): plan cancel_event (do not perform).
-    return
+    for row in rows:
+        try:
+            task_id = int(row["id"])
+            event_id = str(row["calendar_event_id"] or "").strip()
+            if not event_id:
+                continue
+            res = _calendar_cancel_event(event_id)
+            logging.info(
+                "%s action=cancel_attempt task_id=%s calendar_event_id=%s ok=%s http_status=%s err=%s",
+                P4_CALENDAR_CANCEL,
+                task_id,
+                event_id,
+                res.get("ok"),
+                res.get("http_status"),
+                res.get("err"),
+            )
+            if res.get("ok"):
+                reason = "already_missing" if res.get("http_status") == 404 else "delete_success"
+                with _get_conn() as conn:
+                    conn.execute(
+                        """
+                        UPDATE tasks
+                        SET calendar_event_id = NULL,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (datetime.now(timezone.utc).isoformat(), task_id),
+                    )
+                    conn.commit()
+                logging.info(
+                    "%s action=cancel_applied task_id=%s cleared_calendar_event_id=1 reason=%s",
+                    P4_CALENDAR_CANCEL,
+                    task_id,
+                    reason,
+                )
+                continue
+            logging.warning(
+                "%s action=cancel_failed task_id=%s calendar_event_id=%s ok=%s http_status=%s err=%s",
+                P4_CALENDAR_CANCEL,
+                task_id,
+                event_id,
+                res.get("ok"),
+                res.get("http_status"),
+                res.get("err"),
+            )
+        except Exception as exc:
+            logging.warning(
+                "%s action=cancel_failed task_id=%s calendar_event_id=%s err=%s",
+                P4_CALENDAR_CANCEL,
+                row["id"],
+                row.get("calendar_event_id"),
+                str(exc)[:200],
+            )
+            continue
 
 def _sync_calendar_for_item(item: dict) -> None:
     # accept sqlite3.Row too
@@ -3216,6 +3279,7 @@ def main() -> None:
                 _p3_calendar_create_tick()
                 if CALENDAR_SYNC_MODE == "full":
                     _p3_calendar_update_tick()
+                    _p4_calendar_cancel_tick()
         except Exception as exc:
             logging.exception("worker error: %s", exc)
         now = time.time()

@@ -213,6 +213,7 @@ Control flag:
 Unknown values default to `full`.
 
 ### 8.2 P4: Cancel flow (explicit tick)
+Status: DONE
 Purpose:
 Provide a safe, idempotent cancellation of calendar events for tasks in CANCELLED state.
 
@@ -232,6 +233,7 @@ Idempotency:
 - Repeated cancel attempts are safe.
 - 404 is not an error.
 - Clearing `calendar_event_id` terminates the cancel loop.
+Clearing `calendar_event_id` is the terminal step of cancel flow.
 
 Data rules:
 - `tasks.state` is NOT changed.
