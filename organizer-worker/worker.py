@@ -39,6 +39,8 @@ CALENDAR_SYNC_MODE = (
     if _CALENDAR_SYNC_MODE_NORM in {"off", "create", "full"}
     else "full"
 )
+REG_NUDGES_MODE = (os.getenv("REG_NUDGES_MODE", "off") or "off").strip().lower()
+REG_NUDGES_INTERVAL_SEC = int(os.getenv("REG_NUDGES_INTERVAL_SEC", "3600"))
 ASR_DT_SELF_CHECK = os.getenv("ASR_DT_SELF_CHECK", "0") == "1"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ASR_SERVICE_URL = os.getenv("ASR_SERVICE_URL", "http://asr-service:8001")
@@ -79,8 +81,11 @@ SCHEMA_PATH = os.getenv("B2_SCHEMA_PATH", "/app/migrations/001_inbox_queue.sql")
 MIGRATIONS_DIR = os.getenv("MIGRATIONS_DIR", "/app/migrations")
 P2_ENFORCE_STATUS = os.getenv("P2_ENFORCE_STATUS", "0") == "1"
 WORKER_COMMAND_PORT = int(os.getenv("WORKER_COMMAND_PORT", "8002"))
+NUDGE_SIGNALS_KEY = "signals_enable_prompt"
 
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
+
+_REG_NUDGE_LAST_SENT: dict[str, float] = {}
 
 def _local_tz() -> timezone:
     return timezone(timedelta(minutes=LOCAL_TZ_OFFSET_MIN))
@@ -1498,6 +1503,7 @@ def _p2_task_row(task_id: int) -> dict:
         row = conn.execute(
             """
             SELECT id, title, status, state, planned_at, calendar_event_id, source_msg_id,
+                   parent_type, parent_id,
                    created_at, updated_at, completed_at
             FROM tasks
             WHERE id = ?
@@ -1527,8 +1533,150 @@ def _p2_subtask_row(subtask_id: int) -> dict:
     return row
 
 
-def cmd_create_task(title: str, status: str, source_msg_id: str | None = None) -> dict:
-    task = p2.create_task(title, status=status, source_msg_id=source_msg_id)
+def _p2_direction_row(direction_id: int) -> dict:
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, title, note, status, source_msg_id, created_at, updated_at
+            FROM directions
+            WHERE id = ?
+            """,
+            (int(direction_id),),
+        ).fetchone()
+    row = as_dict(row)
+    if not row:
+        raise ValueError("direction not found")
+    return row
+
+
+def _p2_project_row(project_id: int) -> dict:
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, direction_id, title, status, source_msg_id, created_at, updated_at, closed_at
+            FROM projects
+            WHERE id = ?
+            """,
+            (int(project_id),),
+        ).fetchone()
+    row = as_dict(row)
+    if not row:
+        raise ValueError("project not found")
+    return row
+
+
+def _p2_cycle_row(cycle_id: int) -> dict:
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, type, period_key, period_start, period_end, status, summary,
+                   source_msg_id, created_at, updated_at, closed_at
+            FROM cycles
+            WHERE id = ?
+            """,
+            (int(cycle_id),),
+        ).fetchone()
+    row = as_dict(row)
+    if not row:
+        raise ValueError("cycle not found")
+    return row
+
+
+def _p2_cycle_outcome_row(outcome_id: int) -> dict:
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, cycle_id, kind, text, created_at
+            FROM cycle_outcomes
+            WHERE id = ?
+            """,
+            (int(outcome_id),),
+        ).fetchone()
+    row = as_dict(row)
+    if not row:
+        raise ValueError("cycle outcome not found")
+    return row
+
+
+def _p2_cycle_goal_row(goal_id: int) -> dict:
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, cycle_id, text, status, continued_from_goal_id, created_at, updated_at
+            FROM cycle_goals
+            WHERE id = ?
+            """,
+            (int(goal_id),),
+        ).fetchone()
+    row = as_dict(row)
+    if not row:
+        raise ValueError("cycle goal not found")
+    return row
+
+
+def _p4_regulation_row(regulation_id: int) -> dict:
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, title, note, status, day_of_month, due_time_local, source_msg_id,
+                   created_at, updated_at
+            FROM regulations
+            WHERE id = ?
+            """,
+            (int(regulation_id),),
+        ).fetchone()
+    row = as_dict(row)
+    if not row:
+        raise ValueError("regulation not found")
+    return row
+
+
+def _p4_regulation_run_row(run_id: int) -> dict:
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, regulation_id, period_key, status, due_date, due_time_local,
+                   done_at, created_at, updated_at
+            FROM regulation_runs
+            WHERE id = ?
+            """,
+            (int(run_id),),
+        ).fetchone()
+    row = as_dict(row)
+    if not row:
+        raise ValueError("regulation_run not found")
+    return row
+
+
+def _normalize_parent_type(parent_type: str | None) -> str | None:
+    if parent_type is None:
+        return None
+    s = str(parent_type).strip().lower()
+    if not s or s == "none":
+        return None
+    if s not in {"project", "cycle", "regulation_run"}:
+        raise ValueError("invalid parent_type")
+    return s
+
+
+def cmd_create_task(
+    title: str,
+    source_msg_id: str | None = None,
+    parent_type: str | None = None,
+    parent_id: int | None = None,
+) -> dict:
+    parent_type_norm = _normalize_parent_type(parent_type)
+    if parent_type_norm and parent_id is None:
+        raise ValueError("parent_id is required")
+    if parent_type_norm is None and parent_id is not None:
+        raise ValueError("parent_type is required when parent_id is set")
+    task = p2.create_task(
+        title,
+        status="NEW",
+        source_msg_id=source_msg_id,
+        parent_type=parent_type_norm,
+        parent_id=int(parent_id) if parent_id is not None else None,
+    )
     return _p2_task_row(task.id)
 
 
@@ -1555,6 +1703,474 @@ def cmd_complete_task(task_id: int) -> dict:
 def cmd_plan_task(task_id: int, planned_at: str) -> dict:
     task = p2.plan_task(task_id, planned_at)
     return _p2_task_row(task.id)
+
+
+def cmd_create_direction(title: str, note: str | None, source_msg_id: str | None) -> dict:
+    direction = p2.create_direction(title, note=note, source_msg_id=source_msg_id)
+    return _p2_direction_row(direction.id)
+
+
+def cmd_create_project(
+    title: str,
+    direction_id: int | None,
+    source_msg_id: str | None,
+) -> dict:
+    project = p2.create_project(title, direction_id=direction_id, source_msg_id=source_msg_id)
+    return _p2_project_row(project.id)
+
+
+def cmd_convert_direction_to_project(
+    direction_id: int,
+    title: str | None,
+    source_msg_id: str | None,
+) -> dict:
+    project = p2.convert_direction_to_project(direction_id, title=title, source_msg_id=source_msg_id)
+    return _p2_project_row(project.id)
+
+
+def cmd_start_cycle(type: str, period_key: str | None, source_msg_id: str | None) -> dict:
+    cycle = p2.start_cycle(type, period_key=period_key, source_msg_id=source_msg_id)
+    return _p2_cycle_row(cycle.id)
+
+
+def cmd_close_cycle(
+    cycle_id: int,
+    status: str,
+    summary: str | None,
+    source_msg_id: str | None,
+) -> dict:
+    _ = source_msg_id
+    cycle = p2.close_cycle(cycle_id, status=status, summary=summary)
+    return _p2_cycle_row(cycle.id)
+
+
+def cmd_add_cycle_outcome(
+    cycle_id: int,
+    kind: str,
+    text: str,
+    source_msg_id: str | None,
+) -> dict:
+    _ = source_msg_id
+    outcome = p2.add_cycle_outcome(cycle_id, kind=kind, text=text)
+    return _p2_cycle_outcome_row(outcome.id)
+
+
+def cmd_add_cycle_goal(
+    cycle_id: int,
+    text: str,
+    source_msg_id: str | None,
+) -> dict:
+    _ = source_msg_id
+    goal = p2.add_cycle_goal(cycle_id, text=text)
+    return _p2_cycle_goal_row(goal.id)
+
+
+def cmd_continue_cycle_goal(
+    goal_id: int,
+    target_cycle_id: int,
+    source_msg_id: str | None,
+) -> dict:
+    _ = source_msg_id
+    goal = p2.continue_cycle_goal(goal_id, target_cycle_id)
+    return _p2_cycle_goal_row(goal.id)
+
+
+def cmd_update_cycle_goal_status(
+    goal_id: int,
+    status: str,
+    source_msg_id: str | None,
+) -> dict:
+    _ = source_msg_id
+    goal = p2.update_cycle_goal_status(goal_id, status=status)
+    return _p2_cycle_goal_row(goal.id)
+
+
+def cmd_create_regulation(
+    title: str,
+    day_of_month: int,
+    note: str | None,
+    due_time_local: str | None,
+    source_msg_id: str | None,
+) -> dict:
+    reg = p2.create_regulation(
+        title=title,
+        day_of_month=day_of_month,
+        note=note,
+        due_time_local=due_time_local,
+        source_msg_id=source_msg_id,
+    )
+    return _p4_regulation_row(reg.id)
+
+
+def cmd_archive_regulation(regulation_id: int, source_msg_id: str | None) -> dict:
+    _ = source_msg_id
+    reg = p2.archive_regulation(regulation_id)
+    return _p4_regulation_row(reg.id)
+
+
+def cmd_update_regulation_schedule(
+    regulation_id: int,
+    day_of_month: int | None,
+    due_time_local: str | None,
+    source_msg_id: str | None,
+) -> dict:
+    _ = source_msg_id
+    reg = p2.update_regulation_schedule(
+        regulation_id,
+        day_of_month=day_of_month,
+        due_time_local=due_time_local,
+    )
+    return _p4_regulation_row(reg.id)
+
+
+def cmd_ensure_regulation_runs(
+    user_id: str | None,
+    period_key: str,
+    source_msg_id: str | None,
+) -> dict:
+    _ = user_id
+    _ = source_msg_id
+    runs = p2.ensure_regulation_runs(period_key)
+    return {
+        "period_key": period_key,
+        "runs": [
+            {
+                "id": r.id,
+                "regulation_id": r.regulation_id,
+                "period_key": r.period_key,
+                "status": r.status,
+                "due_date": r.due_date,
+                "due_time_local": r.due_time_local,
+                "done_at": r.done_at,
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+            }
+            for r in runs
+        ],
+    }
+
+
+def cmd_mark_regulation_done(
+    run_id: int,
+    done_at: str | None,
+    source_msg_id: str | None,
+) -> dict:
+    _ = source_msg_id
+    run = p2.mark_regulation_done(run_id, done_at=done_at)
+    return _p4_regulation_run_row(run.id)
+
+
+def cmd_complete_reg_run(
+    run_id: int,
+    done_at: str | None,
+    source_msg_id: str | None,
+) -> dict:
+    _ = source_msg_id
+    run = p2.complete_regulation_run(run_id, done_at=done_at)
+    return _p4_regulation_run_row(run.id)
+
+
+def cmd_skip_reg_run(
+    run_id: int,
+    source_msg_id: str | None,
+) -> dict:
+    _ = source_msg_id
+    run = p2.skip_regulation_run(run_id)
+    return _p4_regulation_run_row(run.id)
+
+
+def cmd_disable_reg(
+    regulation_id: int,
+    source_msg_id: str | None,
+) -> dict:
+    _ = source_msg_id
+    reg = p2.disable_regulation(regulation_id)
+    return _p4_regulation_row(reg.id)
+
+
+def _ensure_user_settings(user_id: str) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    next_at = (datetime.now(timezone.utc) + timedelta(days=90)).isoformat()
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT user_id, signals_enabled, overload_enabled, drift_enabled, created_at, updated_at "
+            "FROM user_settings WHERE user_id = ?",
+            (str(user_id),),
+        ).fetchone()
+        if not row:
+            conn.execute(
+                """
+                INSERT INTO user_settings (user_id, signals_enabled, overload_enabled, drift_enabled, created_at, updated_at)
+                VALUES (?, 0, 0, 0, ?, ?)
+                """,
+                (str(user_id), now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO user_nudges (user_id, nudge_key, next_at, last_shown_at, created_at, updated_at)
+                VALUES (?, ?, ?, NULL, ?, ?)
+                """,
+                (str(user_id), NUDGE_SIGNALS_KEY, next_at, now, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT user_id, signals_enabled, overload_enabled, drift_enabled, created_at, updated_at "
+                "FROM user_settings WHERE user_id = ?",
+                (str(user_id),),
+            ).fetchone()
+        else:
+            # migrate from signals_enabled if new fields are missing or zeroed
+            try:
+                sig = int(row["signals_enabled"] or 0)
+            except Exception:
+                sig = 0
+            try:
+                overload_enabled = int(row["overload_enabled"] or 0)
+            except Exception:
+                overload_enabled = 0
+            try:
+                drift_enabled = int(row["drift_enabled"] or 0)
+            except Exception:
+                drift_enabled = 0
+            if sig and (overload_enabled == 0 or drift_enabled == 0):
+                conn.execute(
+                    """
+                    UPDATE user_settings
+                    SET overload_enabled = ?,
+                        drift_enabled = ?,
+                        updated_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (sig, sig, now, str(user_id)),
+                )
+                conn.commit()
+            # ensure nudge exists
+            nudge = conn.execute(
+                """
+                SELECT user_id FROM user_nudges WHERE user_id = ? AND nudge_key = ?
+                """,
+                (str(user_id), NUDGE_SIGNALS_KEY),
+            ).fetchone()
+            if not nudge:
+                conn.execute(
+                    """
+                    INSERT INTO user_nudges (user_id, nudge_key, next_at, last_shown_at, created_at, updated_at)
+                    VALUES (?, ?, ?, NULL, ?, ?)
+                    """,
+                    (str(user_id), NUDGE_SIGNALS_KEY, next_at, now, now),
+                )
+                conn.commit()
+    row = as_dict(row)
+    return {
+        "user_id": row.get("user_id"),
+        "signals_enabled": int(row.get("signals_enabled") or 0),
+        "overload_enabled": int(row.get("overload_enabled") or 0),
+        "drift_enabled": int(row.get("drift_enabled") or 0),
+    }
+
+
+def cmd_set_signals_enabled(user_id: str, enabled: int) -> dict:
+    enabled_val = 1 if int(enabled) else 0
+    now = datetime.now(timezone.utc).isoformat()
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT user_id, signals_enabled, overload_enabled, drift_enabled FROM user_settings WHERE user_id = ?",
+            (str(user_id),),
+        ).fetchone()
+        if not row:
+            conn.execute(
+                """
+                INSERT INTO user_settings (user_id, signals_enabled, overload_enabled, drift_enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (str(user_id), enabled_val, enabled_val, enabled_val, now, now),
+            )
+        else:
+            if int(row["signals_enabled"] or 0) != enabled_val:
+                conn.execute(
+                    """
+                    UPDATE user_settings
+                    SET signals_enabled = ?,
+                        overload_enabled = ?,
+                        drift_enabled = ?,
+                        updated_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (enabled_val, enabled_val, enabled_val, now, str(user_id)),
+                )
+        conn.commit()
+        row = conn.execute(
+            "SELECT user_id, signals_enabled, overload_enabled, drift_enabled FROM user_settings WHERE user_id = ?",
+            (str(user_id),),
+        ).fetchone()
+    row = as_dict(row)
+    return {
+        "user_id": row.get("user_id"),
+        "signals_enabled": int(row.get("signals_enabled") or 0),
+        "overload_enabled": int(row.get("overload_enabled") or 0),
+        "drift_enabled": int(row.get("drift_enabled") or 0),
+    }
+
+
+def cmd_set_module_enabled(user_id: str, module: str, enabled: int) -> dict:
+    mod = (module or "").strip().lower()
+    if mod not in {"overload", "drift"}:
+        raise ValueError("invalid module")
+    enabled_val = 1 if int(enabled) else 0
+    now = datetime.now(timezone.utc).isoformat()
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT user_id, overload_enabled, drift_enabled FROM user_settings WHERE user_id = ?",
+            (str(user_id),),
+        ).fetchone()
+        if not row:
+            overload_val = enabled_val if mod == "overload" else 0
+            drift_val = enabled_val if mod == "drift" else 0
+            conn.execute(
+                """
+                INSERT INTO user_settings (user_id, signals_enabled, overload_enabled, drift_enabled, created_at, updated_at)
+                VALUES (?, 0, ?, ?, ?, ?)
+                """,
+                (str(user_id), overload_val, drift_val, now, now),
+            )
+        else:
+            if mod == "overload":
+                conn.execute(
+                    """
+                    UPDATE user_settings
+                    SET overload_enabled = ?,
+                        updated_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (enabled_val, now, str(user_id)),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE user_settings
+                    SET drift_enabled = ?,
+                        updated_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (enabled_val, now, str(user_id)),
+                )
+        conn.commit()
+        row = conn.execute(
+            "SELECT user_id, overload_enabled, drift_enabled FROM user_settings WHERE user_id = ?",
+            (str(user_id),),
+        ).fetchone()
+    row = as_dict(row)
+    return {
+        "user_id": row.get("user_id"),
+        "overload_enabled": int(row.get("overload_enabled") or 0),
+        "drift_enabled": int(row.get("drift_enabled") or 0),
+    }
+
+
+def cmd_set_modules_enabled_bulk(user_id: str, overload_enabled: int, drift_enabled: int) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT user_id FROM user_settings WHERE user_id = ?",
+            (str(user_id),),
+        ).fetchone()
+        if not row:
+            conn.execute(
+                """
+                INSERT INTO user_settings (user_id, signals_enabled, overload_enabled, drift_enabled, created_at, updated_at)
+                VALUES (?, 0, ?, ?, ?, ?)
+                """,
+                (str(user_id), int(overload_enabled), int(drift_enabled), now, now),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE user_settings
+                SET overload_enabled = ?,
+                    drift_enabled = ?,
+                    updated_at = ?
+                WHERE user_id = ?
+                """,
+                (int(overload_enabled), int(drift_enabled), now, str(user_id)),
+            )
+        conn.commit()
+        row = conn.execute(
+            "SELECT user_id, overload_enabled, drift_enabled FROM user_settings WHERE user_id = ?",
+            (str(user_id),),
+        ).fetchone()
+    row = as_dict(row)
+    return {
+        "user_id": row.get("user_id"),
+        "overload_enabled": int(row.get("overload_enabled") or 0),
+        "drift_enabled": int(row.get("drift_enabled") or 0),
+    }
+
+
+def cmd_snooze_nudge(user_id: str, nudge_key: str, days: int) -> dict:
+    now = datetime.now(timezone.utc)
+    target = now + timedelta(days=int(days))
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT user_id, nudge_key, next_at
+            FROM user_nudges
+            WHERE user_id = ? AND nudge_key = ?
+            """,
+            (str(user_id), str(nudge_key)),
+        ).fetchone()
+        if not row:
+            conn.execute(
+                """
+                INSERT INTO user_nudges (user_id, nudge_key, next_at, last_shown_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(user_id),
+                    str(nudge_key),
+                    target.isoformat(),
+                    now.isoformat(),
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+        else:
+            try:
+                existing = datetime.fromisoformat(str(row["next_at"]))
+            except Exception:
+                existing = None
+            next_use = existing if (existing and existing >= target) else target
+            conn.execute(
+                """
+                UPDATE user_nudges
+                SET next_at = ?,
+                    last_shown_at = ?,
+                    updated_at = ?
+                WHERE user_id = ? AND nudge_key = ?
+                """,
+                (
+                    next_use.isoformat(),
+                    now.isoformat(),
+                    now.isoformat(),
+                    str(user_id),
+                    str(nudge_key),
+                ),
+            )
+        conn.commit()
+        row = conn.execute(
+            """
+            SELECT user_id, nudge_key, next_at, last_shown_at
+            FROM user_nudges
+            WHERE user_id = ? AND nudge_key = ?
+            """,
+            (str(user_id), str(nudge_key)),
+        ).fetchone()
+    row = as_dict(row)
+    return {
+        "user_id": row.get("user_id"),
+        "nudge_key": row.get("nudge_key"),
+        "next_at": row.get("next_at"),
+        "last_shown_at": row.get("last_shown_at"),
+    }
 
 
 class _CommandHandler(BaseHTTPRequestHandler):
@@ -1589,8 +2205,162 @@ class _CommandHandler(BaseHTTPRequestHandler):
             if self.path == "/p2/commands/create_task":
                 res = cmd_create_task(
                     data.get("title") or "",
-                    data.get("status") or "NEW",
                     data.get("source_msg_id"),
+                    data.get("parent_type"),
+                    data.get("parent_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/create_direction":
+                if not data.get("title"):
+                    raise ValueError("title is required")
+                res = cmd_create_direction(
+                    data.get("title") or "",
+                    data.get("note"),
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/create_project":
+                if not data.get("title"):
+                    raise ValueError("title is required")
+                direction_id = data.get("direction_id")
+                res = cmd_create_project(
+                    data.get("title") or "",
+                    int(direction_id) if direction_id is not None else None,
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/convert_direction_to_project":
+                if data.get("direction_id") is None:
+                    raise ValueError("direction_id is required")
+                res = cmd_convert_direction_to_project(
+                    int(data.get("direction_id")),
+                    data.get("title"),
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/start_cycle":
+                if not data.get("type"):
+                    raise ValueError("type is required")
+                res = cmd_start_cycle(
+                    data.get("type") or "",
+                    data.get("period_key"),
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/close_cycle":
+                if data.get("cycle_id") is None:
+                    raise ValueError("cycle_id is required")
+                status = data.get("status") or ""
+                status_norm = status.strip().upper()
+                if status_norm not in {"DONE", "SKIPPED"}:
+                    raise ValueError("status must be DONE or SKIPPED")
+                res = cmd_close_cycle(
+                    int(data.get("cycle_id")),
+                    status_norm,
+                    data.get("summary"),
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/add_cycle_outcome":
+                if data.get("cycle_id") is None:
+                    raise ValueError("cycle_id is required")
+                if not data.get("kind"):
+                    raise ValueError("kind is required")
+                if not data.get("text"):
+                    raise ValueError("text is required")
+                res = cmd_add_cycle_outcome(
+                    int(data.get("cycle_id")),
+                    data.get("kind") or "",
+                    data.get("text") or "",
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/add_cycle_goal":
+                if data.get("cycle_id") is None:
+                    raise ValueError("cycle_id is required")
+                if not data.get("text"):
+                    raise ValueError("text is required")
+                res = cmd_add_cycle_goal(
+                    int(data.get("cycle_id")),
+                    data.get("text") or "",
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/continue_cycle_goal":
+                if data.get("goal_id") is None:
+                    raise ValueError("goal_id is required")
+                if data.get("target_cycle_id") is None:
+                    raise ValueError("target_cycle_id is required")
+                res = cmd_continue_cycle_goal(
+                    int(data.get("goal_id")),
+                    int(data.get("target_cycle_id")),
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/update_cycle_goal_status":
+                if data.get("goal_id") is None:
+                    raise ValueError("goal_id is required")
+                if not data.get("status"):
+                    raise ValueError("status is required")
+                res = cmd_update_cycle_goal_status(
+                    int(data.get("goal_id")),
+                    str(data.get("status")),
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/ensure_user_settings":
+                if not data.get("user_id"):
+                    raise ValueError("user_id is required")
+                res = _ensure_user_settings(str(data.get("user_id")))
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/set_signals_enabled":
+                if not data.get("user_id"):
+                    raise ValueError("user_id is required")
+                enabled = data.get("enabled")
+                if enabled is None:
+                    raise ValueError("enabled is required")
+                res = cmd_set_signals_enabled(str(data.get("user_id")), int(enabled))
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/snooze_nudge":
+                if not data.get("user_id"):
+                    raise ValueError("user_id is required")
+                nudge_key = data.get("nudge_key") or NUDGE_SIGNALS_KEY
+                days = int(data.get("days") or 90)
+                res = cmd_snooze_nudge(str(data.get("user_id")), str(nudge_key), days)
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/set_module_enabled":
+                if not data.get("user_id"):
+                    raise ValueError("user_id is required")
+                if not data.get("module"):
+                    raise ValueError("module is required")
+                enabled = data.get("enabled")
+                if enabled is None:
+                    raise ValueError("enabled is required")
+                res = cmd_set_module_enabled(str(data.get("user_id")), str(data.get("module")), int(enabled))
+                self._send_json(200, res)
+                return
+            if self.path == "/p2/commands/set_modules_enabled_bulk":
+                if not data.get("user_id"):
+                    raise ValueError("user_id is required")
+                if data.get("overload_enabled") is None or data.get("drift_enabled") is None:
+                    raise ValueError("overload_enabled and drift_enabled are required")
+                res = cmd_set_modules_enabled_bulk(
+                    str(data.get("user_id")),
+                    int(data.get("overload_enabled")),
+                    int(data.get("drift_enabled")),
                 )
                 self._send_json(200, res)
                 return
@@ -1623,6 +2393,85 @@ class _CommandHandler(BaseHTTPRequestHandler):
                 if not data.get("planned_at"):
                     raise ValueError("planned_at is required")
                 res = cmd_plan_task(int(data.get("task_id")), str(data.get("planned_at")))
+                self._send_json(200, res)
+                return
+            if self.path == "/p4/commands/create_regulation":
+                if not data.get("title"):
+                    raise ValueError("title is required")
+                day_val = data.get("day_of_month")
+                res = cmd_create_regulation(
+                    data.get("title") or "",
+                    int(day_val) if day_val is not None else 1,
+                    data.get("note"),
+                    data.get("due_time_local"),
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p4/commands/archive_regulation":
+                if data.get("regulation_id") is None:
+                    raise ValueError("regulation_id is required")
+                res = cmd_archive_regulation(int(data.get("regulation_id")), data.get("source_msg_id"))
+                self._send_json(200, res)
+                return
+            if self.path == "/p4/commands/update_regulation_schedule":
+                if data.get("regulation_id") is None:
+                    raise ValueError("regulation_id is required")
+                day_of_month = data.get("day_of_month")
+                res = cmd_update_regulation_schedule(
+                    int(data.get("regulation_id")),
+                    int(day_of_month) if day_of_month is not None else None,
+                    data.get("due_time_local"),
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p4/commands/ensure_regulation_runs":
+                if not data.get("period_key"):
+                    raise ValueError("period_key is required")
+                res = cmd_ensure_regulation_runs(
+                    data.get("user_id"),
+                    str(data.get("period_key")),
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p4/commands/mark_regulation_done":
+                if data.get("run_id") is None:
+                    raise ValueError("run_id is required")
+                res = cmd_mark_regulation_done(
+                    int(data.get("run_id")),
+                    data.get("done_at"),
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p4/commands/complete_reg_run":
+                if data.get("run_id") is None:
+                    raise ValueError("run_id is required")
+                res = cmd_complete_reg_run(
+                    int(data.get("run_id")),
+                    data.get("done_at"),
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p4/commands/skip_reg_run":
+                if data.get("run_id") is None:
+                    raise ValueError("run_id is required")
+                res = cmd_skip_reg_run(
+                    int(data.get("run_id")),
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p4/commands/disable_reg":
+                if data.get("regulation_id") is None:
+                    raise ValueError("regulation_id is required")
+                res = cmd_disable_reg(
+                    int(data.get("regulation_id")),
+                    data.get("source_msg_id"),
+                )
                 self._send_json(200, res)
                 return
             self._send_json(404, {"error": "not found"})
@@ -2889,6 +3738,63 @@ def _p4_calendar_cancel_tick(limit: int = 3) -> None:
             )
             continue
 
+def _p4_reg_nudge_should_emit(mode: str, today: date, due_date: date) -> bool:
+    mode_norm = (mode or "off").strip().lower()
+    if mode_norm == "off":
+        return False
+    if mode_norm == "daily":
+        return True
+    if mode_norm == "due_day":
+        return today == due_date
+    return False
+
+
+def _p4_reg_nudge_tick(limit: int = 50) -> None:
+    mode = REG_NUDGES_MODE
+    if mode not in {"daily", "due_day"}:
+        return
+    now_local = datetime.now(_local_tz())
+    today = now_local.date()
+    period_key = f"{today.year:04d}-{today.month:02d}"
+    try:
+        with _get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT rr.id, rr.regulation_id, rr.period_key, rr.status, rr.due_date, r.title
+                FROM regulation_runs rr
+                JOIN regulations r ON r.id = rr.regulation_id
+                WHERE rr.period_key = ?
+                  AND rr.status = 'OPEN'
+                  AND r.status = 'ACTIVE'
+                ORDER BY rr.id ASC
+                LIMIT ?
+                """,
+                (period_key, int(limit)),
+            ).fetchall()
+    except Exception as exc:
+        logging.warning("P4_REG_NUDGE action=fetch_error err=%s", str(exc)[:200])
+        return
+    for row in rows:
+        try:
+            due_date = date.fromisoformat(str(row["due_date"]))
+        except Exception:
+            continue
+        if not _p4_reg_nudge_should_emit(mode, today, due_date):
+            continue
+        key = f"{today.isoformat()}:{period_key}:{int(row['id'])}"
+        if _REG_NUDGE_LAST_SENT.get(key):
+            continue
+        _REG_NUDGE_LAST_SENT[key] = time.time()
+        logging.info(
+            "P4_REG_NUDGE action=emit reg_run_id=%s regulation_id=%s period_key=%s due_date=%s mode=%s dedup=%s",
+            row["id"],
+            row["regulation_id"],
+            period_key,
+            row["due_date"],
+            mode,
+            key,
+        )
+
 def _sync_calendar_for_item(item: dict) -> None:
     # accept sqlite3.Row too
     if not isinstance(item, dict):
@@ -3260,6 +4166,7 @@ def main() -> None:
 
     last_heartbeat = 0.0
     last_requeue = 0.0
+    last_reg_nudge = 0.0
     while True:
         try:
             _queue_reaper()
@@ -3269,6 +4176,9 @@ def main() -> None:
                 if moved:
                     logging.info("requeued FAILED->NEW: %s", moved)
                 last_requeue = now
+            if REG_NUDGES_INTERVAL_SEC > 0 and (now - last_reg_nudge) >= REG_NUDGES_INTERVAL_SEC:
+                _p4_reg_nudge_tick()
+                last_reg_nudge = now
             row = _queue_claim()
             if row:
                 _process_queue_item(row)

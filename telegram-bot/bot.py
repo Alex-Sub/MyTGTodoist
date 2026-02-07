@@ -7,12 +7,20 @@ import re
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta, timezone, date
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - fallback for minimal runtime
+    ZoneInfo = None
 
-import requests
+try:
+    import requests  # type: ignore
+except Exception:  # pragma: no cover - fallback for minimal runtime
+    requests = None
 
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ORGANIZER_API_URL = os.getenv("ORGANIZER_API_URL", "http://organizer-api:8000")
+WORKER_COMMAND_URL = os.getenv("WORKER_COMMAND_URL", "http://organizer-worker:8002")
 HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8082"))
 STATE_PATH = os.getenv("STATE_PATH", "/data/bot.offset")
 TG_DRAIN_ON_START = os.getenv("TG_DRAIN_ON_START", "0") == "1"
@@ -24,13 +32,1021 @@ B2_QUEUE_MAX_TOTAL = int(os.getenv("B2_QUEUE_MAX_TOTAL", "500"))
 B2_BACKPRESSURE_MODE = os.getenv("B2_BACKPRESSURE_MODE", "reject")
 SCHEMA_PATH = os.getenv("B2_SCHEMA_PATH", "/app/migrations/001_inbox_queue.sql")
 LOCAL_TZ_OFFSET_MIN = int(os.getenv("LOCAL_TZ_OFFSET_MIN", "180"))  # +03:00
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 DEFAULT_MEETING_MINUTES = int(os.getenv("MEETING_DEFAULT_MINUTES", "30"))
 TG_SEND_MAX_RETRIES = int(os.getenv("TG_SEND_MAX_RETRIES", "2"))
 CLARIFY_STATE_PATH = os.getenv("CLARIFY_STATE_PATH", "/data/bot.clarify.json")
 CLARIFY_TTL_SEC = int(os.getenv("CLARIFY_TTL_SEC", "180"))
+NUDGE_SIGNALS_KEY = "signals_enable_prompt"
+_P2_PENDING_PATH_ENV = os.getenv("P2_PENDING_PATH")
+if _P2_PENDING_PATH_ENV:
+    P2_PENDING_PATH = _P2_PENDING_PATH_ENV
+else:
+    _pending_dir = "/data" if os.path.isdir("/data") else "./data"
+    P2_PENDING_PATH = os.path.join(_pending_dir, "bot.p2_pending.json")
+P2_PENDING_TTL_SEC = int(os.getenv("P2_PENDING_TTL_SEC", "300"))
+
+_p2_pending_state: dict[int, dict] = {}
+
+def _worker_post(path: str, payload: dict) -> dict | None:
+    try:
+        if requests is not None:
+            resp = requests.post(
+                f"{WORKER_COMMAND_URL}{path}",
+                json=payload,
+                timeout=TG_HTTP_TIMEOUT,
+            )
+            if resp.status_code >= 300:
+                print(f"p2_cmd_http_error status={resp.status_code} path={path} body={resp.text[:200]}")
+                return None
+            data = _safe_json(resp)
+            return data if isinstance(data, dict) else None
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{WORKER_COMMAND_URL}{path}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=_timeout_seconds()) as resp:
+            body = resp.read()
+        data = json.loads(body.decode("utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception as exc:
+        print(f"p2_cmd_http_error path={path} err={str(exc)[:200]}")
+        return None
+
+
+def _worker_post_ex(path: str, payload: dict) -> tuple[bool, dict | None, int | None, str | None]:
+    try:
+        if requests is not None:
+            resp = requests.post(
+                f"{WORKER_COMMAND_URL}{path}",
+                json=payload,
+                timeout=TG_HTTP_TIMEOUT,
+            )
+            status = int(resp.status_code)
+            if status >= 300:
+                return False, None, status, (resp.text or "")[:500]
+            data = _safe_json(resp)
+            return True, data if isinstance(data, dict) else None, status, None
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{WORKER_COMMAND_URL}{path}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=_timeout_seconds()) as resp:
+            status = int(getattr(resp, "status", 200))
+            body = resp.read()
+        if status >= 300:
+            return False, None, status, body.decode("utf-8")[:500]
+        parsed = json.loads(body.decode("utf-8"))
+        return True, parsed if isinstance(parsed, dict) else None, status, None
+    except Exception as exc:
+        return False, None, None, str(exc)[:500]
+
+
+def _api_get_ex(path: str, params: dict | None = None) -> tuple[bool, dict | list | None, int | None, str | None]:
+    try:
+        if requests is not None:
+            resp = requests.get(f"{ORGANIZER_API_URL}{path}", params=params or {}, timeout=TG_HTTP_TIMEOUT)
+            status = int(resp.status_code)
+            if status >= 300:
+                return False, None, status, (resp.text or "")[:500]
+            data = _safe_json(resp)
+            return True, data, status, None
+        query = urllib.parse.urlencode(params or {})
+        url = f"{ORGANIZER_API_URL}{path}"
+        if query:
+            url = f"{url}?{query}"
+        with urllib.request.urlopen(url, timeout=_timeout_seconds()) as resp:
+            status = int(getattr(resp, "status", 200))
+            body = resp.read()
+        if status >= 300:
+            return False, None, status, body.decode("utf-8")[:500]
+        data = json.loads(body.decode("utf-8"))
+        return True, data, status, None
+    except Exception as exc:
+        return False, None, None, str(exc)[:500]
+
+
+def _timeout_seconds() -> float:
+    t = TG_HTTP_TIMEOUT
+    if isinstance(t, (int, float)):
+        return float(t)
+    if isinstance(t, (tuple, list)) and len(t) >= 2:
+        return float(t[1])
+    if isinstance(t, (tuple, list)) and len(t) == 1:
+        return float(t[0])
+    return 10.0
+
+
+def _normalize_ws(text: str) -> str:
+    return " ".join((text or "").split())
+
+
+def _normalize_due_time_local(text: str) -> str | None:
+    s = (text or "").strip()
+    if not s:
+        return None
+    if s in {"-", "нет", "skip"}:
+        return None
+    if not re.match(r"^\d{2}:\d{2}$", s):
+        raise ValueError("invalid due_time_local")
+    hh = int(s[:2])
+    mm = int(s[3:])
+    if hh > 23 or mm > 59:
+        raise ValueError("invalid due_time_local")
+    return s
+
+
+_REGS_PAGE_SIZE = 10
+_REGS_MONTHS_RU = [
+    "Январь",
+    "Февраль",
+    "Март",
+    "Апрель",
+    "Май",
+    "Июнь",
+    "Июль",
+    "Август",
+    "Сентябрь",
+    "Октябрь",
+    "Ноябрь",
+    "Декабрь",
+]
+
+
+def _regs_period_key(dt: datetime) -> str:
+    return f"{dt.year:04d}-{dt.month:02d}"
+
+
+def _regs_parse_period_key(period_key: str) -> tuple[int, int] | None:
+    try:
+        parts = (period_key or "").split("-")
+        if len(parts) != 2:
+            return None
+        y = int(parts[0])
+        m = int(parts[1])
+        if m < 1 or m > 12:
+            return None
+        return y, m
+    except Exception:
+        return None
+
+
+def _regs_shift_period(period_key: str, delta_months: int) -> str | None:
+    parsed = _regs_parse_period_key(period_key)
+    if not parsed:
+        return None
+    y, m = parsed
+    m = m + int(delta_months)
+    while m > 12:
+        y += 1
+        m -= 12
+    while m < 1:
+        y -= 1
+        m += 12
+    return f"{y:04d}-{m:02d}"
+
+
+def _regs_month_label(period_key: str) -> str:
+    parsed = _regs_parse_period_key(period_key)
+    if not parsed:
+        return period_key
+    y, m = parsed
+    name = _REGS_MONTHS_RU[m - 1]
+    return f"{name} {y}"
+
+
+def _regs_status_from_run(status: str | None) -> str:
+    s = (status or "").strip().upper()
+    if s == "DONE":
+        return "DONE"
+    if s in {"MISSED", "SKIPPED"}:
+        return "MISSED"
+    if s == "OPEN":
+        return "DUE"
+    return "DUE"
+
+
+def _regs_status_icon(label: str) -> str:
+    if label == "DONE":
+        return "🟢"
+    if label == "MISSED":
+        return "⚠️"
+    return "🔴"
+
+
+def _regs_sort_key(item: dict) -> tuple[int, str]:
+    order = {"DUE": 0, "MISSED": 1, "DONE": 2}
+    label = item.get("status_label") or "DUE"
+    return (order.get(label, 0), (item.get("title") or "").lower())
+
+
+def _regs_source_msg_id(chat_id: int, message_id: int, action: str) -> str:
+    return f"tg:{chat_id}:{int(message_id)}:regs:{action}"
+
+
+def _edit_message_with_keyboard(chat_id: int, message_id: int, text: str, reply_markup: dict | None) -> None:
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    try:
+        resp = requests.post(_api_url("editMessageText"), json=payload, timeout=TG_HTTP_TIMEOUT)
+        resp.raise_for_status()
+    except Exception:
+        return
+
+
+def _truncate(text: str, max_len: int = 80) -> str:
+    s = _normalize_ws(text)
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
+
+
+def _planned_at_local(iso_text: str | None) -> str:
+    if not iso_text:
+        return ""
+    try:
+        s = iso_text.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local_dt = dt.astimezone(_tz_local())
+        return local_dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
+def _slice_page(items: list, page: int, page_size: int = 10) -> list:
+    if page < 1 or page > 50:
+        return []
+    start = (page - 1) * page_size
+    end = start + page_size
+    return items[start:end]
+
+
+def _source_msg_id(chat_id: int, message_id: int | None) -> str | None:
+    if message_id is None:
+        return None
+    return f"tg:{chat_id}:{int(message_id)}"
+
+
+def _p2_handle_text(chat_id: int, message_id: int | None, text: str) -> None:
+    src_id = _source_msg_id(chat_id, message_id)
+    if not src_id:
+        return
+    raw = text.strip()
+    now_ts = time.time()
+    _prune_p2_pending_state(_p2_pending_state, now_ts)
+    pending = _p2_pending_state.get(chat_id)
+    if pending and raw and not raw.startswith("/"):
+        mode = pending.get("mode")
+        if mode == "task":
+            parent_type = pending.get("parent_type")
+            parent_id = pending.get("parent_id")
+            ok, data, status, err_text = _worker_post_ex(
+                "/p2/commands/create_task",
+                {
+                    "title": raw,
+                    "status": "NEW",
+                    "source_msg_id": src_id,
+                    "parent_type": parent_type,
+                    "parent_id": parent_id,
+                },
+            )
+            if ok and data:
+                _send_message(chat_id, f"✅ Задача создана: task #{data.get('id')}")
+            else:
+                print(f"p2_cmd=create_task_pending source_msg_id={src_id} ok=0 status={status} err={err_text}")
+                _send_message(chat_id, "⚠️ Не удалось создать задачу.")
+        elif mode == "cycle_outcome":
+            cycle_id = pending.get("cycle_id")
+            kind = pending.get("kind")
+            ok, data, status, err_text = _worker_post_ex(
+                "/p2/commands/add_cycle_outcome",
+                {"cycle_id": cycle_id, "kind": kind, "text": raw, "source_msg_id": src_id},
+            )
+            if ok and data:
+                _send_message(chat_id, f"✅ Результат добавлен: outcome #{data.get('id')}")
+            else:
+                print(f"p2_cmd=add_cycle_outcome source_msg_id={src_id} ok=0 status={status} err={err_text}")
+                _send_message(chat_id, "⚠️ Не удалось добавить результат.")
+            _p2_pending_state.pop(chat_id, None)
+            _save_p2_pending_state(_p2_pending_state)
+            return
+        if mode == "project_create":
+            ok, data, status, err_text = _worker_post_ex(
+                "/p2/commands/create_project",
+                {"title": raw, "source_msg_id": src_id},
+            )
+            if ok and data:
+                _send_message(chat_id, f"✅ Проект создан: #{data.get('id')}")
+            else:
+                print(f"p2_cmd=create_project source_msg_id={src_id} ok=0 status={status} err={err_text}")
+                _send_message(chat_id, "⚠️ Не удалось создать проект.")
+            _p2_pending_state.pop(chat_id, None)
+            _save_p2_pending_state(_p2_pending_state)
+            return
+        if mode == "reg_add":
+            step = int(pending.get("step") or 1)
+            if step == 1:
+                _p2_pending_state[chat_id] = {
+                    "mode": "reg_add",
+                    "step": 2,
+                    "title": raw,
+                    "expires_at": time.time() + P2_PENDING_TTL_SEC,
+                }
+                _save_p2_pending_state(_p2_pending_state)
+                _send_message(chat_id, "День месяца (1-31):")
+                return
+            if step == 2:
+                try:
+                    day_of_month = int(raw)
+                except Exception:
+                    _send_message(chat_id, "Формат: число 1-31.")
+                    return
+                if day_of_month < 1 or day_of_month > 31:
+                    _send_message(chat_id, "Формат: число 1-31.")
+                    return
+                _p2_pending_state[chat_id] = {
+                    "mode": "reg_add",
+                    "step": 3,
+                    "title": pending.get("title") or "",
+                    "day_of_month": day_of_month,
+                    "expires_at": time.time() + P2_PENDING_TTL_SEC,
+                }
+                _save_p2_pending_state(_p2_pending_state)
+                _send_message(chat_id, "Время (HH:MM) или '-' если без времени:")
+                return
+            if step == 3:
+                try:
+                    due_time_local = _normalize_due_time_local(raw)
+                except Exception:
+                    _send_message(chat_id, "Формат: HH:MM или '-'")
+                    return
+                ok, data, status, err_text = _worker_post_ex(
+                    "/p4/commands/create_regulation",
+                    {
+                        "title": pending.get("title") or "",
+                        "day_of_month": int(pending.get("day_of_month") or 1),
+                        "due_time_local": due_time_local,
+                        "source_msg_id": src_id,
+                    },
+                )
+                if ok and data:
+                    _send_message(chat_id, f"✅ Регламент создан: #{data.get('id')}")
+                else:
+                    print(f"p4_cmd=create_regulation source_msg_id={src_id} ok=0 status={status} err={err_text}")
+                    _send_message(chat_id, "⚠️ Не удалось создать регламент.")
+                _p2_pending_state.pop(chat_id, None)
+                _save_p2_pending_state(_p2_pending_state)
+                return
+        if mode == "cycle_goal":
+            cycle_id = pending.get("cycle_id")
+            count = int(pending.get("count") or 0)
+            if raw.strip().lower() in {"готово", "стоп", "хватит"} and count >= 1:
+                _p2_pending_state.pop(chat_id, None)
+                _save_p2_pending_state(_p2_pending_state)
+                _send_message_with_keyboard(
+                    chat_id,
+                    f"Цели собраны для цикла #{cycle_id}. Что дальше?",
+                    {
+                        "inline_keyboard": [
+                            [
+                                {
+                                    "text": "Добавить задачу",
+                                    "callback_data": f"p2:cycle:add_task:{cycle_id}",
+                                },
+                                {
+                                    "text": "Добавить проект",
+                                    "callback_data": f"p2:cycle:add_project:{cycle_id}",
+                                },
+                            ],
+                            [
+                                {
+                                    "text": "Закрыть цикл",
+                                    "callback_data": f"p2:cycle:close:{cycle_id}",
+                                }
+                            ],
+                        ]
+                    },
+                )
+                return
+            ok, data, status, err_text = _worker_post_ex(
+                "/p2/commands/add_cycle_goal",
+                {"cycle_id": cycle_id, "text": raw, "source_msg_id": src_id},
+            )
+            if ok and data:
+                count += 1
+                if count >= 3:
+                    _p2_pending_state.pop(chat_id, None)
+                    _save_p2_pending_state(_p2_pending_state)
+                    _send_message_with_keyboard(
+                        chat_id,
+                        f"Цели собраны для цикла #{cycle_id}. Что дальше?",
+                        {
+                            "inline_keyboard": [
+                                [
+                                    {
+                                        "text": "Добавить задачу",
+                                        "callback_data": f"p2:cycle:add_task:{cycle_id}",
+                                    },
+                                    {
+                                        "text": "Добавить проект",
+                                        "callback_data": f"p2:cycle:add_project:{cycle_id}",
+                                    },
+                                ],
+                                [
+                                    {
+                                        "text": "Закрыть цикл",
+                                        "callback_data": f"p2:cycle:close:{cycle_id}",
+                                    }
+                                ],
+                            ]
+                        },
+                    )
+                    return
+                _p2_pending_state[chat_id] = {
+                    "mode": "cycle_goal",
+                    "cycle_id": cycle_id,
+                    "count": count,
+                    "expires_at": time.time() + P2_PENDING_TTL_SEC,
+                }
+                _save_p2_pending_state(_p2_pending_state)
+                _send_message(chat_id, f"Цель {count + 1}/3:")
+            else:
+                print(f"p2_cmd=add_cycle_goal source_msg_id={src_id} ok=0 status={status} err={err_text}")
+                _send_message(chat_id, "⚠️ Не удалось добавить цель.")
+            return
+        if mode == "task_plan":
+            task_id = pending.get("task_id")
+            try:
+                planned_iso, planned_local = _parse_plan_input(raw)
+            except Exception:
+                _send_message(chat_id, "Формат: YYYY-MM-DD HH:MM")
+                return
+            ok, data, status, err_text = _worker_post_ex(
+                "/p2/commands/plan_task",
+                {"task_id": task_id, "planned_at": planned_iso, "source_msg_id": src_id},
+            )
+            if ok and data:
+                _send_message(chat_id, f"Ок, запланировал на {planned_local}.")
+                _p2_pending_state.pop(chat_id, None)
+                _save_p2_pending_state(_p2_pending_state)
+                return
+            print(f"p2_cmd=plan_task_pending source_msg_id={src_id} ok=0 status={status} err={err_text}")
+            _send_message(chat_id, "⚠️ Не удалось запланировать.")
+            return
+        _p2_pending_state.pop(chat_id, None)
+        _save_p2_pending_state(_p2_pending_state)
+        return
+    if raw == "/help":
+        _send_message(
+            chat_id,
+            "\n".join(
+                [
+                    "Команды:",
+                    "Inbox:",
+                    "/inbox — буфер принятия решений",
+                    "/inbox pN — страница N",
+                    "Типы: циклы/направления/проекты/unplanned задачи",
+                    "/list — последние задачи",
+                    "/list open — незавершённые",
+                    "/list <task_id> — задача и подзадачи",
+                    "/done <task_id> — завершить задачу",
+                    "/sdone <subtask_id> — завершить подзадачу",
+                    "Подзадача: #<task_id> <текст>",
+                    "Направление: !! <текст>",
+                    "Проект: @@ <текст>",
+                    "Обычный текст — новая задача",
+                    "Кнопки задачи в /inbox:",
+                    "Запланировать — меню:",
+                    "Через 1/3 дней (10:00)",
+                    "Выбрать дату… (YYYY-MM-DD HH:MM)",
+                    "Оставить без даты",
+                    "Напомнить через 7 дней — отдельная быстрая кнопка",
+                ]
+            ),
+        )
+        return
+    if raw == "/state":
+        ok_set, data_set, status_set, err_set = _api_get_ex(
+            "/p2/user_settings", {"user_id": str(chat_id)}
+        )
+        if not ok_set or not isinstance(data_set, dict):
+            print(f"p2_state_error user_id={chat_id} status={status_set} err={err_set}")
+            _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
+            return
+        overload_enabled = int((data_set or {}).get("overload_enabled") or 0)
+        drift_enabled = int((data_set or {}).get("drift_enabled") or 0)
+        signals_on = 1 if overload_enabled or drift_enabled else 0
+        text_line = (
+            f"Сигналы управления: {'ВКЛ' if signals_on else 'ВЫКЛ'}\n"
+            f"Перегрузка: {'ВКЛ' if overload_enabled else 'ВЫКЛ'}\n"
+            f"Связность: {'ВКЛ' if drift_enabled else 'ВЫКЛ'}"
+        )
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "Перегрузка: ВКЛ" if not overload_enabled else "Перегрузка: ВЫКЛ",
+                        "callback_data": f"p2:signals:toggle_direct:overload:{chat_id}",
+                    },
+                    {
+                        "text": "Связность: ВКЛ" if not drift_enabled else "Связность: ВЫКЛ",
+                        "callback_data": f"p2:signals:toggle_direct:drift:{chat_id}",
+                    },
+                ],
+            ]
+        }
+        shortcut = _signals_shortcut_keyboard(str(chat_id))
+        reply_markup["inline_keyboard"] = shortcut["inline_keyboard"] + reply_markup["inline_keyboard"]
+        _send_message_with_keyboard(chat_id, text_line, reply_markup)
+        return
+    if raw == "/reg add":
+        _p2_pending_state[chat_id] = {
+            "mode": "reg_add",
+            "step": 1,
+            "expires_at": time.time() + P2_PENDING_TTL_SEC,
+        }
+        _save_p2_pending_state(_p2_pending_state)
+        _send_message(chat_id, "Название регламента:")
+        return
+    if raw in {"/reg", "/regs"}:
+        now_local = datetime.now(_tz_local())
+        period_key = _regs_period_key(now_local)
+        _regs_render(chat_id, None, period_key, page=1)
+        return
+    m_plan = re.match(r"^/plan(?:\s+|#)(\d+)\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})$", raw)
+    if m_plan:
+        task_id = int(m_plan.group(1))
+        date_part = m_plan.group(2)
+        time_part = m_plan.group(3)
+        try:
+            local_dt = datetime.strptime(f"{date_part} {time_part}", "%Y-%m-%d %H:%M")
+            local_dt = local_dt.replace(tzinfo=_tz_local())
+            planned_iso = local_dt.astimezone(timezone.utc).isoformat()
+        except Exception:
+            _send_message(chat_id, "⚠️ Не удалось выполнить команду.")
+            return
+        ok, data, status, err_text = _worker_post_ex(
+            "/p2/commands/plan_task",
+            {"task_id": task_id, "planned_at": planned_iso, "source_msg_id": src_id},
+        )
+        if ok and data:
+            print(f"p2_cmd=plan_task source_msg_id={src_id} ok=1 id={data.get('id')}")
+            _send_message(chat_id, f"✅ Запланировано: task #{data.get('id')} {date_part} {time_part}")
+        else:
+            print(f"p2_cmd=plan_task source_msg_id={src_id} ok=0 status={status} err={err_text}")
+            if status == 400:
+                _send_message(chat_id, "⚠️ Не удалось выполнить команду.")
+            else:
+                _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
+        return
+    m_done = re.match(r"^/done(?:\s+|#)(\d+)$", raw)
+    if m_done:
+        task_id = int(m_done.group(1))
+        ok, data, status, err_text = _worker_post_ex("/p2/commands/complete_task", {"task_id": task_id})
+        if ok and data:
+            print(f"p2_cmd=complete_task source_msg_id={src_id} ok=1 id={data.get('id')}")
+            _send_message(chat_id, f"✅ Готово: task #{data.get('id')}")
+        else:
+            print(f"p2_cmd=complete_task source_msg_id={src_id} ok=0 status={status} err={err_text}")
+            if status == 400 and err_text and "open subtasks" in err_text:
+                _send_message(chat_id, "⚠️ Нельзя завершить: есть незавершённые подзадачи.")
+            elif status == 400:
+                _send_message(chat_id, "⚠️ Не удалось выполнить команду.")
+            else:
+                _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
+        return
+
+    m_sdone = re.match(r"^/sdone(?:\s+|#)(\d+)$", raw)
+    if m_sdone:
+        sub_id = int(m_sdone.group(1))
+        ok, data, status, err_text = _worker_post_ex("/p2/commands/complete_subtask", {"subtask_id": sub_id})
+        if ok and data:
+            print(f"p2_cmd=complete_subtask source_msg_id={src_id} ok=1 id={data.get('id')}")
+            _send_message(chat_id, f"✅ Готово: subtask #{data.get('id')}")
+        else:
+            print(f"p2_cmd=complete_subtask source_msg_id={src_id} ok=0 status={status} err={err_text}")
+            if status == 400:
+                _send_message(chat_id, "⚠️ Не удалось выполнить команду.")
+            else:
+                _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
+        return
+
+    if raw == "/open":
+        raw = "/list open"
+
+    m_inbox_page = re.match(r"^/inbox\s+p(\d+)$", raw)
+    if raw == "/inbox" or m_inbox_page:
+        page = int(m_inbox_page.group(1)) if m_inbox_page else 1
+        _worker_post("/p2/commands/ensure_user_settings", {"user_id": str(chat_id), "source_msg_id": src_id})
+        ok_set, data_set, status_set, err_set = _api_get_ex("/p2/user_settings", {"user_id": str(chat_id)})
+        ok_state, data_state, status_state, err_state = _api_get_ex("/p2/state", {"user_id": str(chat_id)})
+        ok_new, data_new, status_new, err_new = _api_get_ex("/p2/tasks", {"status": "NEW"})
+        ok_dir, data_dir, status_dir, err_dir = _api_get_ex("/p2/directions")
+        ok_proj, data_proj, status_proj, err_proj = _api_get_ex("/p2/projects", {"inbox": 1})
+        ok_cyc, data_cyc, status_cyc, err_cyc = _api_get_ex("/p2/cycles")
+        if (
+            not ok_new
+            or not ok_dir
+            or not ok_cyc
+            or not isinstance(data_new, list)
+            or not isinstance(data_dir, list)
+            or not isinstance(data_cyc, list)
+        ):
+            print(
+                "p2_inbox_error source_msg_id=%s status_new=%s status_dir=%s status_proj=%s status_cyc=%s "
+                "err_new=%s err_dir=%s err_proj=%s err_cyc=%s",
+                src_id,
+                status_new,
+                status_dir,
+                status_proj,
+                status_cyc,
+                err_new,
+                err_dir,
+                err_proj,
+                err_cyc,
+            )
+            _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
+            return
+        overload_enabled = 0
+        drift_enabled = 0
+        if ok_set and isinstance(data_set, dict):
+            overload_enabled = int((data_set or {}).get("overload_enabled") or 0)
+            drift_enabled = int((data_set or {}).get("drift_enabled") or 0)
+        if overload_enabled or drift_enabled:
+            if ok_state and isinstance(data_state, dict):
+                line = _state_line_from_payload(data_state)
+                if line:
+                    _send_message(chat_id, line)
+        else:
+            ok_nudge, data_nudge, status_nudge, err_nudge = _api_get_ex(
+                "/p2/user_nudges", {"user_id": str(chat_id), "nudge_key": NUDGE_SIGNALS_KEY}
+            )
+            if ok_nudge and isinstance(data_nudge, dict):
+                now = datetime.now(timezone.utc)
+                if _nudge_is_due(data_nudge.get("next_at"), now):
+                    reply_markup = {
+                        "inline_keyboard": [
+                            [
+                                {
+                                    "text": "Настроить",
+                                    "callback_data": f"p2:signals:configure:{chat_id}",
+                                },
+                                {
+                                    "text": "Не сейчас",
+                                    "callback_data": f"p2:signals:snooze:{chat_id}",
+                                },
+                            ]
+                        ]
+                    }
+                    _send_message_with_keyboard(
+                        chat_id,
+                        "Хочешь включить сигналы управления?",
+                        reply_markup,
+                    )
+
+        if not ok_proj or not isinstance(data_proj, list):
+            print(
+                "p2_inbox_projects_fallback source_msg_id=%s status_proj=%s err_proj=%s",
+                src_id,
+                status_proj,
+                err_proj,
+            )
+            ok_proj_all, data_proj_all, status_proj_all, err_proj_all = _api_get_ex("/p2/projects")
+            if ok_proj_all and isinstance(data_proj_all, list):
+                data_proj = data_proj_all
+            else:
+                data_proj = []
+        inbox_items = _build_inbox_items(data_cyc, data_dir, data_proj, data_new)
+        page_items = _slice_page(inbox_items, page)
+        if not page_items:
+            _send_message(chat_id, "Пусто.")
+            return
+
+        month_key = datetime.now(_tz_local()).strftime("%Y-%m")
+        q = (datetime.now(_tz_local()).month - 1) // 3 + 1
+        quarter_key = f"{datetime.now(_tz_local()).year}-Q{q}"
+        _send_message_with_keyboard(
+            chat_id,
+            f"Обзоры: {month_key} / {quarter_key}",
+            {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "Начать месячный обзор",
+                            "callback_data": "p2:cycle:start:MONTHLY",
+                        }
+                    ],
+                    [
+                        {
+                            "text": "Начать квартальный обзор",
+                            "callback_data": "p2:cycle:start:QUARTERLY",
+                        }
+                    ],
+                ]
+            },
+        )
+
+        for it in page_items:
+            t = it.get("kind")
+            if t == "direction":
+                text_line = f"📌 Направление #{it.get('id')} — {_truncate(it.get('title') or '')}"
+                reply_markup = {
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "Сделать проектом",
+                                "callback_data": f"p2:direction:convert:{it.get('id')}",
+                            }
+                        ]
+                    ]
+                }
+                _send_message_with_keyboard(chat_id, text_line, reply_markup)
+            elif t == "project":
+                text_line = f"📁 Проект #{it.get('id')} — {_truncate(it.get('title') or '')}"
+                reply_markup = {
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "Добавить задачу",
+                                "callback_data": f"p2:project:add_task:{it.get('id')}",
+                            }
+                        ]
+                    ]
+                }
+                _send_message_with_keyboard(chat_id, text_line, reply_markup)
+            elif t == "cycle":
+                period = it.get("period_key") or "-"
+                text_line = f"🔁 Цикл #{it.get('id')} — {it.get('type')} {period}"
+                reply_markup = {
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "Добавить цель",
+                                "callback_data": f"p2:cycle:add_goal:{it.get('id')}",
+                            },
+                        ],
+                        [
+                            {
+                                "text": "Добавить задачу",
+                                "callback_data": f"p2:cycle:add_task:{it.get('id')}",
+                            }
+                        ],
+                    ]
+                }
+                _send_message_with_keyboard(chat_id, text_line, reply_markup)
+            else:
+                iid = it.get("id")
+                title = _truncate(it.get("title") or "")
+                reply_markup = {
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "Запланировать",
+                                "callback_data": f"p2:task:plan:{iid}",
+                            },
+                            {
+                                "text": "Напомнить через 7 дней",
+                                "callback_data": f"p2:task:plan_later:{iid}",
+                            },
+                        ],
+                    ]
+                }
+                _send_message_with_keyboard(chat_id, f"🧩 Задача #{iid} — {title}".strip(), reply_markup)
+        return
+
+    m_list_open_page = re.match(r"^/list\s+open\s+p(\d+)$", raw)
+    if m_list_open_page:
+        page = int(m_list_open_page.group(1))
+        ok_new, data_new, status_new, err_new = _api_get_ex("/p2/tasks", {"status": "NEW"})
+        ok_ip, data_ip, status_ip, err_ip = _api_get_ex("/p2/tasks", {"status": "IN_PROGRESS"})
+        if (
+            not ok_new
+            or not ok_ip
+            or not isinstance(data_new, list)
+            or not isinstance(data_ip, list)
+        ):
+            print(
+                "p2_list_open_error source_msg_id=%s status_new=%s status_ip=%s err_new=%s err_ip=%s",
+                src_id,
+                status_new,
+                status_ip,
+                err_new,
+                err_ip,
+            )
+            _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
+            return
+        items = data_new + data_ip
+        merged: dict[int, dict] = {}
+        for it in items:
+            try:
+                iid = int((it or {}).get("id") or 0)
+            except Exception:
+                continue
+            if iid <= 0:
+                continue
+            if iid not in merged:
+                merged[iid] = it
+        items_sorted = sorted(merged.values(), key=lambda r: int((r or {}).get("id") or 0), reverse=True)
+        page_items = _slice_page(items_sorted, page)
+        if not page_items:
+            _send_message(chat_id, "Пусто.")
+            return
+        lines = []
+        for it in page_items:
+            iid = it.get("id")
+            status = (it.get("state") or "").strip()
+            title = _truncate(it.get("title") or "")
+            planned_local = _planned_at_local(it.get("planned_at"))
+            suffix = f" @ {planned_local}" if planned_local else ""
+            lines.append(f"#{iid} [{status}] {title}{suffix}".strip())
+        _send_message(chat_id, "\n".join(lines))
+        return
+
+    m_list_page = re.match(r"^/list\s+p(\d+)$", raw)
+    if m_list_page:
+        page = int(m_list_page.group(1))
+        ok, data, status, err_text = _api_get_ex("/p2/tasks")
+        if not ok or not isinstance(data, list):
+            print(f"p2_list_error source_msg_id={src_id} status={status} err={err_text}")
+            _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
+            return
+        items_sorted = sorted(data, key=lambda r: int((r or {}).get("id") or 0), reverse=True)
+        page_items = _slice_page(items_sorted, page)
+        if not page_items:
+            _send_message(chat_id, "Пусто.")
+            return
+        lines = []
+        for it in page_items:
+            iid = it.get("id")
+            status = (it.get("state") or "").strip()
+            title = _truncate(it.get("title") or "")
+            planned_local = _planned_at_local(it.get("planned_at"))
+            suffix = f" @ {planned_local}" if planned_local else ""
+            lines.append(f"#{iid} [{status}] {title}{suffix}".strip())
+        _send_message(chat_id, "\n".join(lines))
+        return
+
+    if raw == "/list" or raw == "/list open":
+        if raw == "/list":
+            ok, data, status, err_text = _api_get_ex("/p2/tasks")
+            if not ok or not isinstance(data, list):
+                print(f"p2_list_error source_msg_id={src_id} status={status} err={err_text}")
+                _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
+                return
+            items = data
+        else:
+            ok_new, data_new, status_new, err_new = _api_get_ex("/p2/tasks", {"status": "NEW"})
+            ok_ip, data_ip, status_ip, err_ip = _api_get_ex("/p2/tasks", {"status": "IN_PROGRESS"})
+            if (
+                not ok_new
+                or not ok_ip
+                or not isinstance(data_new, list)
+                or not isinstance(data_ip, list)
+            ):
+                print(
+                    "p2_list_open_error source_msg_id=%s status_new=%s status_ip=%s err_new=%s err_ip=%s",
+                    src_id,
+                    status_new,
+                    status_ip,
+                    err_new,
+                    err_ip,
+                )
+                _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
+                return
+            items = data_new + data_ip
+
+        merged: dict[int, dict] = {}
+        for it in items:
+            try:
+                iid = int((it or {}).get("id") or 0)
+            except Exception:
+                continue
+            if iid <= 0:
+                continue
+            if iid not in merged:
+                merged[iid] = it
+        items_sorted = sorted(merged.values(), key=lambda r: int((r or {}).get("id") or 0), reverse=True)
+        page_items = _slice_page(items_sorted, 1)
+        if not page_items:
+            _send_message(chat_id, "Пусто.")
+            return
+        lines = []
+        for it in page_items:
+            iid = it.get("id")
+            status = (it.get("state") or "").strip()
+            title = _truncate(it.get("title") or "")
+            planned_local = _planned_at_local(it.get("planned_at"))
+            suffix = f" @ {planned_local}" if planned_local else ""
+            lines.append(f"#{iid} [{status}] {title}{suffix}".strip())
+        _send_message(chat_id, "\n".join(lines))
+        return
+
+    m_list_one = re.match(r"^/list\s+(\d+)$", raw)
+    if m_list_one:
+        task_id = int(m_list_one.group(1))
+        ok_t, data_t, status_t, err_t = _api_get_ex(f"/p2/tasks/{task_id}")
+        if not ok_t:
+            if status_t == 404:
+                _send_message(chat_id, "⚠️ Не найдено.")
+            else:
+                print(f"p2_list_task_error source_msg_id={src_id} status={status_t} err={err_t}")
+                _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
+            return
+        ok_s, data_s, status_s, err_s = _api_get_ex(f"/p2/tasks/{task_id}/subtasks")
+        if not ok_s or not isinstance(data_s, list):
+            print(f"p2_list_subtasks_error source_msg_id={src_id} status={status_s} err={err_s}")
+            _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
+            return
+        title = _truncate((data_t or {}).get("title") or "")
+        status = ((data_t or {}).get("state") or "").strip()
+        planned_local = _planned_at_local((data_t or {}).get("planned_at"))
+        suffix = f" @ {planned_local}" if planned_local else ""
+        lines = [f"task #{task_id} [{status}] {title}{suffix}".strip()]
+        if not data_s:
+            lines.append("  (нет подзадач)")
+        else:
+            for sub in data_s:
+                sid = sub.get("id")
+                sst = (sub.get("status") or "").strip()
+                stitle = _truncate(sub.get("title") or "")
+                lines.append(f"  - sub #{sid} [{sst}] {stitle}".rstrip())
+        _send_message(chat_id, "\n".join(lines))
+        return
+
+    m = re.match(r"^#(\d+)\s+(.+)$", raw)
+    try:
+        m_dir = re.match(r"^!!\s+(.+)$", raw)
+        m_proj = re.match(r"^@@\s+(.+)$", raw)
+        if m_dir:
+            title = m_dir.group(1).strip()
+            direction = _worker_post(
+                "/p2/commands/create_direction",
+                {"title": title, "source_msg_id": src_id},
+            )
+            if direction:
+                print(f"p2_cmd=create_direction source_msg_id={src_id} id={direction.get('id')}")
+        elif m_proj:
+            title = m_proj.group(1).strip()
+            project = _worker_post(
+                "/p2/commands/create_project",
+                {"title": title, "source_msg_id": src_id},
+            )
+            if project:
+                print(f"p2_cmd=create_project source_msg_id={src_id} id={project.get('id')}")
+        elif m:
+            task_id = int(m.group(1))
+            title = m.group(2).strip()
+            sub = _worker_post(
+                "/p2/commands/create_subtask",
+                {"task_id": task_id, "title": title, "status": "NEW", "source_msg_id": src_id},
+            )
+            if sub:
+                print(f"p2_cmd=create_subtask source_msg_id={src_id} id={sub.get('id')}")
+        else:
+            task = _worker_post(
+                "/p2/commands/create_task",
+                {"title": raw, "status": "NEW", "source_msg_id": src_id},
+            )
+            if task:
+                print(f"p2_cmd=create_task source_msg_id={src_id} id={task.get('id')}")
+    except Exception as exc:
+        print(f"p2_cmd_error source_msg_id={src_id} err={str(exc)[:200]}")
+
+
+def _p2_handle_voice(chat_id: int, message_id: int | None, voice: dict) -> None:
+    src_id = _source_msg_id(chat_id, message_id)
+    if not src_id:
+        return
+    fid = voice.get("file_unique_id") or voice.get("file_id") or ""
+    title = f"voice:{fid}" if fid else "voice"
+    try:
+        task = _worker_post(
+            "/p2/commands/create_task",
+            {"title": title, "status": "NEW", "source_msg_id": src_id},
+        )
+        if task:
+            print(f"p2_cmd=create_task source_msg_id={src_id} id={task.get('id')}")
+    except Exception as exc:
+        print(f"p2_cmd_error source_msg_id={src_id} err={str(exc)[:200]}")
 
 
 def _tz_local() -> timezone:
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(TIMEZONE)
+        except Exception:
+            pass
     return timezone(timedelta(minutes=LOCAL_TZ_OFFSET_MIN))
 
 
@@ -97,7 +1113,7 @@ def _enqueue_text(update_id: int, chat_id: int, message_id: int | None, text: st
         ).fetchone()["cnt"]
     return inserted, int(depth_new)
 
-def _handle_text_message(update_id: int, message: dict) -> None:
+def _handle_text_message(update_id: int, message: dict, pending_state: dict[int, dict]) -> None:
     chat_id = int(message["chat"]["id"])
     text_msg = (message.get("text") or "").strip()
     if not text_msg:
@@ -115,6 +1131,7 @@ def _handle_text_message(update_id: int, message: dict) -> None:
         message_id=message.get("message_id"),
         text=text_msg,
     )
+    _p2_handle_text(chat_id, message.get("message_id"), text_msg)
     if inserted:
         _send_message(chat_id, f"Принято. В очереди: {depth_new_after}.")
     else:
@@ -158,6 +1175,24 @@ def _send_message(chat_id: int, text: str) -> None:
             resp = requests.post(
                 _api_url("sendMessage"),
                 json={"chat_id": chat_id, "text": text},
+                timeout=TG_HTTP_TIMEOUT,
+            )
+            resp.raise_for_status()
+            return
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_exc = exc
+            time.sleep(0.3)
+    if last_exc:
+        raise last_exc
+
+
+def _send_message_with_keyboard(chat_id: int, text: str, reply_markup: dict) -> None:
+    last_exc: Exception | None = None
+    for _ in range(max(1, TG_SEND_MAX_RETRIES)):
+        try:
+            resp = requests.post(
+                _api_url("sendMessage"),
+                json={"chat_id": chat_id, "text": text, "reply_markup": reply_markup},
                 timeout=TG_HTTP_TIMEOUT,
             )
             resp.raise_for_status()
@@ -256,6 +1291,49 @@ def _prune_clarify_state(state: dict[int, dict], now_ts: float) -> None:
     expired = [cid for cid, st in state.items() if (st or {}).get("expires_at", 0) <= now_ts]
     for cid in expired:
         state.pop(cid, None)
+
+
+def _load_p2_pending_state() -> dict[int, dict]:
+    if not os.path.exists(P2_PENDING_PATH):
+        return {}
+    try:
+        with open(P2_PENDING_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            out: dict[int, dict] = {}
+            for k, v in data.items():
+                if isinstance(v, dict):
+                    try:
+                        out[int(k)] = v
+                    except Exception:
+                        continue
+            return out
+    except Exception as exc:
+        print(f"p2_pending_load_error path={P2_PENDING_PATH} err={str(exc)[:200]}")
+        return {}
+    return {}
+
+
+def _save_p2_pending_state(state: dict[int, dict]) -> None:
+    tmp_path = f"{P2_PENDING_PATH}.tmp"
+    os.makedirs(os.path.dirname(P2_PENDING_PATH), exist_ok=True)
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False)
+    os.replace(tmp_path, P2_PENDING_PATH)
+
+
+def _prune_p2_pending_state(state: dict[int, dict], now_ts: float) -> None:
+    expired = []
+    for cid, st in state.items():
+        try:
+            if float((st or {}).get("expires_at", 0)) <= now_ts:
+                expired.append(cid)
+        except Exception:
+            expired.append(cid)
+    for cid in expired:
+        state.pop(cid, None)
+    if expired:
+        _save_p2_pending_state(state)
 
 
 def _drain_updates() -> int:
@@ -469,6 +1547,808 @@ def _format_latest(latest: list[dict]) -> str:
     return "\n".join(lines) if lines else "-"
 
 
+def _set_pending_task(chat_id: int, parent_type: str, parent_id: int) -> None:
+    _p2_pending_state[chat_id] = {
+        "mode": "task",
+        "parent_type": parent_type,
+        "parent_id": int(parent_id),
+        "expires_at": time.time() + P2_PENDING_TTL_SEC,
+    }
+    _save_p2_pending_state(_p2_pending_state)
+
+
+def _set_pending_cycle_outcome(chat_id: int, cycle_id: int, kind: str) -> None:
+    _p2_pending_state[chat_id] = {
+        "mode": "cycle_outcome",
+        "cycle_id": int(cycle_id),
+        "kind": kind,
+        "expires_at": time.time() + P2_PENDING_TTL_SEC,
+    }
+    _save_p2_pending_state(_p2_pending_state)
+
+
+def _set_pending_task_plan(chat_id: int, task_id: int) -> None:
+    _p2_pending_state[chat_id] = {
+        "mode": "task_plan",
+        "task_id": int(task_id),
+        "expires_at": time.time() + P2_PENDING_TTL_SEC,
+    }
+    _save_p2_pending_state(_p2_pending_state)
+
+def _plan_menu_keyboard(task_id: int) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Через 1 день (10:00)", "callback_data": f"p2:task:plan_in:{task_id}:1"},
+                {"text": "Через 3 дня (10:00)", "callback_data": f"p2:task:plan_in:{task_id}:3"},
+            ],
+            [
+                {"text": "Выбрать дату…", "callback_data": f"p2:task:plan_choose:{task_id}"},
+                {"text": "Оставить без даты", "callback_data": f"p2:task:plan_none:{task_id}"},
+            ],
+            [
+                {"text": "Назад", "callback_data": f"p2:task:plan_back:{task_id}"},
+            ],
+        ]
+    }
+
+def _id_desc(it: dict) -> int:
+    try:
+        return int(it.get("id") or 0)
+    except Exception:
+        return 0
+
+
+def _task_is_in_inbox(task: dict) -> bool:
+    if not isinstance(task, dict):
+        return False
+    if task.get("planned_at"):
+        return False
+    state = (task.get("state") or "").strip().upper()
+    status = (task.get("status") or "").strip().upper()
+    if state:
+        return state == "NEW"
+    return status == "NEW"
+
+
+def _build_inbox_items(
+    cycles: list[dict],
+    directions: list[dict],
+    projects: list[dict],
+    tasks_new: list[dict],
+) -> list[dict]:
+    cycle_entries: list[dict] = []
+    direction_entries: list[dict] = []
+    project_entries: list[dict] = []
+    task_entries: list[dict] = []
+
+    for c in cycles:
+        if not isinstance(c, dict):
+            continue
+        if (c.get("status") or "").upper() != "OPEN":
+            continue
+        cycle_entries.append({"kind": "cycle", **c})
+
+    for d in directions:
+        if not isinstance(d, dict):
+            continue
+        if (d.get("status") or "").upper() != "ACTIVE":
+            continue
+        direction_entries.append({"kind": "direction", **d})
+
+    for p in projects:
+        if not isinstance(p, dict):
+            continue
+        if (p.get("status") or "").upper() != "ACTIVE":
+            continue
+        project_entries.append({"kind": "project", **p})
+
+    for it in tasks_new:
+        if _task_is_in_inbox(it):
+            task_entries.append({"kind": "task", **it})
+
+    cycle_sorted = sorted(cycle_entries, key=_id_desc, reverse=True)
+    direction_sorted = sorted(direction_entries, key=_id_desc, reverse=True)
+    project_sorted = sorted(project_entries, key=_id_desc, reverse=True)
+    tasks_sorted = sorted(task_entries, key=_id_desc, reverse=True)
+    return cycle_sorted + direction_sorted + project_sorted + tasks_sorted
+
+
+def _compute_plan_local(days: int) -> datetime:
+    tz = _tz_local()
+    now = datetime.now(tz)
+    later = now + timedelta(days=int(days))
+    return datetime(later.year, later.month, later.day, 10, 0, tzinfo=tz)
+
+
+def _compute_plan_iso(days: int) -> str:
+    when = _compute_plan_local(days)
+    return when.astimezone(timezone.utc).isoformat()
+
+
+def _format_local_dt(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _parse_plan_input(text: str) -> tuple[str, str]:
+    dt_local = datetime.strptime(text, "%Y-%m-%d %H:%M").replace(tzinfo=_tz_local())
+    return dt_local.astimezone(timezone.utc).isoformat(), _format_local_dt(dt_local)
+
+
+def _state_line_from_payload(payload: dict) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    overload = payload.get("overload") if isinstance(payload.get("overload"), dict) else None
+    drift = payload.get("drift") if isinstance(payload.get("drift"), dict) else None
+    if overload and overload.get("active"):
+        return "Состояние: • Перегрузка"
+    if drift and drift.get("active"):
+        return "Состояние: • Связность"
+    return None
+
+
+def _nudge_is_due(next_at: str | None, now: datetime) -> bool:
+    if not next_at:
+        return False
+    try:
+        dt = datetime.fromisoformat(str(next_at))
+    except Exception:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return now.astimezone(timezone.utc) >= dt.astimezone(timezone.utc)
+
+
+def _signals_config_keyboard(overload_enabled: int, drift_enabled: int, user_id: str) -> dict:
+    overload_label = "Перегрузка: ВКЛ" if overload_enabled else "Перегрузка: ВЫКЛ"
+    drift_label = "Связность: ВКЛ" if drift_enabled else "Связность: ВЫКЛ"
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": overload_label,
+                    "callback_data": f"p2:signals:toggle:overload:{user_id}",
+                }
+            ],
+            [
+                {
+                    "text": drift_label,
+                    "callback_data": f"p2:signals:toggle:drift:{user_id}",
+                }
+            ],
+            [
+                {
+                    "text": "Сохранить",
+                    "callback_data": f"p2:signals:save:{user_id}",
+                },
+                {
+                    "text": "Отмена",
+                    "callback_data": f"p2:signals:cancel:{user_id}",
+                },
+            ],
+        ]
+    }
+
+
+def _signals_shortcut_keyboard(user_id: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "Сигналы: ВКЛ",
+                    "callback_data": f"p2:signals:bulk_on:{user_id}",
+                },
+                {
+                    "text": "Сигналы: ВЫКЛ",
+                    "callback_data": f"p2:signals:bulk_off:{user_id}",
+                },
+            ]
+        ]
+    }
+
+
+def _regs_collect_items(period_key: str) -> list[dict]:
+    ok_regs, data_regs, status_regs, err_regs = _api_get_ex("/p4/regulations")
+    if not ok_regs or not isinstance(data_regs, list):
+        print(f"p4_reg_error status={status_regs} err={err_regs}")
+        return []
+    regs = [r for r in data_regs if (r.get("status") or "ACTIVE") == "ACTIVE"][:50]
+    items: list[dict] = []
+    for reg in regs:
+        reg_id = reg.get("id")
+        if reg_id is None:
+            continue
+        ok_run, data_run, status_run, err_run = _api_get_ex(
+            f"/p4/regulations/{int(reg_id)}/runs", {"period": period_key}
+        )
+        run = None
+        if ok_run and isinstance(data_run, list) and data_run:
+            run = data_run[0]
+        elif not ok_run:
+            print(f"p4_runs_error reg_id={reg_id} status={status_run} err={err_run}")
+        run_status = (run or {}).get("status")
+        status_label = _regs_status_from_run(run_status)
+        items.append(
+            {
+                "reg_id": int(reg_id),
+                "run_id": int(run.get("id")) if run and run.get("id") is not None else None,
+                "title": _truncate(reg.get("title") or ""),
+                "day_of_month": reg.get("day_of_month"),
+                "status_label": status_label,
+            }
+        )
+    items.sort(key=_regs_sort_key)
+    return items
+
+
+def _regs_build_message(period_key: str, page: int, items: list[dict]) -> tuple[str, dict, int]:
+    items_sorted = sorted(items, key=_regs_sort_key)
+    total = len(items_sorted)
+    total_pages = max(1, (total + _REGS_PAGE_SIZE - 1) // _REGS_PAGE_SIZE)
+    page_use = page if 1 <= page <= total_pages else 1
+    page_items = items_sorted[(page_use - 1) * _REGS_PAGE_SIZE : page_use * _REGS_PAGE_SIZE]
+
+    lines = [f"📅 Регламенты — {_regs_month_label(period_key)}", ""]
+    for it in page_items:
+        label = it.get("status_label") or "DUE"
+        icon = _regs_status_icon(label)
+        title = it.get("title") or ""
+        day = it.get("day_of_month")
+        day_part = f" (до {day})" if day else ""
+        lines.append(f"{icon} [{label}] {title}{day_part}")
+
+    if not page_items:
+        lines.append("Пусто.")
+
+    lines.append("")
+    lines.append("Легенда: 🔴 Не выполнен • 🟢 Выполнен • ⚠️ Пропущен")
+    if total_pages > 1:
+        lines.append(f"Стр. {page_use}/{total_pages}")
+
+    kb_rows: list[list[dict]] = []
+    for it in page_items:
+        label = it.get("status_label") or "DUE"
+        run_id = it.get("run_id")
+        reg_id = it.get("reg_id")
+        row: list[dict] = []
+        if label == "DUE" and run_id is not None:
+            row.append(
+                {
+                    "text": "✅ Выполнить",
+                    "callback_data": f"regs:act:complete:{run_id}:{period_key}",
+                }
+            )
+            row.append(
+                {
+                    "text": "⏭ Пропустить",
+                    "callback_data": f"regs:act:skip:{run_id}:{period_key}",
+                }
+            )
+        if reg_id is not None:
+            row.append(
+                {
+                    "text": "⛔ Отключить",
+                    "callback_data": f"regs:act:disable:{reg_id}:{period_key}",
+                }
+            )
+        if row:
+            kb_rows.append(row)
+
+    prev_key = _regs_shift_period(period_key, -1) or period_key
+    next_key = _regs_shift_period(period_key, 1) or period_key
+    nav_row = [
+        {"text": "◀️ Пред. месяц", "callback_data": f"regs:month:{prev_key}"},
+        {"text": "Обновить", "callback_data": f"regs:refresh:{period_key}"},
+        {"text": "След. месяц ▶️", "callback_data": f"regs:month:{next_key}"},
+    ]
+    kb_rows.append(nav_row)
+
+    if total_pages > 1:
+        page_row: list[dict] = []
+        if page_use > 1:
+            page_row.append(
+                {
+                    "text": "◀️ Стр.",
+                    "callback_data": f"regs:page:{period_key}:p{page_use - 1}",
+                }
+            )
+        if page_use < total_pages:
+            page_row.append(
+                {
+                    "text": "Стр. ▶️",
+                    "callback_data": f"regs:page:{period_key}:p{page_use + 1}",
+                }
+            )
+        if page_row:
+            kb_rows.append(page_row)
+
+    return "\n".join(lines), {"inline_keyboard": kb_rows}, total_pages
+
+
+def _regs_render(chat_id: int, message_id: int | None, period_key: str, page: int = 1) -> None:
+    items = _regs_collect_items(period_key)
+    text, keyboard, _ = _regs_build_message(period_key, page, items)
+    if message_id is None:
+        _send_message_with_keyboard(chat_id, text, keyboard)
+        return
+    _edit_message_with_keyboard(chat_id, message_id, text, keyboard)
+
+
+def _default_signals_selection(overload_enabled: int, drift_enabled: int) -> tuple[int, int]:
+    if int(overload_enabled or 0) == 0 and int(drift_enabled or 0) == 0:
+        return 1, 0
+    return int(overload_enabled or 0), int(drift_enabled or 0)
+
+
+def _handle_p2_callback(data: str, chat_id: int | None) -> str:
+    if not chat_id:
+        return ""
+    parts = data.split(":")
+    if len(parts) < 2:
+        return ""
+    if parts[:3] == ["p2", "direction", "convert"] and len(parts) >= 4:
+        direction_id = int(parts[3])
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p2/commands/convert_direction_to_project",
+            {"direction_id": direction_id},
+        )
+        if ok and payload:
+            _send_message(chat_id, f"✅ Проект создан: #{payload.get('id')}")
+            return "Готово"
+        print(f"p2_cmd=convert_direction_to_project ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось создать проект.")
+        return "Ошибка"
+    if parts[:3] == ["p2", "project", "add_task"] and len(parts) >= 4:
+        project_id = int(parts[3])
+        _set_pending_task(chat_id, "project", project_id)
+        _send_message(chat_id, f"Пришли текст задачи для проекта #{project_id}.")
+        return "Ок"
+    if parts[:3] == ["p2", "cycle", "add_task"] and len(parts) >= 4:
+        cycle_id = int(parts[3])
+        _set_pending_task(chat_id, "cycle", cycle_id)
+        _send_message(chat_id, f"Пришли текст задачи для цикла #{cycle_id}.")
+        return "Ок"
+    if parts[:3] == ["p2", "cycle", "add_goal"] and len(parts) >= 4:
+        cycle_id = int(parts[3])
+        _p2_pending_state[chat_id] = {
+            "mode": "cycle_goal",
+            "cycle_id": cycle_id,
+            "count": 0,
+            "expires_at": time.time() + P2_PENDING_TTL_SEC,
+        }
+        _save_p2_pending_state(_p2_pending_state)
+        _send_message(chat_id, "Цель 1/3:")
+        return "Ок"
+    if parts[:3] == ["p2", "goal", "continue"] and len(parts) >= 5:
+        goal_id = int(parts[3])
+        cycle_id = int(parts[4])
+        ok, data, status, err_text = _worker_post_ex(
+            "/p2/commands/continue_cycle_goal",
+            {"goal_id": goal_id, "target_cycle_id": cycle_id},
+        )
+        if ok and data:
+            _send_message(chat_id, f"✅ Цель продлена в цикл #{cycle_id}")
+            return "Готово"
+        print(f"p2_cmd=continue_cycle_goal ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось продлить цель.")
+        return "Ошибка"
+    if parts[:3] == ["p2", "goal", "update"] and len(parts) >= 5:
+        goal_id = int(parts[3])
+        status_val = parts[4]
+        ok, data, status, err_text = _worker_post_ex(
+            "/p2/commands/update_cycle_goal_status",
+            {"goal_id": goal_id, "status": status_val},
+        )
+        if ok and data:
+            _send_message(chat_id, "✅ Обновил цель.")
+            return "Готово"
+        print(f"p2_cmd=update_cycle_goal_status ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось обновить цель.")
+        return "Ошибка"
+    if parts[:3] == ["p2", "cycle", "add_project"] and len(parts) >= 4:
+        _p2_pending_state[chat_id] = {
+            "mode": "project_create",
+            "cycle_id": int(parts[3]),
+            "expires_at": time.time() + P2_PENDING_TTL_SEC,
+        }
+        _save_p2_pending_state(_p2_pending_state)
+        _send_message(chat_id, "Пришли название проекта.")
+        return "Ок"
+    if parts[:3] == ["p2", "cycle", "close"] and len(parts) >= 4:
+        cycle_id = int(parts[3])
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p2/commands/close_cycle",
+            {"cycle_id": cycle_id, "status": "DONE"},
+        )
+        if ok and payload:
+            _send_message(chat_id, f"✅ Цикл закрыт: #{payload.get('id')}")
+            return "Готово"
+        print(f"p2_cmd=close_cycle ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось закрыть цикл.")
+        return "Ошибка"
+    if parts[:3] == ["p2", "cycle", "start"] and len(parts) >= 4:
+        cycle_type = parts[3]
+        now = datetime.now(_tz_local())
+        if cycle_type == "MONTHLY":
+            period_key = now.strftime("%Y-%m")
+        elif cycle_type == "QUARTERLY":
+            q = (now.month - 1) // 3 + 1
+            period_key = f"{now.year}-Q{q}"
+        else:
+            return "Ошибка"
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p2/commands/start_cycle",
+            {"type": cycle_type, "period_key": period_key},
+        )
+        if ok and payload:
+            cycle_id = payload.get("id")
+            _send_message(chat_id, f"✅ Цикл начат: #{cycle_id} ({period_key})")
+            ok_prev, data_prev, status_prev, err_prev = _api_get_ex(
+                f"/p2/cycles/{int(cycle_id)}/previous_goals"
+            )
+            if ok_prev and isinstance(data_prev, list) and data_prev:
+                for g in data_prev:
+                    gid = g.get("id")
+                    text = _truncate(g.get("text") or "")
+                    _send_message_with_keyboard(
+                        chat_id,
+                        f"Прошлая цель #{gid}: {text}",
+                        {
+                            "inline_keyboard": [
+                                [
+                                    {
+                                        "text": "Продлить",
+                                        "callback_data": f"p2:goal:continue:{gid}:{cycle_id}",
+                                    },
+                                    {
+                                        "text": "Достигнута",
+                                        "callback_data": f"p2:goal:update:{gid}:ACHIEVED",
+                                    },
+                                    {
+                                        "text": "Снять",
+                                        "callback_data": f"p2:goal:update:{gid}:DROPPED",
+                                    },
+                                ]
+                            ]
+                        },
+                    )
+            _p2_pending_state[chat_id] = {
+                "mode": "cycle_goal",
+                "cycle_id": cycle_id,
+                "count": 0,
+                "expires_at": time.time() + P2_PENDING_TTL_SEC,
+            }
+            _save_p2_pending_state(_p2_pending_state)
+            _send_message(chat_id, "Цель 1/3:")
+            return "Готово"
+        print(f"p2_cmd=start_cycle ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось начать цикл.")
+        return "Ошибка"
+    if parts[:3] == ["p2", "task", "plan"] and len(parts) >= 4:
+        task_id = int(parts[3])
+        _send_message_with_keyboard(chat_id, f"Выбери срок для task #{task_id}:", _plan_menu_keyboard(task_id))
+        return "Ок"
+    if parts[:3] == ["p2", "task", "plan_in"] and len(parts) >= 5:
+        task_id = int(parts[3])
+        days = int(parts[4])
+        planned_local = _format_local_dt(_compute_plan_local(days))
+        planned_iso = _compute_plan_iso(days)
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p2/commands/plan_task",
+            {"task_id": task_id, "planned_at": planned_iso},
+        )
+        if ok and payload:
+            _send_message(chat_id, f"Ок, запланировал на {planned_local}.")
+            return "Готово"
+        print(f"p2_cmd=plan_task_in ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось запланировать.")
+        return "Ошибка"
+    if parts[:3] == ["p2", "task", "plan_choose"] and len(parts) >= 4:
+        task_id = int(parts[3])
+        _set_pending_task_plan(chat_id, task_id)
+        _send_message(chat_id, f"Пришли дату и время для task #{task_id} в формате YYYY-MM-DD HH:MM.")
+        return "Ок"
+    if parts[:3] == ["p2", "task", "plan_none"] and len(parts) >= 4:
+        _send_message(chat_id, "Ок, оставил без даты.")
+        return "Ок"
+    if parts[:3] == ["p2", "task", "plan_later"] and len(parts) >= 4:
+        task_id = int(parts[3])
+        planned_local = _format_local_dt(_compute_plan_local(7))
+        planned_iso = _compute_plan_iso(7)
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p2/commands/plan_task",
+            {"task_id": task_id, "planned_at": planned_iso},
+        )
+        if ok and payload:
+            _send_message(chat_id, f"Ок, запланировал на {planned_local}.")
+            return "Готово"
+        print(f"p2_cmd=plan_task_later ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось запланировать.")
+        return "Ошибка"
+    if parts[:3] == ["p2", "task", "plan_back"] and len(parts) >= 4:
+        _send_message(chat_id, "Ок.")
+        return "Ок"
+    if parts[:3] == ["p2", "signals", "enable"] and len(parts) >= 4:
+        user_id = parts[3]
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p2/commands/set_modules_enabled_bulk",
+            {"user_id": user_id, "overload_enabled": 1, "drift_enabled": 1},
+        )
+        if ok and payload:
+            _send_message(chat_id, "Сигналы управления включены.")
+            return "Готово"
+        print(f"p2_cmd=set_modules_enabled_bulk ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось включить.")
+        return "Ошибка"
+    if parts[:3] == ["p2", "signals", "disable"] and len(parts) >= 4:
+        user_id = parts[3]
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p2/commands/set_modules_enabled_bulk",
+            {"user_id": user_id, "overload_enabled": 0, "drift_enabled": 0},
+        )
+        if ok and payload:
+            _send_message(chat_id, "Сигналы управления выключены.")
+            return "Готово"
+        print(f"p2_cmd=set_modules_enabled_bulk ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось выключить.")
+        return "Ошибка"
+    if parts[:3] == ["p2", "signals", "snooze"] and len(parts) >= 4:
+        user_id = parts[3]
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p2/commands/snooze_nudge",
+            {"user_id": user_id, "nudge_key": NUDGE_SIGNALS_KEY, "days": 90},
+        )
+        if ok and payload:
+            _send_message(chat_id, "Ок, напомню позже.")
+            return "Готово"
+        print(f"p2_cmd=snooze_nudge ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось отложить.")
+        return "Ошибка"
+    if parts[:3] == ["p2", "signals", "configure"] and len(parts) >= 4:
+        user_id = parts[3]
+        ok_set, data_set, status_set, err_set = _api_get_ex(
+            "/p2/user_settings", {"user_id": str(user_id)}
+        )
+        if not ok_set or not isinstance(data_set, dict):
+            _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
+            return "Ошибка"
+        overload_enabled = int((data_set or {}).get("overload_enabled") or 0)
+        drift_enabled = int((data_set or {}).get("drift_enabled") or 0)
+        overload_enabled, drift_enabled = _default_signals_selection(overload_enabled, drift_enabled)
+        _p2_pending_state[chat_id] = {
+            "mode": "signals_config",
+            "user_id": str(user_id),
+            "overload_enabled": overload_enabled,
+            "drift_enabled": drift_enabled,
+            "expires_at": time.time() + P2_PENDING_TTL_SEC,
+        }
+        _save_p2_pending_state(_p2_pending_state)
+        _send_message_with_keyboard(
+            chat_id,
+            "Настройки сигналов:",
+            _signals_config_keyboard(overload_enabled, drift_enabled, str(user_id)),
+        )
+        return "Ок"
+    if parts[:3] == ["p2", "signals", "toggle"] and len(parts) >= 5:
+        module = parts[3]
+        user_id = parts[4]
+        st = _p2_pending_state.get(chat_id) or {}
+        if st.get("mode") != "signals_config" or st.get("user_id") != str(user_id):
+            return "Ок"
+        if module == "overload":
+            st["overload_enabled"] = 0 if int(st.get("overload_enabled") or 0) else 1
+        elif module == "drift":
+            st["drift_enabled"] = 0 if int(st.get("drift_enabled") or 0) else 1
+        st["expires_at"] = time.time() + P2_PENDING_TTL_SEC
+        _p2_pending_state[chat_id] = st
+        _save_p2_pending_state(_p2_pending_state)
+        _send_message_with_keyboard(
+            chat_id,
+            "Настройки сигналов:",
+            _signals_config_keyboard(int(st.get("overload_enabled") or 0), int(st.get("drift_enabled") or 0), user_id),
+        )
+        return "Ок"
+    if parts[:3] == ["p2", "signals", "save"] and len(parts) >= 4:
+        user_id = parts[3]
+        st = _p2_pending_state.get(chat_id) or {}
+        if st.get("mode") != "signals_config" or st.get("user_id") != str(user_id):
+            return "Ок"
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p2/commands/set_modules_enabled_bulk",
+            {
+                "user_id": user_id,
+                "overload_enabled": int(st.get("overload_enabled") or 0),
+                "drift_enabled": int(st.get("drift_enabled") or 0),
+            },
+        )
+        if ok and payload:
+            _p2_pending_state.pop(chat_id, None)
+            _save_p2_pending_state(_p2_pending_state)
+            _send_message(chat_id, "Настройки сохранены.")
+            return "Готово"
+        print(f"p2_cmd=set_modules_enabled_bulk ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось сохранить.")
+        return "Ошибка"
+    if parts[:3] == ["p2", "signals", "cancel"] and len(parts) >= 4:
+        _p2_pending_state.pop(chat_id, None)
+        _save_p2_pending_state(_p2_pending_state)
+        _send_message(chat_id, "Ок.")
+        return "Ок"
+    if parts[:3] == ["p2", "signals", "toggle_direct"] and len(parts) >= 5:
+        module = parts[3]
+        user_id = parts[4]
+        ok_set, data_set, status_set, err_set = _api_get_ex(
+            "/p2/user_settings", {"user_id": str(user_id)}
+        )
+        if not ok_set or not isinstance(data_set, dict):
+            _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
+            return "Ошибка"
+        if module == "overload":
+            enabled = 0 if int((data_set or {}).get("overload_enabled") or 0) else 1
+        elif module == "drift":
+            enabled = 0 if int((data_set or {}).get("drift_enabled") or 0) else 1
+        else:
+            return "Ошибка"
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p2/commands/set_module_enabled",
+            {"user_id": user_id, "module": module, "enabled": enabled},
+        )
+        if ok and payload:
+            _send_message(chat_id, "Ок.")
+            return "Готово"
+        print(f"p2_cmd=set_module_enabled ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось переключить.")
+        return "Ошибка"
+    if parts[:3] == ["p2", "signals", "bulk_on"] and len(parts) >= 4:
+        user_id = parts[3]
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p2/commands/set_modules_enabled_bulk",
+            {"user_id": user_id, "overload_enabled": 1, "drift_enabled": 0},
+        )
+        if ok and payload:
+            _send_message(chat_id, "Сигналы управления включены (перегрузка).")
+            return "Готово"
+        print(f"p2_cmd=set_modules_enabled_bulk ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось включить.")
+        return "Ошибка"
+    if parts[:3] == ["p2", "signals", "bulk_off"] and len(parts) >= 4:
+        user_id = parts[3]
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p2/commands/set_modules_enabled_bulk",
+            {"user_id": user_id, "overload_enabled": 0, "drift_enabled": 0},
+        )
+        if ok and payload:
+            _send_message(chat_id, "Сигналы управления выключены.")
+            return "Готово"
+        print(f"p2_cmd=set_modules_enabled_bulk ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось выключить.")
+        return "Ошибка"
+    if parts[:3] == ["p2", "task", "leave_unplanned"] and len(parts) >= 4:
+        _send_message(chat_id, "Ок, оставил без даты.")
+        return "Ок"
+    return ""
+
+
+def _handle_p4_callback(data: str, chat_id: int | None) -> str:
+    if not chat_id:
+        return ""
+    parts = data.split(":")
+    if len(parts) < 2:
+        return ""
+    if parts[:3] == ["p4", "reg", "ensure"] and len(parts) >= 4:
+        period_key = parts[3]
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p4/commands/ensure_regulation_runs",
+            {"user_id": str(chat_id), "period_key": period_key},
+        )
+        if ok and payload:
+            _send_message(chat_id, f"Ок, запустил регламенты за {period_key}.")
+            return "Готово"
+        print(f"p4_cmd=ensure_regulation_runs ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось запустить регламенты.")
+        return "Ошибка"
+    if parts[:3] == ["p4", "run", "done"] and len(parts) >= 4:
+        run_id = int(parts[3])
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p4/commands/mark_regulation_done",
+            {"run_id": run_id},
+        )
+        if ok and payload:
+            _send_message(chat_id, f"✅ Отмечено: run #{run_id}")
+            return "Готово"
+        print(f"p4_cmd=mark_regulation_done ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось отметить.")
+        return "Ошибка"
+    return ""
+
+
+def _handle_regs_callback(data: str, chat_id: int | None, message_id: int | None) -> str:
+    if not chat_id:
+        return ""
+    if len(data or "") > 64:
+        return "Некорректная команда"
+    parts = data.split(":")
+    if len(parts) < 2:
+        return "Некорректная команда"
+    if parts[:2] == ["regs", "month"] and len(parts) == 3:
+        period_key = parts[2]
+        if not _regs_parse_period_key(period_key):
+            return "Некорректная команда"
+        _regs_render(chat_id, message_id, period_key, page=1)
+        return "Ок"
+    if parts[:2] == ["regs", "refresh"] and len(parts) == 3:
+        period_key = parts[2]
+        if not _regs_parse_period_key(period_key):
+            return "Некорректная команда"
+        _regs_render(chat_id, message_id, period_key, page=1)
+        return "Ок"
+    if parts[:2] == ["regs", "page"] and len(parts) == 4:
+        period_key = parts[2]
+        if not _regs_parse_period_key(period_key):
+            return "Некорректная команда"
+        m = re.fullmatch(r"p(\d+)", parts[3])
+        if not m:
+            return "Некорректная команда"
+        page = int(m.group(1))
+        _regs_render(chat_id, message_id, period_key, page=page)
+        return "Ок"
+    if parts[:3] == ["regs", "act", "complete"] and len(parts) == 5:
+        run_id = int(parts[3])
+        period_key = parts[4]
+        if not _regs_parse_period_key(period_key):
+            return "Некорректная команда"
+        msg_id_use = int(message_id or 0)
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p4/commands/complete_reg_run",
+            {
+                "run_id": run_id,
+                "source_msg_id": _regs_source_msg_id(chat_id, msg_id_use, "complete"),
+            },
+        )
+        if ok and payload:
+            _regs_render(chat_id, message_id, period_key, page=1)
+            return "Готово"
+        print(f"p4_cmd=complete_reg_run ok=0 status={status} err={err_text}")
+        return "Ошибка"
+    if parts[:3] == ["regs", "act", "skip"] and len(parts) == 5:
+        run_id = int(parts[3])
+        period_key = parts[4]
+        if not _regs_parse_period_key(period_key):
+            return "Некорректная команда"
+        msg_id_use = int(message_id or 0)
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p4/commands/skip_reg_run",
+            {
+                "run_id": run_id,
+                "source_msg_id": _regs_source_msg_id(chat_id, msg_id_use, "skip"),
+            },
+        )
+        if ok and payload:
+            _regs_render(chat_id, message_id, period_key, page=1)
+            return "Пропущено"
+        print(f"p4_cmd=skip_reg_run ok=0 status={status} err={err_text}")
+        return "Ошибка"
+    if parts[:3] == ["regs", "act", "disable"] and len(parts) == 5:
+        reg_id = int(parts[3])
+        period_key = parts[4]
+        if not _regs_parse_period_key(period_key):
+            return "Некорректная команда"
+        msg_id_use = int(message_id or 0)
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p4/commands/disable_reg",
+            {
+                "regulation_id": reg_id,
+                "source_msg_id": _regs_source_msg_id(chat_id, msg_id_use, "disable"),
+            },
+        )
+        if ok and payload:
+            _regs_render(chat_id, message_id, period_key, page=1)
+            return "Отключено"
+        print(f"p4_cmd=disable_reg ok=0 status={status} err={err_text}")
+        return "Ошибка"
+    return "Некорректная команда"
+
+
 def _handle_voice_message(update_id: int, message: dict) -> None:
     chat_id = int(message["chat"]["id"])
     voice = message.get("voice") or {}
@@ -491,6 +2371,7 @@ def _handle_voice_message(update_id: int, message: dict) -> None:
         message_id=message.get("message_id"),
         voice=voice,
     )
+    _p2_handle_voice(chat_id, message.get("message_id"), voice)
     if inserted:
         _send_message(chat_id, f"Принято. В очереди: {depth_new_after}.")
     else:
@@ -508,6 +2389,8 @@ def main() -> None:
 
     offset = _load_offset()
     clarify_state = _load_clarify_state()
+    global _p2_pending_state
+    _p2_pending_state = _load_p2_pending_state()
     print(f"loaded offset={offset}")
     if TG_DRAIN_ON_START:
         try:
@@ -577,6 +2460,28 @@ def main() -> None:
                         except Exception:
                             if chat_id_cb:
                                 _send_message(int(chat_id_cb), "Не получилось обновить встречу, попробуйте позже")
+                            _api_answer_callback(cb_id, "Ошибка")
+                    elif data.startswith("p2:"):
+                        try:
+                            resp_text = _handle_p2_callback(data, int(chat_id_cb) if chat_id_cb else None)
+                            _api_answer_callback(cb_id, resp_text or "Ок")
+                        except Exception:
+                            _api_answer_callback(cb_id, "Ошибка")
+                    elif data.startswith("regs:"):
+                        try:
+                            msg = callback.get("message") or {}
+                            msg_id = msg.get("message_id")
+                            resp_text = _handle_regs_callback(
+                                data, int(chat_id_cb) if chat_id_cb else None, int(msg_id) if msg_id else None
+                            )
+                            _api_answer_callback(cb_id, resp_text or "Ок")
+                        except Exception:
+                            _api_answer_callback(cb_id, "Ошибка")
+                    elif data.startswith("p4:"):
+                        try:
+                            resp_text = _handle_p4_callback(data, int(chat_id_cb) if chat_id_cb else None)
+                            _api_answer_callback(cb_id, resp_text or "Ок")
+                        except Exception:
                             _api_answer_callback(cb_id, "Ошибка")
                     else:
                         _api_answer_callback(cb_id)
@@ -757,7 +2662,7 @@ def main() -> None:
                         handled_kind = "voice"
                     elif text_msg:
                         # Stage B2.1: enqueue plain text (excluding commands above)
-                        _handle_text_message(update_id, message)
+                        _handle_text_message(update_id, message, _p2_pending_state)
                         handled_kind = "text"
                     else:
                         handled_kind = "noop"
