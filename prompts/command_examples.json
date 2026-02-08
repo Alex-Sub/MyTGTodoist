@@ -1,0 +1,136 @@
+[
+  {
+    "role": "user",
+    "content": "CURRENT_DATETIME (now_iso): 2026-02-08T12:00:00+03:00\n\nASR_TEXT:\nсоздай задачу купить молоко завтра"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"intent\":\"create_task\",\"confidence\":0.86,\"text_original\":\"создай задачу купить молоко завтра\",\"text_normalized\":\"создать задачу: купить молоко; срок: завтра\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"title\":\"Купить молоко\",\"project\":null,\"due_iso\":\"2026-02-09T23:59:00+03:00\",\"priority\":null,\"labels\":[],\"reminder_iso\":null},\"needs_clarification\":false,\"clarifying_question\":null,\"notes\":null}"
+  },
+
+  {
+    "role": "user",
+    "content": "CURRENT_DATETIME (now_iso): 2026-02-08T12:00:00+03:00\n\nASR_TEXT:\nдобавь задачу позвонить Ивану сегодня в шесть вечера"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"intent\":\"create_task\",\"confidence\":0.84,\"text_original\":\"добавь задачу позвонить Ивану сегодня в шесть вечера\",\"text_normalized\":\"создать задачу: позвонить Ивану; срок: сегодня 18:00\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"title\":\"Позвонить Ивану\",\"project\":null,\"due_iso\":\"2026-02-08T18:00:00+03:00\",\"priority\":null,\"labels\":[],\"reminder_iso\":null},\"needs_clarification\":false,\"clarifying_question\":null,\"notes\":null}"
+  },
+
+  {
+    "role": "user",
+    "content": "CURRENT_DATETIME (now_iso): 2026-02-08T12:00:00+03:00\n\nASR_TEXT:\nсоздай задачу подготовить отчет по проекту Альфа в понедельник"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"intent\":\"create_task\",\"confidence\":0.78,\"text_original\":\"создай задачу подготовить отчет по проекту Альфа в понедельник\",\"text_normalized\":\"создать задачу: подготовить отчет по проекту Альфа; срок: ближайший понедельник\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"title\":\"Подготовить отчет по проекту Альфа\",\"project\":\"Альфа\",\"due_iso\":\"2026-02-09T23:59:00+03:00\",\"priority\":null,\"labels\":[],\"reminder_iso\":null},\"needs_clarification\":false,\"clarifying_question\":null,\"notes\":\"Интерпретация: ближайший понедельник после now_iso\"}"
+  },
+
+  {
+    "role": "user",
+    "content": "CURRENT_DATETIME (now_iso): 2026-02-08T12:00:00+03:00\n\nASR_TEXT:\nпоставь встречу с Петром завтра в 11 на час"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"intent\":\"create_event\",\"confidence\":0.85,\"text_original\":\"поставь встречу с Петром завтра в 11 на час\",\"text_normalized\":\"создать событие: встреча с Петром; завтра 11:00–12:00\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"title\":\"Встреча с Петром\",\"start_iso\":\"2026-02-09T11:00:00+03:00\",\"end_iso\":\"2026-02-09T12:00:00+03:00\",\"location\":null,\"attendees\":[\"Пётр\"],\"notes\":null},\"needs_clarification\":false,\"clarifying_question\":null,\"notes\":null}"
+  },
+
+  {
+    "role": "user",
+    "content": "CURRENT_DATETIME (now_iso): 2026-02-08T12:00:00+03:00\n\nASR_TEXT:\nвстреча с клиентом в четверг в 15:30 в офисе"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"intent\":\"create_event\",\"confidence\":0.8,\"text_original\":\"встреча с клиентом в четверг в 15:30 в офисе\",\"text_normalized\":\"создать событие: встреча с клиентом; четверг 15:30; место: офис\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"title\":\"Встреча с клиентом\",\"start_iso\":\"2026-02-12T15:30:00+03:00\",\"end_iso\":null,\"location\":\"Офис\",\"attendees\":[],\"notes\":null},\"needs_clarification\":false,\"clarifying_question\":null,\"notes\":\"Длительность не указана\"}"
+  },
+
+  {
+    "role": "user",
+    "content": "CURRENT_DATETIME (now_iso): 2026-02-08T12:00:00+03:00\n\nASR_TEXT:\nперенеси задачу купить молоко на послезавтра"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"intent\":\"update_task\",\"confidence\":0.73,\"text_original\":\"перенеси задачу купить молоко на послезавтра\",\"text_normalized\":\"обновить задачу: купить молоко; новый срок: послезавтра\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"task_ref\":\"купить молоко\",\"fields\":{\"due_iso\":\"2026-02-10T23:59:00+03:00\"}},\"needs_clarification\":false,\"clarifying_question\":null,\"notes\":null}"
+  },
+
+  {
+    "role": "user",
+    "content": "CURRENT_DATETIME (now_iso): 2026-02-08T12:00:00+03:00\n\nASR_TEXT:\nсделай задачу купить молоко выполненной"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"intent\":\"complete_task\",\"confidence\":0.82,\"text_original\":\"сделай задачу купить молоко выполненной\",\"text_normalized\":\"завершить задачу: купить молоко\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"task_ref\":\"купить молоко\",\"fields\":{}},\"needs_clarification\":false,\"clarifying_question\":null,\"notes\":null}"
+  },
+
+  {
+    "role": "user",
+    "content": "CURRENT_DATETIME (now_iso): 2026-02-08T12:00:00+03:00\n\nASR_TEXT:\nудали встречу с Петром завтра"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"intent\":\"delete_event\",\"confidence\":0.68,\"text_original\":\"удали встречу с Петром завтра\",\"text_normalized\":\"удалить событие: встреча с Петром; завтра\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"event_ref\":\"встреча с Петром завтра\",\"fields\":{}},\"needs_clarification\":false,\"clarifying_question\":null,\"notes\":\"event_ref текстовый, требуется поиск по календарю\"}"
+  },
+
+  {
+    "role": "user",
+    "content": "CURRENT_DATETIME (now_iso): 2026-02-08T12:00:00+03:00\n\nASR_TEXT:\nпокажи задачи на сегодня"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"intent\":\"list_tasks\",\"confidence\":0.9,\"text_original\":\"покажи задачи на сегодня\",\"text_normalized\":\"показать задачи: сегодня\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"filter\":\"today\",\"value\":null},\"needs_clarification\":false,\"clarifying_question\":null,\"notes\":null}"
+  },
+
+  {
+    "role": "user",
+    "content": "CURRENT_DATETIME (now_iso): 2026-02-08T12:00:00+03:00\n\nASR_TEXT:\nпокажи просроченные"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"intent\":\"list_tasks\",\"confidence\":0.88,\"text_original\":\"покажи просроченные\",\"text_normalized\":\"показать задачи: просроченные\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"filter\":\"overdue\",\"value\":null},\"needs_clarification\":false,\"clarifying_question\":null,\"notes\":null}"
+  },
+
+  {
+    "role": "user",
+    "content": "CURRENT_DATETIME (now_iso): 2026-02-08T12:00:00+03:00\n\nASR_TEXT:\nдобавь заметку в инбокс: идея по оптимизации пайплайна"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"intent\":\"add_note\",\"confidence\":0.86,\"text_original\":\"добавь заметку в инбокс: идея по оптимизации пайплайна\",\"text_normalized\":\"добавить заметку в inbox\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"scope\":\"inbox\",\"ref\":null,\"text\":\"Идея по оптимизации пайплайна\"},\"needs_clarification\":false,\"clarifying_question\":null,\"notes\":null}"
+  },
+
+  {
+    "role": "user",
+    "content": "CURRENT_DATETIME (now_iso): 2026-02-08T12:00:00+03:00\n\nASR_TEXT:\nсоздай задачу оплатить счет"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"intent\":\"create_task\",\"confidence\":0.62,\"text_original\":\"создай задачу оплатить счет\",\"text_normalized\":\"создать задачу: оплатить счет\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"title\":\"Оплатить счёт\",\"project\":null,\"due_iso\":null,\"priority\":null,\"labels\":[],\"reminder_iso\":null},\"needs_clarification\":false,\"clarifying_question\":null,\"notes\":\"Срок не указан\"}"
+  },
+
+  {
+    "role": "user",
+    "content": "CURRENT_DATETIME (now_iso): 2026-02-08T12:00:00+03:00\n\nASR_TEXT:\nперенеси на завтра"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"intent\":\"update_task\",\"confidence\":0.42,\"text_original\":\"перенеси на завтра\",\"text_normalized\":\"обновить задачу: перенос срока на завтра\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"task_ref\":\"\",\"fields\":{\"due_iso\":\"2026-02-09T23:59:00+03:00\"}},\"needs_clarification\":true,\"clarifying_question\":\"Какую задачу перенести на завтра?\",\"notes\":\"Не указан объект переноса\"}"
+  },
+
+  {
+    "role": "user",
+    "content": "CURRENT_DATETIME (now_iso): 2026-02-08T12:00:00+03:00\n\nASR_TEXT:\nзапланируй встречу завтра"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"intent\":\"create_event\",\"confidence\":0.45,\"text_original\":\"запланируй встречу завтра\",\"text_normalized\":\"создать событие: встреча; завтра\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"title\":\"Встреча\",\"start_iso\":\"2026-02-09T09:00:00+03:00\",\"end_iso\":null,\"location\":null,\"attendees\":[],\"notes\":null},\"needs_clarification\":true,\"clarifying_question\":\"Во сколько завтра и какая длительность встречи?\",\"notes\":\"Время не указано\"}"
+  },
+
+  {
+    "role": "user",
+    "content": "CURRENT_DATETIME (now_iso): 2026-02-08T12:00:00+03:00\n\nASR_TEXT:\nну ты понял, сделай как обычно"
+  },
+  {
+    "role": "assistant",
+    "content": "{\"intent\":\"unknown\",\"confidence\":0.1,\"text_original\":\"ну ты понял, сделай как обычно\",\"text_normalized\":\"неопределенная команда\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{},\"needs_clarification\":true,\"clarifying_question\":\"Что именно сделать: создать задачу, встречу, заметку или показать список?\",\"notes\":null}"
+  }
+]
