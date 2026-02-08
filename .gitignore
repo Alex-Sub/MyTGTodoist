@@ -31,3 +31,18 @@ tmp/
 
 # Local data
 data/
+
+# Local artifacts
+PATCH_*.diff
+SNIPPET_*.md
+SNIPPET_*.txt
+VERIFY.md
+docker-compose.*-verify.yml
+.smoke_bot_check.py
+
+# Docs drafts / archive (local)
+Docs/archive/
+*.docx
+
+# Local secrets directory
+secrets/
