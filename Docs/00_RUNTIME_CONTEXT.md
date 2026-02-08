@@ -5,7 +5,7 @@
 
 Принципы:
 - runtime развивается **без правок legacy `src/*`**;
-- P2/P3 использует отдельные таблицы `tasks` и `subtasks` (не `items`);
+- P2/P3 использует отдельные таблицы `tasks` и `subtasks` (не legacy сущности P1);
 - Telegram‑бот пишет в P2/P3 только через **HTTP‑команды organizer-worker**;
 - organizer-api runtime — **read-only**, organizer-worker — **единственный writer** в SQLite.
 
@@ -69,6 +69,31 @@ Reads:
 
 ---
 
+## 1.4 LLM Layer
+Два контура (two-agent split):
+- **command_parser** (kind: `voice_command` / `text_command`): строгий JSON по `schemas/command.schema.json`.
+- **assistant_planner** (kind: `assistant`): JSON-only, без Markdown, без ```json```, retry на невалидный JSON.
+
+Правила:
+- command_parser получает только ASR-текст + `now_iso` (минимум персональных данных).
+- assistant_planner получает агрегированный снапшот (stats/projects/top_tasks) и **не выполняет** side-effects.
+- side-effects всегда через command_parser + детерминированный слой.
+- assistant_planner **не имеет schema**; выдаёт JSON-only по контракту.
+- `suggested_command` (если есть) — опционален, **строго** совместим с `schemas/command.schema.json`,
+  **никогда** не исполняется автоматически.
+- `intent=unknown` — валидный путь уточнения:
+  - `needs_clarification=true` всегда,
+  - `clarifying_question` обязателен,
+  - side-effects запрещены.
+
+CLI примеры:
+```bash
+python -m src.llm.router --kind voice_command --text "..." --now "..."
+python -m src.llm.router --kind assistant --text '{...snapshot...}' --now "..."
+```
+
+---
+
 ## 2. Ports & URLs
 - organizer-worker command server: **8002 (internal)**
 - organizer-api runtime: **8000 (internal)**, **8101 (host)**
@@ -84,6 +109,13 @@ Reads:
 - `P2_ENFORCE_STATUS=1|0` (raise vs log invariant violations)
 - `GOOGLE_SERVICE_ACCOUNT_FILE=/data/google_sa.json`
 - `GOOGLE_CALENDAR_ID=<calendar id>`
+ - `OPENROUTER_API_KEY` (ключ **без пробелов**, рекомендуется `strip()`)
+ - `OPENROUTER_BASE_URL=https://openrouter.ai/api/v1` (default)
+ - `OPENROUTER_HTTP_TIMEOUT_S=60` (default)
+ - `OPENROUTER_MODEL_COMMANDS=nvidia/llama-3.1-nemotron-nano-8b-v1:free`
+ - `OPENROUTER_MODEL_ASSISTANT=nvidia/llama-3.1-nemotron-nano-8b-v1:free`
+ - `COMMAND_FEWSHOT_MAX=8` (default)
+ - `ASSISTANT_FEWSHOT_MAX=6` (default, если `prompts/assistant_examples.json` существует)
 
 ---
 
@@ -96,10 +128,14 @@ Columns (runtime):
 - `status` TEXT (canonical: NEW / IN_PROGRESS / DONE / FAILED)
 - `state` TEXT (P3 source of truth for lifecycle; см. ниже)
 - `planned_at` TEXT NULL (ISO, UTC)
-- `calendar_event_id` TEXT NULL (Google event id или NULL)
+- `calendar_event_id` TEXT NULL (Google event id или NULL; относится к `tasks`)
 - `source_msg_id` TEXT NULL (idempotency key)
 - `created_at`, `updated_at` TEXT (ISO UTC)
 - `completed_at` TEXT NULL
+
+Примечание:
+- статусы/флаги `PENDING`/`FAILED` и retry-поля (`attempts`, `last_error`) — legacy P1/inbox_queue,
+  не используются в P2/P3 и не относятся к `tasks`.
 
 ### 4.2 subtasks
 Columns (runtime):
@@ -147,7 +183,7 @@ Semantics:
 - `⚠️ Нельзя завершить: есть незавершённые подзадачи.`
 
 ### 7.3 List / navigation
-- `/list` — page 1, 10 items
+- `/list` — page 1, 10 tasks
 - `/open` = `/list open`
 - `/list open` — NEW + IN_PROGRESS (merge+dedup, desc by id)
 - `/list <task_id>` — task + subtasks

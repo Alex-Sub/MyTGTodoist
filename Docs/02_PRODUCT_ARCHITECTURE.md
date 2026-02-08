@@ -2,6 +2,7 @@
 
 ## Содержание
 - [P1 Ingestion](#p1-ingestion)
+- [LLM Layer (two-agent)](#llm-layer-two-agent)
 - [P2 Tasks & Subtasks](#p2-tasks--subtasks)
 - [P3 Calendar Sync FSM](#p3-calendar-sync-fsm)
 - [P4 Calendar Cancel](#p4-calendar-cancel)
@@ -128,6 +129,22 @@ git tag: p1-pr2-calendar-tg-ordering
 RUNBOOK обновлён
 
 PRD считается закрытым
+
+## LLM Layer (two-agent)
+
+Схема (runtime):
+- Voice → ASR → **command_parser (OpenRouter)** → JSON (schema) → deterministic actions (Todoist/Calendar/etc)
+- **assistant_planner** получает агрегированный снапшот (stats/projects/top_tasks) → JSON план/риски/вопросы + suggested_command (не исполняет)
+
+Правила:
+- assistant не делает side-effects, только предложения.
+- side-effects всегда через command_parser + детерминированный слой.
+- assistant_planner не имеет schema; JSON-only контракт.
+- suggested_command (если есть) — опционален, совместим с `schemas/command.schema.json`, не исполняется автоматически.
+- retry:
+  - command_parser: retry на parse fail и на schema fail.
+  - assistant_planner: retry на parse fail.
+- intent=unknown — штатный выход на уточнение (needs_clarification=true, clarifying_question обязателен).
 
 ## P2 Tasks & Subtasks
 
@@ -306,6 +323,14 @@ PLANNED | CANCELLED | cancel (explicit tick)
 
 **Статус:** DONE
 
+## P4.2–P4.4 Regulations (monthly)
+Подсистема регламентов:
+- P4.2 — data model + runs
+- P4.3 — Telegram UX
+- P4.4 — nudges (отдельный модуль)
+
+См. `Docs/04_REGULATIONS.md`.
+
 ## P5 Signals: Drift / Overload / State
 
 # P5 — Calendar Drift Detection (log-only)
@@ -376,3 +401,19 @@ PLANNED | CANCELLED | cancel (explicit tick)
 - Только log-only наблюдаемость.
 
 **Статус:** PLANNED
+
+## P5.1 Drift (log-only)
+- `DRIFT_MODE=off|log` (default off)
+- `P5_TICK_INTERVAL_SEC` (default 3600)
+- Логи: `P5_DRIFT drift_type=...`
+Примечание: для регламентов статус OPEN трактуется как DUE.
+
+## P5.2 Overload (log-only)
+- `OVERLOAD_MODE=off|log` (default off)
+- Пороги: `CAPACITY_MINUTES_PER_DAY`, `CAPACITY_ITEMS_PER_DAY`, `DUE_TODAY_LIMIT`, `BACKLOG_LIMIT`
+- Логи: `P5_OVERLOAD signal=... value=... threshold=... day=...`
+
+## P5.3 Nudges (log-only)
+- `P5_NUDGES_MODE=off|daily` (default off)
+- Логи: `P5_NUDGE action=emit day=... drift=... overload=...`
+- Пока log-only, без chat_id.

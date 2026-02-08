@@ -50,3 +50,19 @@ P4/P5 — зафиксированы как PRD, реализация части
 - P4.3 Telegram UX (/regs)
 - P4.4 nudges (log-only, toggle)
 - P4.5 документация и канонизация
+
+---
+
+# Release v0.1.1
+
+Дата: 2026-02-08
+
+## LLM Router
+- двухконтурная схема: command_parser + assistant_planner
+- фиксированные модели для команд и ассистента (nemotron nano 8b free)
+- few-shot поддержка + лимиты (COMMAND_FEWSHOT_MAX / ASSISTANT_FEWSHOT_MAX)
+- retry на невалидный JSON (assistant) и parse/schema fail (command_parser)
+- keep-alive httpx client (performance patch)
+- требование: OPENROUTER_API_KEY без пробелов (trim)
+- intent=unknown добавлен в schema как штатный путь уточнения
+- assistant_planner: JSON-only контракт без schema, suggested_command опционален
