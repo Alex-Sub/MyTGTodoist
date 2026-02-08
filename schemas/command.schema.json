@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "intent",
+    "confidence",
+    "text_original",
+    "text_normalized",
+    "datetime_context",
+    "entities",
+    "needs_clarification",
+    "clarifying_question",
+    "notes"
+  ],
+  "properties": {
+    "intent": {
+      "type": "string",
+      "enum": [
+        "create_task",
+        "update_task",
+        "complete_task",
+        "delete_task",
+        "create_event",
+        "update_event",
+        "delete_event",
+        "list_tasks",
+        "list_events",
+        "add_note",
+        "unknown"
+      ]
+    },
+    "confidence": {"type": "number"},
+    "text_original": {"type": "string"},
+    "text_normalized": {"type": "string"},
+    "datetime_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["now_iso", "timezone"],
+      "properties": {
+        "now_iso": {"type": "string"},
+        "timezone": {"type": "string"}
+      }
+    },
+    "entities": {"type": "object"},
+    "needs_clarification": {"type": "boolean"},
+    "clarifying_question": {"type": ["string", "null"]},
+    "notes": {"type": ["string", "null"]}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "needs_clarification": {"const": true}
+        }
+      },
+      "then": {
+        "properties": {
+          "clarifying_question": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "intent": {"const": "unknown"}
+        }
+      },
+      "then": {
+        "properties": {
+          "needs_clarification": {"const": true},
+          "clarifying_question": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "intent": {"const": "create_task"}
+        }
+      },
+      "then": {
+        "properties": {
+          "entities": {
+            "type": "object",
+            "required": ["title"],
+            "properties": {
+              "title": {"type": "string"},
+              "project": {"type": ["string", "null"]},
+              "due_iso": {"type": ["string", "null"]},
+              "priority": {"type": ["integer", "null"], "minimum": 1, "maximum": 4},
+              "labels": {"type": "array", "items": {"type": "string"}},
+              "reminder_iso": {"type": ["string", "null"]}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "intent": {"const": "list_tasks"}
+        }
+      },
+      "then": {
+        "properties": {
+          "entities": {
+            "type": "object",
+            "required": ["filter"],
+            "properties": {
+              "filter": {
+                "type": "string",
+                "enum": ["today", "tomorrow", "week", "overdue", "project", "search"]
+              },
+              "value": {"type": ["string", "null"]}
+            }
+          }
+        }
+      }
+    }
+  ]
+}

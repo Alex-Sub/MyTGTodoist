@@ -1,0 +1,166 @@
+services:
+  database:
+    image: alpine:3.20
+    command: ["sh", "-c", "mkdir -p /data && touch /data/organizer.db && tail -f /dev/null"]
+    volumes:
+      - db_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /data/organizer.db"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  organizer-api:
+    build:
+      context: ./organizer-api
+    env_file:
+      - deploy/tenants/.env.alexey
+    environment:
+      DB_PATH: ${DB_PATH:-/data/organizer.db}
+      LOCAL_TZ_OFFSET_MIN: ${LOCAL_TZ_OFFSET_MIN:-180}
+      DT_MARKER_HOUR: ${DT_MARKER_HOUR:-6}
+      DT_MARKER_MINUTE: ${DT_MARKER_MINUTE:-0}
+    volumes:
+      - db_data:/data:ro
+      - ./migrations:/app/migrations:ro
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      database:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  organizer-worker:
+    build:
+      context: ./organizer-worker
+    env_file:
+      - deploy/tenants/.env.alexey
+    environment:
+      DB_PATH: ${DB_PATH:-/data/organizer.db}
+      GOOGLE_CALENDAR_ID: ${GOOGLE_CALENDAR_ID}
+      GOOGLE_SERVICE_ACCOUNT_FILE: /data/google_sa.json
+      TIMEZONE_NAME: ${TIMEZONE_NAME:-Europe/Moscow}
+      TIMEZONE: ${TIMEZONE:-Europe/Moscow}
+      WORKER_INTERVAL_SEC: 5
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      ASR_SERVICE_URL: http://asr-service:8001
+      WORKER_TG_HTTP_READ_TIMEOUT: ${WORKER_TG_HTTP_READ_TIMEOUT:-90}
+      WORKER_TG_SEND_MAX_RETRIES: ${WORKER_TG_SEND_MAX_RETRIES:-2}
+      WORKER_NOTIFY_ON_DEAD: ${WORKER_NOTIFY_ON_DEAD:-1}
+      ORGANIZER_API_URL: ${ORGANIZER_API_URL:-http://organizer-api:8000}
+      TG_HTTP_CONNECT_TIMEOUT: ${TG_HTTP_CONNECT_TIMEOUT:-10}
+      TG_HTTP_READ_TIMEOUT: ${TG_HTTP_READ_TIMEOUT:-90}
+      TG_HTTP_RETRIES: ${TG_HTTP_RETRIES:-3}
+      TG_HTTP_RETRY_SLEEP: ${TG_HTTP_RETRY_SLEEP:-1.0}
+      ASR_HTTP_READ_TIMEOUT: ${ASR_HTTP_READ_TIMEOUT:-180}
+      DT_DEFAULT_HOUR: ${DT_DEFAULT_HOUR:-10}
+      DT_DEFAULT_MINUTE: ${DT_DEFAULT_MINUTE:-0}
+      DT_MARKER_HOUR: ${DT_MARKER_HOUR:-6}
+      DT_MARKER_MINUTE: ${DT_MARKER_MINUTE:-0}
+      DT_REQUIRE_AMPM_FOR_SHORT_HOURS: ${DT_REQUIRE_AMPM_FOR_SHORT_HOURS:-1}
+      DT_SHORT_HOUR_MAX: ${DT_SHORT_HOUR_MAX:-12}
+      DT_AMBIGUOUS_MARKER_HOUR: ${DT_AMBIGUOUS_MARKER_HOUR:-6}
+      DT_AMBIGUOUS_MARKER_MINUTE: ${DT_AMBIGUOUS_MARKER_MINUTE:-0}
+      DT_DEFAULT_WEEKDAY: ${DT_DEFAULT_WEEKDAY:-0}          # 0=Mon
+      DT_DEFAULT_MONTHDAY: ${DT_DEFAULT_MONTHDAY:-1}
+      DT_DEFAULT_YEAR_MONTH: ${DT_DEFAULT_YEAR_MONTH:-1}    # Jan
+      DT_DEFAULT_YEAR_MONTHDAY: ${DT_DEFAULT_YEAR_MONTHDAY:-1}
+      LOCAL_TZ_OFFSET_MIN: ${LOCAL_TZ_OFFSET_MIN:-180}
+      MEETING_DEFAULT_MINUTES: ${MEETING_DEFAULT_MINUTES:-30}
+      B2_QUEUE_MAX_NEW: ${B2_QUEUE_MAX_NEW:-50}
+      B2_QUEUE_MAX_TOTAL: ${B2_QUEUE_MAX_TOTAL:-500}
+      B2_CLAIM_LEASE_SEC: ${B2_CLAIM_LEASE_SEC:-120}
+      B2_MAX_ATTEMPTS: ${B2_MAX_ATTEMPTS:-5}
+      B2_REQUEUE_FAILED_EVERY_SEC: ${B2_REQUEUE_FAILED_EVERY_SEC:-15}
+      B2_REQUEUE_FAILED_BATCH: ${B2_REQUEUE_FAILED_BATCH:-10}
+      B2_IDLE_SLEEP_SEC: ${B2_IDLE_SLEEP_SEC:-0.5}
+      B2_SCHEMA_PATH: /app/migrations/001_inbox_queue.sql
+    volumes:
+      - ./migrations:/app/migrations:ro
+      - db_data:/data
+      - ./secrets:/secrets:ro
+      - D:/My_AI_Prodgekt/MyTGTodoist/secrets/alexey/google_sa.json:/data/google_sa.json:ro
+    depends_on:
+      database:
+        condition: service_healthy
+      organizer-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/worker.ok"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  asr-service:
+    build:
+      context: ./asr-service
+    ports:
+      - "${ASR_PORT}:8001"
+    environment:
+      WHISPER_MODEL: /app/models/ggml-large-v3.bin
+      WHISPER_LANG: ru
+      WHISPER_THREADS: "8"
+      ASR_MOCK: ${ASR_MOCK:-1}
+    volumes:
+      - ./asr-service/models:/app/models:rw
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health').read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  telegram-bot:
+    build:
+      context: ./telegram-bot
+    env_file:
+      - deploy/tenants/.env.alexey
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      ASR_SERVICE_URL: http://asr-service:8001
+      ORGANIZER_API_URL: http://organizer-api:8000
+      STATE_PATH: /data/bot.offset
+      TG_DRAIN_ON_START: "0"
+      TG_LONGPOLL_SEC: "25"
+      TG_HTTP_CONNECT_TIMEOUT: ${TG_HTTP_CONNECT_TIMEOUT:-10}
+      TG_HTTP_READ_TIMEOUT: ${TG_HTTP_READ_TIMEOUT:-20}
+      TG_HTTP_RETRIES: ${TG_HTTP_RETRIES:-3}
+      TG_HTTP_RETRY_SLEEP: ${TG_HTTP_RETRY_SLEEP:-1.0}
+      LOCAL_TZ_OFFSET_MIN: ${LOCAL_TZ_OFFSET_MIN:-180}
+      MEETING_DEFAULT_MINUTES: ${MEETING_DEFAULT_MINUTES:-30}
+      CLARIFY_STATE_PATH: ${CLARIFY_STATE_PATH:-/data/bot.clarify.json}
+      CLARIFY_TTL_SEC: ${CLARIFY_TTL_SEC:-180}
+      CONFIRM_ENABLED: ${CONFIRM_ENABLED:-1}
+      CONFIRM_STATE_PATH: ${CONFIRM_STATE_PATH:-/data/bot.confirm.json}
+      CONFIRM_TTL_SEC: ${CONFIRM_TTL_SEC:-120}
+      B2_QUEUE_MAX_NEW: ${B2_QUEUE_MAX_NEW:-50}
+      B2_QUEUE_MAX_TOTAL: ${B2_QUEUE_MAX_TOTAL:-500}
+      B2_BACKPRESSURE_MODE: ${B2_BACKPRESSURE_MODE:-reject}
+      B2_SCHEMA_PATH: /app/migrations/001_inbox_queue.sql
+      DB_PATH: ${DB_PATH:-/data/organizer.db}
+    depends_on:
+      organizer-api:
+        condition: service_healthy
+      asr-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/bot.ok"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - ./migrations:/app/migrations:ro
+      - db_data:/data
+    restart: unless-stopped
+
+volumes:
+  db_data:
