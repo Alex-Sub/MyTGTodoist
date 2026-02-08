@@ -2,7 +2,7 @@ import json
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from src.db.models import Item, ItemEvent, Project
@@ -70,6 +70,138 @@ def create_item(
     session.commit()
     session.refresh(item)
     return item
+
+
+def create_task(
+    session: Session,
+    *,
+    title: str | None = None,
+    status: str = "inbox",
+    description: str | None = None,
+    from_inbox_item_id: str | None = None,
+    **fields,
+) -> Item:
+    """
+    Create a root task either directly or by promoting an inbox item.
+    - Direct create: status is "inbox" or "active".
+    - From inbox: item must be root and status "inbox".
+    """
+    if from_inbox_item_id:
+        item = session.get(Item, from_inbox_item_id)
+        if item is None:
+            raise ValueError("Inbox item not found")
+        if item.parent_id is not None:
+            raise ValueError("Cannot promote a subtask to task")
+        if item.status != "inbox":
+            raise ValueError("Only inbox items can be promoted to task")
+        if title is not None:
+            item.title = title
+        if description is not None:
+            item.description = description
+        item.type = "task"
+        validate_task_status(session, item, status)
+        item.status = status
+        item.updated_at = datetime.now(timezone.utc)
+        item.last_touched_at = item.updated_at
+        _log_event(session, item.id, "promoted_to_task")
+        session.commit()
+        session.refresh(item)
+        return item
+
+    if status not in {"inbox", "active"}:
+        raise ValueError("Task status must be inbox or active on create")
+    item = Item(
+        title=title or "",
+        description=description,
+        type="task",
+        status=status,
+        project_id=None,
+        parent_id=None,
+        depth=0,
+        **fields,
+    )
+    session.add(item)
+    session.flush()
+    _log_event(session, item.id, "created_task")
+    session.commit()
+    session.refresh(item)
+    return item
+
+
+def create_subtask(
+    session: Session,
+    *,
+    parent_id: str,
+    title: str,
+    description: str | None = None,
+    status: str = "todo",
+    **fields,
+) -> Item:
+    """
+    Create a subtask for a root task.
+    Rules:
+    - parent must exist, be type='task', and be root (parent_id IS NULL)
+    - parent cannot be done
+    - subtask depth=1, parent_id is required
+    """
+    parent = session.get(Item, parent_id)
+    if parent is None:
+        raise ValueError("Parent task not found")
+    if parent.parent_id is not None:
+        raise ValueError("Cannot create a subtask under another subtask")
+    if parent.type != "task":
+        raise ValueError("Parent must be a task")
+    if parent.status == "done":
+        raise ValueError("Cannot add subtask to a done task")
+    if status not in {"todo", "done"}:
+        raise ValueError("Subtask status must be todo or done on create")
+
+    item = Item(
+        title=title,
+        description=description,
+        type="task",
+        status=status,
+        project_id=parent.project_id,
+        parent_id=parent.id,
+        depth=1,
+        **fields,
+    )
+    session.add(item)
+    session.flush()
+    _log_event(session, item.id, "created_subtask", meta={"parent_id": parent.id})
+    session.commit()
+    session.refresh(item)
+    return item
+
+
+def validate_task_status(session: Session, item: Item, new_status: str) -> None:
+    """
+    Validate task/subtask status transitions.
+    - task: inbox -> active -> done -> archived
+    - subtask: todo -> done
+    - task cannot be done if any subtask is not done
+    """
+    if item.type != "task":
+        raise ValueError("Status validation applies only to tasks")
+
+    is_subtask = item.parent_id is not None
+    if is_subtask:
+        allowed = {"todo": {"done"}, "done": set()}
+    else:
+        allowed = {"inbox": {"active"}, "active": {"done"}, "done": {"archived"}, "archived": set()}
+
+    current = item.status
+    if new_status == current:
+        return
+    if current not in allowed or new_status not in allowed[current]:
+        raise ValueError(f"Invalid status transition: {current} -> {new_status}")
+
+    if not is_subtask and new_status == "done":
+        open_subtasks = session.scalar(
+            select(func.count()).where(and_(Item.parent_id == item.id, Item.status != "done"))
+        )
+        if open_subtasks and int(open_subtasks) > 0:
+            raise ValueError("Cannot complete task with open subtasks")
 
 
 def update_item(session: Session, item_id: str, **fields) -> Item:

@@ -25,7 +25,7 @@ services:
       - db_data:/data:ro
       - ./migrations:/app/migrations:ro
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "8101:8000"
     depends_on:
       database:
         condition: service_healthy
@@ -84,9 +84,11 @@ services:
       B2_SCHEMA_PATH: /app/migrations/001_inbox_queue.sql
     volumes:
       - ./migrations:/app/migrations:ro
+      - ./organizer-worker/worker.py:/app/worker.py:ro
+      - ./organizer-worker/src:/app/src:ro
       - db_data:/data
       - ./secrets:/secrets:ro
-      - D:/My_AI_Prodgekt/MyTGTodoist/secrets/alexey/google_sa.json:/data/google_sa.json:ro
+      - ./secrets/alexey/google_sa.json:/data/google_sa.json:ro
     depends_on:
       database:
         condition: service_healthy
@@ -128,6 +130,7 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       ASR_SERVICE_URL: http://asr-service:8001
       ORGANIZER_API_URL: http://organizer-api:8000
+      WORKER_COMMAND_URL: http://organizer-worker:8002
       STATE_PATH: /data/bot.offset
       TG_DRAIN_ON_START: "0"
       TG_LONGPOLL_SEC: "25"
