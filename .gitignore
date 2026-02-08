@@ -32,17 +32,18 @@ tmp/
 # Local data
 data/
 
-# Local artifacts
+# --- local / debug artifacts ---
+.smoke_bot_check.py
 PATCH_*.diff
 SNIPPET_*.md
 SNIPPET_*.txt
 VERIFY.md
 docker-compose.*-verify.yml
-.smoke_bot_check.py
+docker-compose.verify.yml
 
-# Docs drafts / archive (local)
+# --- docs drafts / archives ---
 Docs/archive/
 *.docx
 
-# Local secrets directory
+# --- secrets ---
 secrets/
