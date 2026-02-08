@@ -1,4 +1,5 @@
 import importlib
+import importlib.util as importlib_util
 import json
 import logging
 import os
@@ -10,16 +11,21 @@ import sys
 import threading
 from pathlib import Path
 from datetime import datetime, timedelta, timezone, date
+from typing import Any
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.request
 
 import requests
 
 
-_SRC_DIR = os.path.join(os.path.dirname(__file__), "src")
-if _SRC_DIR not in sys.path:
-    sys.path.append(_SRC_DIR)
-import p2_tasks_runtime as p2
+_SRC_DIR = Path(__file__).resolve().parent / "src"
+_P2_RUNTIME_PATH = _SRC_DIR / "p2_tasks_runtime.py"
+_P2_SPEC = importlib_util.spec_from_file_location("p2_tasks_runtime", _P2_RUNTIME_PATH)
+if _P2_SPEC is None or _P2_SPEC.loader is None:
+    raise ImportError(f"Cannot load p2 runtime module from {_P2_RUNTIME_PATH}")
+p2: Any = importlib_util.module_from_spec(_P2_SPEC)
+sys.modules.setdefault("p2_tasks_runtime", p2)
+_P2_SPEC.loader.exec_module(p2)
 
 DB_PATH = os.getenv("DB_PATH", "/data/organizer.db")
 TIMEZONE_NAME = os.getenv("TIMEZONE_NAME", os.getenv("TIMEZONE", "Europe/Moscow"))
@@ -41,6 +47,15 @@ CALENDAR_SYNC_MODE = (
 )
 REG_NUDGES_MODE = (os.getenv("REG_NUDGES_MODE", "off") or "off").strip().lower()
 REG_NUDGES_INTERVAL_SEC = int(os.getenv("REG_NUDGES_INTERVAL_SEC", "3600"))
+DRIFT_MODE = (os.getenv("DRIFT_MODE", "off") or "off").strip().lower()
+OVERLOAD_MODE = (os.getenv("OVERLOAD_MODE", "off") or "off").strip().lower()
+P5_TICK_INTERVAL_SEC = int(os.getenv("P5_TICK_INTERVAL_SEC", "3600"))
+P5_NUDGES_MODE = (os.getenv("P5_NUDGES_MODE", "off") or "off").strip().lower()
+CAPACITY_MINUTES_PER_DAY = int(os.getenv("CAPACITY_MINUTES_PER_DAY", "240"))
+CAPACITY_ITEMS_PER_DAY = int(os.getenv("CAPACITY_ITEMS_PER_DAY", "6"))
+DUE_TODAY_LIMIT = int(os.getenv("DUE_TODAY_LIMIT", "5"))
+BACKLOG_LIMIT = int(os.getenv("BACKLOG_LIMIT", "50"))
+P7_MODE = (os.getenv("P7_MODE", "off") or "off").strip().lower()
 ASR_DT_SELF_CHECK = os.getenv("ASR_DT_SELF_CHECK", "0") == "1"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ASR_SERVICE_URL = os.getenv("ASR_SERVICE_URL", "http://asr-service:8001")
@@ -86,6 +101,10 @@ NUDGE_SIGNALS_KEY = "signals_enable_prompt"
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 _REG_NUDGE_LAST_SENT: dict[str, float] = {}
+_P5_NUDGE_DAY: str | None = None
+_P5_DRIFT_COUNT_TODAY: int = 0
+_P5_OVERLOAD_COUNT_TODAY: int = 0
+_P5_NUDGE_EMITTED: bool = False
 
 def _local_tz() -> timezone:
     return timezone(timedelta(minutes=LOCAL_TZ_OFFSET_MIN))
@@ -94,6 +113,63 @@ def as_dict(row: sqlite3.Row | dict | None) -> dict:
     if row is None:
         return {}
     return row if isinstance(row, dict) else dict(row)
+
+
+def _to_int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _require_int_field(value: Any, field_name: str) -> int:
+    if value is None:
+        raise ValueError(f"{field_name} is required")
+    parsed = _to_int_or_none(value)
+    if parsed is None:
+        raise ValueError(f"{field_name} must be int")
+    return parsed
+
+
+def _require_lastrowid(cur: sqlite3.Cursor) -> int:
+    lastrowid = cur.lastrowid
+    if lastrowid is None:
+        raise RuntimeError("insert failed: no rowid")
+    return int(lastrowid)
+
+def _p7_enabled() -> bool:
+    return P7_MODE == "on"
+
+def _require_p7() -> None:
+    if not _p7_enabled():
+        raise ValueError("P7_MODE is off")
+
+def _parse_iso_dt(value: str) -> datetime:
+    if not value:
+        raise ValueError("datetime is required")
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        raise ValueError("invalid datetime")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def _local_day_bounds_utc(dt_utc: datetime) -> tuple[datetime, datetime]:
+    local = dt_utc.astimezone(_local_tz())
+    day = local.date()
+    start_local = datetime(day.year, day.month, day.day, tzinfo=_local_tz())
+    end_local = start_local + timedelta(days=1)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+def _ensure_same_local_day(start_utc: datetime, end_utc: datetime) -> None:
+    if start_utc.astimezone(_local_tz()).date() != end_utc.astimezone(_local_tz()).date():
+        raise ValueError("block must fit within a single local day")
 
 
 _RU_MONTHS = {
@@ -1485,17 +1561,10 @@ def _log_voice_meta(
 
 
 def _get_parent_id_from_row(row: dict) -> int | None:
-    if row.get("parent_id_int") is not None:
-        try:
-            return int(row.get("parent_id_int"))
-        except Exception:
-            return None
-    if row.get("parent_id") is not None:
-        try:
-            return int(row.get("parent_id"))
-        except Exception:
-            return None
-    return None
+    parent_id_int = _to_int_or_none(row.get("parent_id_int"))
+    if parent_id_int is not None:
+        return parent_id_int
+    return _to_int_or_none(row.get("parent_id"))
 
 
 def _p2_task_row(task_id: int) -> dict:
@@ -1646,6 +1715,58 @@ def _p4_regulation_run_row(run_id: int) -> dict:
     if not row:
         raise ValueError("regulation_run not found")
     return row
+
+
+def _p7_time_block_row(block_id: int) -> dict:
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, task_id, start_at, end_at, created_at
+            FROM time_blocks
+            WHERE id = ?
+            """,
+            (int(block_id),),
+        ).fetchone()
+    row = as_dict(row)
+    if not row:
+        raise ValueError("time_block not found")
+    return row
+
+
+def _p7_task_exists(task_id: int) -> None:
+    with _get_conn() as conn:
+        row = conn.execute("SELECT 1 FROM tasks WHERE id = ?", (int(task_id),)).fetchone()
+    if not row:
+        raise ValueError("task not found")
+
+
+def _p7_check_overlap(
+    conn: sqlite3.Connection,
+    start_utc: datetime,
+    end_utc: datetime,
+    exclude_id: int | None = None,
+) -> None:
+    day_start, day_end = _local_day_bounds_utc(start_utc)
+    params: list[Any] = [
+        end_utc.isoformat(),
+        start_utc.isoformat(),
+        day_end.isoformat(),
+        day_start.isoformat(),
+    ]
+    sql = (
+        """
+        SELECT id
+        FROM time_blocks
+        WHERE start_at < ? AND end_at > ?
+          AND start_at < ? AND end_at > ?
+        """
+    )
+    if exclude_id is not None:
+        sql += " AND id != ?"
+        params.append(int(exclude_id))
+    row = conn.execute(sql, params).fetchone()
+    if row:
+        raise ValueError("time_block overlap")
 
 
 def _normalize_parent_type(parent_type: str | None) -> str | None:
@@ -1886,6 +2007,79 @@ def cmd_disable_reg(
     _ = source_msg_id
     reg = p2.disable_regulation(regulation_id)
     return _p4_regulation_row(reg.id)
+
+
+def cmd_add_block(
+    task_id: int,
+    start_at: str,
+    end_at: str,
+    source_msg_id: str | None = None,
+) -> dict:
+    _require_p7()
+    _ = source_msg_id
+    _p7_task_exists(task_id)
+    start_utc = _parse_iso_dt(start_at)
+    end_utc = _parse_iso_dt(end_at)
+    if end_utc <= start_utc:
+        raise ValueError("start_at must be < end_at")
+    _ensure_same_local_day(start_utc, end_utc)
+    with _get_conn() as conn:
+        _p7_check_overlap(conn, start_utc, end_utc)
+        created_at = datetime.now(timezone.utc).isoformat()
+        cur = conn.execute(
+            """
+            INSERT INTO time_blocks (task_id, start_at, end_at, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (int(task_id), start_utc.isoformat(), end_utc.isoformat(), created_at),
+        )
+        conn.commit()
+        block_id = int(cur.lastrowid or 0)
+    return _p7_time_block_row(block_id)
+
+
+def cmd_move_block(
+    block_id: int,
+    delta_minutes: int,
+    source_msg_id: str | None = None,
+) -> dict:
+    _require_p7()
+    _ = source_msg_id
+    if delta_minutes not in {-10, 10}:
+        raise ValueError("delta_minutes must be -10 or 10")
+    block = _p7_time_block_row(block_id)
+    start_utc = _parse_iso_dt(str(block.get("start_at") or ""))
+    end_utc = _parse_iso_dt(str(block.get("end_at") or ""))
+    start_utc = start_utc + timedelta(minutes=delta_minutes)
+    end_utc = end_utc + timedelta(minutes=delta_minutes)
+    if end_utc <= start_utc:
+        raise ValueError("start_at must be < end_at")
+    _ensure_same_local_day(start_utc, end_utc)
+    with _get_conn() as conn:
+        _p7_check_overlap(conn, start_utc, end_utc, exclude_id=block_id)
+        conn.execute(
+            """
+            UPDATE time_blocks
+            SET start_at = ?, end_at = ?
+            WHERE id = ?
+            """,
+            (start_utc.isoformat(), end_utc.isoformat(), int(block_id)),
+        )
+        conn.commit()
+    return _p7_time_block_row(block_id)
+
+
+def cmd_delete_block(
+    block_id: int,
+    source_msg_id: str | None = None,
+) -> dict:
+    _require_p7()
+    _ = source_msg_id
+    _ = _p7_time_block_row(block_id)
+    with _get_conn() as conn:
+        conn.execute("DELETE FROM time_blocks WHERE id = ?", (int(block_id),))
+        conn.commit()
+    return {"deleted": True, "block_id": int(block_id)}
 
 
 def _ensure_user_settings(user_id: str) -> dict:
@@ -2236,7 +2430,7 @@ class _CommandHandler(BaseHTTPRequestHandler):
                 if data.get("direction_id") is None:
                     raise ValueError("direction_id is required")
                 res = cmd_convert_direction_to_project(
-                    int(data.get("direction_id")),
+                    _require_int_field(data.get("direction_id"), "direction_id"),
                     data.get("title"),
                     data.get("source_msg_id"),
                 )
@@ -2260,7 +2454,7 @@ class _CommandHandler(BaseHTTPRequestHandler):
                 if status_norm not in {"DONE", "SKIPPED"}:
                     raise ValueError("status must be DONE or SKIPPED")
                 res = cmd_close_cycle(
-                    int(data.get("cycle_id")),
+                    _require_int_field(data.get("cycle_id"), "cycle_id"),
                     status_norm,
                     data.get("summary"),
                     data.get("source_msg_id"),
@@ -2275,7 +2469,7 @@ class _CommandHandler(BaseHTTPRequestHandler):
                 if not data.get("text"):
                     raise ValueError("text is required")
                 res = cmd_add_cycle_outcome(
-                    int(data.get("cycle_id")),
+                    _require_int_field(data.get("cycle_id"), "cycle_id"),
                     data.get("kind") or "",
                     data.get("text") or "",
                     data.get("source_msg_id"),
@@ -2288,7 +2482,7 @@ class _CommandHandler(BaseHTTPRequestHandler):
                 if not data.get("text"):
                     raise ValueError("text is required")
                 res = cmd_add_cycle_goal(
-                    int(data.get("cycle_id")),
+                    _require_int_field(data.get("cycle_id"), "cycle_id"),
                     data.get("text") or "",
                     data.get("source_msg_id"),
                 )
@@ -2300,8 +2494,8 @@ class _CommandHandler(BaseHTTPRequestHandler):
                 if data.get("target_cycle_id") is None:
                     raise ValueError("target_cycle_id is required")
                 res = cmd_continue_cycle_goal(
-                    int(data.get("goal_id")),
-                    int(data.get("target_cycle_id")),
+                    _require_int_field(data.get("goal_id"), "goal_id"),
+                    _require_int_field(data.get("target_cycle_id"), "target_cycle_id"),
                     data.get("source_msg_id"),
                 )
                 self._send_json(200, res)
@@ -2312,7 +2506,7 @@ class _CommandHandler(BaseHTTPRequestHandler):
                 if not data.get("status"):
                     raise ValueError("status is required")
                 res = cmd_update_cycle_goal_status(
-                    int(data.get("goal_id")),
+                    _require_int_field(data.get("goal_id"), "goal_id"),
                     str(data.get("status")),
                     data.get("source_msg_id"),
                 )
@@ -2359,8 +2553,8 @@ class _CommandHandler(BaseHTTPRequestHandler):
                     raise ValueError("overload_enabled and drift_enabled are required")
                 res = cmd_set_modules_enabled_bulk(
                     str(data.get("user_id")),
-                    int(data.get("overload_enabled")),
-                    int(data.get("drift_enabled")),
+                    _require_int_field(data.get("overload_enabled"), "overload_enabled"),
+                    _require_int_field(data.get("drift_enabled"), "drift_enabled"),
                 )
                 self._send_json(200, res)
                 return
@@ -2368,7 +2562,7 @@ class _CommandHandler(BaseHTTPRequestHandler):
                 if data.get("task_id") is None:
                     raise ValueError("task_id is required")
                 res = cmd_create_subtask(
-                    int(data.get("task_id")),
+                    _require_int_field(data.get("task_id"), "task_id"),
                     data.get("title") or "",
                     data.get("status") or "NEW",
                     data.get("source_msg_id"),
@@ -2378,13 +2572,13 @@ class _CommandHandler(BaseHTTPRequestHandler):
             if self.path == "/p2/commands/complete_task":
                 if data.get("task_id") is None:
                     raise ValueError("task_id is required")
-                res = cmd_complete_task(int(data.get("task_id")))
+                res = cmd_complete_task(_require_int_field(data.get("task_id"), "task_id"))
                 self._send_json(200, res)
                 return
             if self.path == "/p2/commands/complete_subtask":
                 if data.get("subtask_id") is None:
                     raise ValueError("subtask_id is required")
-                res = cmd_complete_subtask(int(data.get("subtask_id")))
+                res = cmd_complete_subtask(_require_int_field(data.get("subtask_id"), "subtask_id"))
                 self._send_json(200, res)
                 return
             if self.path == "/p2/commands/plan_task":
@@ -2392,7 +2586,7 @@ class _CommandHandler(BaseHTTPRequestHandler):
                     raise ValueError("task_id is required")
                 if not data.get("planned_at"):
                     raise ValueError("planned_at is required")
-                res = cmd_plan_task(int(data.get("task_id")), str(data.get("planned_at")))
+                res = cmd_plan_task(_require_int_field(data.get("task_id"), "task_id"), str(data.get("planned_at")))
                 self._send_json(200, res)
                 return
             if self.path == "/p4/commands/create_regulation":
@@ -2411,7 +2605,10 @@ class _CommandHandler(BaseHTTPRequestHandler):
             if self.path == "/p4/commands/archive_regulation":
                 if data.get("regulation_id") is None:
                     raise ValueError("regulation_id is required")
-                res = cmd_archive_regulation(int(data.get("regulation_id")), data.get("source_msg_id"))
+                res = cmd_archive_regulation(
+                    _require_int_field(data.get("regulation_id"), "regulation_id"),
+                    data.get("source_msg_id"),
+                )
                 self._send_json(200, res)
                 return
             if self.path == "/p4/commands/update_regulation_schedule":
@@ -2419,8 +2616,8 @@ class _CommandHandler(BaseHTTPRequestHandler):
                     raise ValueError("regulation_id is required")
                 day_of_month = data.get("day_of_month")
                 res = cmd_update_regulation_schedule(
-                    int(data.get("regulation_id")),
-                    int(day_of_month) if day_of_month is not None else None,
+                    _require_int_field(data.get("regulation_id"), "regulation_id"),
+                    _require_int_field(day_of_month, "day_of_month") if day_of_month is not None else None,
                     data.get("due_time_local"),
                     data.get("source_msg_id"),
                 )
@@ -2440,7 +2637,7 @@ class _CommandHandler(BaseHTTPRequestHandler):
                 if data.get("run_id") is None:
                     raise ValueError("run_id is required")
                 res = cmd_mark_regulation_done(
-                    int(data.get("run_id")),
+                    _require_int_field(data.get("run_id"), "run_id"),
                     data.get("done_at"),
                     data.get("source_msg_id"),
                 )
@@ -2450,7 +2647,7 @@ class _CommandHandler(BaseHTTPRequestHandler):
                 if data.get("run_id") is None:
                     raise ValueError("run_id is required")
                 res = cmd_complete_reg_run(
-                    int(data.get("run_id")),
+                    _require_int_field(data.get("run_id"), "run_id"),
                     data.get("done_at"),
                     data.get("source_msg_id"),
                 )
@@ -2460,7 +2657,7 @@ class _CommandHandler(BaseHTTPRequestHandler):
                 if data.get("run_id") is None:
                     raise ValueError("run_id is required")
                 res = cmd_skip_reg_run(
-                    int(data.get("run_id")),
+                    _require_int_field(data.get("run_id"), "run_id"),
                     data.get("source_msg_id"),
                 )
                 self._send_json(200, res)
@@ -2469,7 +2666,43 @@ class _CommandHandler(BaseHTTPRequestHandler):
                 if data.get("regulation_id") is None:
                     raise ValueError("regulation_id is required")
                 res = cmd_disable_reg(
-                    int(data.get("regulation_id")),
+                    _require_int_field(data.get("regulation_id"), "regulation_id"),
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p7/commands/add_block":
+                if data.get("task_id") is None:
+                    raise ValueError("task_id is required")
+                if not data.get("start_at"):
+                    raise ValueError("start_at is required")
+                if not data.get("end_at"):
+                    raise ValueError("end_at is required")
+                res = cmd_add_block(
+                    _require_int_field(data.get("task_id"), "task_id"),
+                    str(data.get("start_at")),
+                    str(data.get("end_at")),
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p7/commands/move_block":
+                if data.get("block_id") is None:
+                    raise ValueError("block_id is required")
+                if data.get("delta_minutes") is None:
+                    raise ValueError("delta_minutes is required")
+                res = cmd_move_block(
+                    _require_int_field(data.get("block_id"), "block_id"),
+                    _require_int_field(data.get("delta_minutes"), "delta_minutes"),
+                    data.get("source_msg_id"),
+                )
+                self._send_json(200, res)
+                return
+            if self.path == "/p7/commands/delete_block":
+                if data.get("block_id") is None:
+                    raise ValueError("block_id is required")
+                res = cmd_delete_block(
+                    _require_int_field(data.get("block_id"), "block_id"),
                     data.get("source_msg_id"),
                 )
                 self._send_json(200, res)
@@ -2605,7 +2838,7 @@ def create_task(
             (title, status, datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
-        return int(cur.lastrowid)
+        return _require_lastrowid(cur)
 
 
 def create_subtask(
@@ -2645,7 +2878,7 @@ def create_subtask(
             (title, status, int(parent_id), int(parent_id), datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
-        return int(cur.lastrowid)
+        return _require_lastrowid(cur)
 def _process_queue_item(row: dict) -> None:
     row = as_dict(row)
     queue_id = row["id"]
@@ -2686,7 +2919,7 @@ def _process_queue_item(row: dict) -> None:
                 ingested_at,
                 int(chat_id) if chat_id else None,
                 int(message_id) if message_id is not None else None,
-                int(row.get("tg_update_id")) if row.get("tg_update_id") is not None else None,
+                _to_int_or_none(row.get("tg_update_id")),
             )
             logging.info("tg meta kind=%s item_id=%s tg_chat_id=%s", kind, item_id, chat_id)
             try:
@@ -2827,7 +3060,7 @@ def _process_queue_item(row: dict) -> None:
                     (str(voice_unique_id),),
                 ).fetchone()
             r = as_dict(r)
-            existing_item_id = int(r.get("id")) if r.get("id") is not None else None
+            existing_item_id = _to_int_or_none(r.get("id"))
             existing_asr_text = (r.get("asr_text") or None) if r else None
         elif tg_update_id is not None and tg_message_id is not None:
             with _get_conn() as conn:
@@ -2842,7 +3075,7 @@ def _process_queue_item(row: dict) -> None:
                     (int(tg_update_id), int(tg_message_id)),
                 ).fetchone()
             r = as_dict(r)
-            existing_item_id = int(r.get("id")) if r.get("id") is not None else None
+            existing_item_id = _to_int_or_none(r.get("id"))
             existing_asr_text = (r.get("asr_text") or None) if r else None
 
         if existing_item_id is not None:
@@ -3381,6 +3614,34 @@ def _calendar_cancel_event(event_id: str) -> dict:
         return _calendar_result(False, None, status, f"exception:{type(exc).__name__}", None)
 
 
+def _calendar_get_event(event_id: str) -> dict:
+    service = _get_calendar_service()
+    if service is None:
+        return _calendar_result(False, None, None, "no_service", None)
+    try:
+        event = service.events().get(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id).execute()
+        start = (event or {}).get("start") or {}
+        start_dt = start.get("dateTime") or start.get("date")
+        return {
+            "ok": True,
+            "event_id": event_id,
+            "http_status": None,
+            "err": None,
+            "event_start": start_dt,
+        }
+    except Exception as exc:
+        status = _calendar_http_status(exc)
+        if status == 404:
+            return {"ok": False, "event_id": None, "http_status": 404, "err": "not_found", "event_start": None}
+        return {
+            "ok": False,
+            "event_id": None,
+            "http_status": status,
+            "err": f"exception:{type(exc).__name__}",
+            "event_start": None,
+        }
+
+
 # === P3: Sync Ticks ==========================================================
 # TODO(P4): infinite-loop protection concept only (no implementation in P3).
 # Suggestion: last_sync_at, sync_counter, or max N state flips per task per hour.
@@ -3795,6 +4056,254 @@ def _p4_reg_nudge_tick(limit: int = 50) -> None:
             key,
         )
 
+
+def _p5_should_run(mode: str) -> bool:
+    return (mode or "off").strip().lower() == "log"
+
+
+def _p5_drift_calendar_type(
+    state: str,
+    cal_http_status: int | None,
+    planned_at: str | None,
+    calendar_start: str | None,
+    cal_ok: bool,
+) -> str | None:
+    state_norm = (state or "").strip().upper()
+    if cal_http_status == 404:
+        if state_norm == "SCHEDULED":
+            return "missing_event"
+        return None
+    if cal_ok and state_norm in {"DONE", "FAILED", "CANCELLED"}:
+        return "unexpected_event"
+    if cal_ok and state_norm == "SCHEDULED" and planned_at and calendar_start:
+        try:
+            pa = planned_at.replace("Z", "+00:00")
+            ca = calendar_start.replace("Z", "+00:00")
+            if datetime.fromisoformat(pa) != datetime.fromisoformat(ca):
+                return "time_mismatch"
+        except Exception:
+            return "time_mismatch"
+    return None
+
+
+def _p5_drift_tick(limit: int = 50) -> int:
+    if not _p5_should_run(DRIFT_MODE):
+        return 0
+    drift_count = 0
+    try:
+        with _get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, state, planned_at, calendar_event_id
+                FROM tasks
+                WHERE calendar_event_id IS NOT NULL AND calendar_event_id != ''
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+    except Exception as exc:
+        logging.warning("P5_DRIFT action=fetch_error err=%s", str(exc)[:200])
+        return 0
+    for row in rows:
+        event_id = str(row["calendar_event_id"] or "").strip()
+        if not event_id:
+            continue
+        cal_res = _calendar_get_event(event_id)
+        drift_type = _p5_drift_calendar_type(
+            str(row["state"] or ""),
+            cal_res.get("http_status"),
+            row["planned_at"],
+            cal_res.get("event_start"),
+            bool(cal_res.get("ok")),
+        )
+        if drift_type:
+            logging.info(
+                "P5_DRIFT drift_type=%s entity=task task_id=%s calendar_event_id=%s planned_at=%s calendar_start=%s "
+                "http_status=%s err=%s",
+                drift_type,
+                row["id"],
+                event_id,
+                row["planned_at"],
+                cal_res.get("event_start"),
+                cal_res.get("http_status"),
+                cal_res.get("err"),
+            )
+            drift_count += 1
+    # Regulations drift: missing run for current month
+    today = datetime.now(_local_tz()).date()
+    period_key = f"{today.year:04d}-{today.month:02d}"
+    try:
+        with _get_conn() as conn:
+            regs = conn.execute(
+                """
+                SELECT id FROM regulations WHERE status = 'ACTIVE' ORDER BY id ASC
+                """
+            ).fetchall()
+            for reg in regs:
+                reg_id = int(reg["id"])
+                run = conn.execute(
+                    """
+                    SELECT id FROM regulation_runs
+                    WHERE regulation_id = ? AND period_key = ?
+                    ORDER BY id ASC
+                    LIMIT 1
+                    """,
+                    (reg_id, period_key),
+                ).fetchone()
+                if not run:
+                    logging.info(
+                        "P5_DRIFT drift_type=reg_run_missing_for_month entity=regulation regulation_id=%s period_key=%s",
+                        reg_id,
+                        period_key,
+                    )
+                    drift_count += 1
+    except Exception as exc:
+        logging.warning("P5_DRIFT action=reg_fetch_error err=%s", str(exc)[:200])
+    return drift_count
+
+
+def _p5_overload_signals(
+    day: str,
+    tasks_today: int,
+    regs_due: int,
+    backlog: int,
+) -> list[tuple[str, int, int, str]]:
+    signals: list[tuple[str, int, int, str]] = []
+    minutes = int(tasks_today) * int(DEFAULT_DURATION_MIN)
+    if minutes > CAPACITY_MINUTES_PER_DAY:
+        signals.append(("capacity_minutes", minutes, CAPACITY_MINUTES_PER_DAY, day))
+    if tasks_today > CAPACITY_ITEMS_PER_DAY:
+        signals.append(("capacity_items", tasks_today, CAPACITY_ITEMS_PER_DAY, day))
+    if regs_due > DUE_TODAY_LIMIT:
+        signals.append(("due_today", regs_due, DUE_TODAY_LIMIT, day))
+    if backlog > BACKLOG_LIMIT:
+        signals.append(("backlog", backlog, BACKLOG_LIMIT, day))
+    return signals
+
+
+def _p5_reg_status_is_due(status: str | None) -> bool:
+    s = (status or "").strip().upper()
+    return s in {"DUE", "OPEN"}
+
+
+def _p5_regs_due_counts(rows: list[sqlite3.Row] | list[dict]) -> tuple[int, dict[str, int]]:
+    total = 0
+    counts: dict[str, int] = {}
+    for row in rows:
+        status = row["status"] if isinstance(row, sqlite3.Row) else row.get("status")
+        if not _p5_reg_status_is_due(status):
+            continue
+        status_norm = (status or "").strip().upper()
+        counts[status_norm] = counts.get(status_norm, 0) + 1
+        total += 1
+    return total, counts
+
+
+def _p5_nudge_reset_if_new_day(day_str: str) -> None:
+    global _P5_NUDGE_DAY, _P5_DRIFT_COUNT_TODAY, _P5_OVERLOAD_COUNT_TODAY, _P5_NUDGE_EMITTED
+    if _P5_NUDGE_DAY != day_str:
+        _P5_NUDGE_DAY = day_str
+        _P5_DRIFT_COUNT_TODAY = 0
+        _P5_OVERLOAD_COUNT_TODAY = 0
+        _P5_NUDGE_EMITTED = False
+
+
+def _p5_nudge_should_emit(mode: str, drift_count: int, overload_count: int, emitted: bool) -> bool:
+    mode_norm = (mode or "off").strip().lower()
+    if mode_norm != "daily":
+        return False
+    if emitted:
+        return False
+    return drift_count > 0 or overload_count > 0
+
+
+def _p5_nudge_emit_if_needed(day_str: str, mode: str | None = None) -> bool:
+    global _P5_NUDGE_EMITTED
+    mode_use = mode if mode is not None else P5_NUDGES_MODE
+    if not _p5_nudge_should_emit(
+        mode_use, _P5_DRIFT_COUNT_TODAY, _P5_OVERLOAD_COUNT_TODAY, _P5_NUDGE_EMITTED
+    ):
+        return False
+    logging.info(
+        "P5_NUDGE action=emit day=%s drift=%s overload=%s hint=%s",
+        day_str,
+        _P5_DRIFT_COUNT_TODAY,
+        _P5_OVERLOAD_COUNT_TODAY,
+        "/regs /list open",
+    )
+    _P5_NUDGE_EMITTED = True
+    return True
+
+
+def _p5_overload_tick() -> int:
+    if not _p5_should_run(OVERLOAD_MODE):
+        return 0
+    tz = _local_tz()
+    now_local = datetime.now(tz)
+    day_str = now_local.date().isoformat()
+    try:
+        with _get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT planned_at
+                FROM tasks
+                WHERE state IN ('PLANNED', 'SCHEDULED')
+                  AND planned_at IS NOT NULL
+                """
+            ).fetchall()
+            tasks_today = 0
+            for row in rows:
+                try:
+                    s = str(row["planned_at"]).replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(s)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if dt.astimezone(tz).date().isoformat() == day_str:
+                        tasks_today += 1
+                except Exception:
+                    continue
+            reg_rows = conn.execute(
+                """
+                SELECT status
+                FROM regulation_runs
+                WHERE due_date = ?
+                  AND status IN ('OPEN', 'DUE')
+                """,
+                (day_str,),
+            ).fetchall()
+            regs_due, reg_status_counts = _p5_regs_due_counts(reg_rows)
+            backlog = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM tasks
+                WHERE planned_at IS NULL
+                  AND (
+                    state = 'NEW'
+                    OR ((state IS NULL OR state = '') AND status = 'NEW')
+                  )
+                """
+            ).fetchone()["cnt"]
+    except Exception as exc:
+        logging.warning("P5_OVERLOAD action=fetch_error err=%s", str(exc)[:200])
+        return 0
+    for status, count in reg_status_counts.items():
+        logging.info(
+            "P5_OVERLOAD action=due_today_status run_status=%s value=%s day=%s",
+            status,
+            count,
+            day_str,
+        )
+    signals = _p5_overload_signals(day_str, int(tasks_today), int(regs_due), int(backlog))
+    for sig, val, thr, day in signals:
+        logging.info(
+            "P5_OVERLOAD signal=%s value=%s threshold=%s day=%s",
+            sig,
+            val,
+            thr,
+            day,
+        )
+    return len(signals)
 def _sync_calendar_for_item(item: dict) -> None:
     # accept sqlite3.Row too
     if not isinstance(item, dict):
@@ -4167,6 +4676,7 @@ def main() -> None:
     last_heartbeat = 0.0
     last_requeue = 0.0
     last_reg_nudge = 0.0
+    last_p5_tick = 0.0
     while True:
         try:
             _queue_reaper()
@@ -4179,6 +4689,17 @@ def main() -> None:
             if REG_NUDGES_INTERVAL_SEC > 0 and (now - last_reg_nudge) >= REG_NUDGES_INTERVAL_SEC:
                 _p4_reg_nudge_tick()
                 last_reg_nudge = now
+            if P5_TICK_INTERVAL_SEC > 0 and (now - last_p5_tick) >= P5_TICK_INTERVAL_SEC:
+                day_str = datetime.now(_local_tz()).date().isoformat()
+                _p5_nudge_reset_if_new_day(day_str)
+                drift_count = _p5_drift_tick()
+                overload_count = _p5_overload_tick()
+                if drift_count:
+                    _P5_DRIFT_COUNT_TODAY += int(drift_count)
+                if overload_count:
+                    _P5_OVERLOAD_COUNT_TODAY += int(overload_count)
+                _p5_nudge_emit_if_needed(day_str)
+                last_p5_tick = now
             row = _queue_claim()
             if row:
                 _process_queue_item(row)

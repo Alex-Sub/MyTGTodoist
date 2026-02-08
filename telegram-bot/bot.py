@@ -4,9 +4,12 @@ import sqlite3
 import threading
 import time
 import re
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone, date, tzinfo
+from typing import Any
 try:
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover - fallback for minimal runtime
@@ -16,6 +19,25 @@ try:
     import requests  # type: ignore
 except Exception:  # pragma: no cover - fallback for minimal runtime
     requests = None
+
+
+def _require_requests() -> Any:
+    if requests is None:
+        raise RuntimeError("requests is required")
+    return requests
+
+
+def _build_retry_exceptions() -> tuple[type[Exception], ...]:
+    ex_types: list[type[Exception]] = [TimeoutError, ConnectionError]
+    if requests is not None:
+        for name in ("Timeout", "ConnectionError"):
+            exc_t = getattr(requests, name, None)
+            if isinstance(exc_t, type) and issubclass(exc_t, Exception):
+                ex_types.append(exc_t)
+    return tuple(ex_types)
+
+
+_RETRY_EXCEPTIONS = _build_retry_exceptions()
 
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -45,8 +67,15 @@ else:
     _pending_dir = "/data" if os.path.isdir("/data") else "./data"
     P2_PENDING_PATH = os.path.join(_pending_dir, "bot.p2_pending.json")
 P2_PENDING_TTL_SEC = int(os.getenv("P2_PENDING_TTL_SEC", "300"))
+DRIFT_MODE = (os.getenv("DRIFT_MODE", "off") or "off").strip().lower()
+OVERLOAD_MODE = (os.getenv("OVERLOAD_MODE", "off") or "off").strip().lower()
+P5_NUDGES_MODE = (os.getenv("P5_NUDGES_MODE", "off") or "off").strip().lower()
+P7_MODE = (os.getenv("P7_MODE", "off") or "off").strip().lower()
 
 _p2_pending_state: dict[int, dict] = {}
+
+def _p7_enabled() -> bool:
+    return P7_MODE == "on"
 
 def _worker_post(path: str, payload: dict) -> dict | None:
     try:
@@ -255,10 +284,398 @@ def _edit_message_with_keyboard(chat_id: int, message_id: int, text: str, reply_
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     try:
-        resp = requests.post(_api_url("editMessageText"), json=payload, timeout=TG_HTTP_TIMEOUT)
+        req_mod = _require_requests()
+        resp = req_mod.post(_api_url("editMessageText"), json=payload, timeout=TG_HTTP_TIMEOUT)
         resp.raise_for_status()
     except Exception:
         return
+
+
+def _today_source_msg_id(chat_id: int, message_id: int, action: str) -> str:
+    return f"tg:{chat_id}:{int(message_id)}:today:{action}"
+
+
+def _today_parse_planned_local(iso_text: str) -> tuple[str, str] | None:
+    try:
+        s = iso_text.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local_dt = dt.astimezone(_tz_local())
+        return local_dt.date().isoformat(), local_dt.strftime("%H:%M")
+    except Exception:
+        return None
+
+
+def _parse_iso_utc(iso_text: str) -> datetime | None:
+    if not iso_text:
+        return None
+    try:
+        s = iso_text.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _format_local_hhmm(dt_utc: datetime) -> str:
+    return dt_utc.astimezone(_tz_local()).strftime("%H:%M")
+
+def _round_up_minutes(dt_local: datetime, step: int) -> datetime:
+    if step <= 0:
+        return dt_local
+    discard = timedelta(minutes=dt_local.minute % step, seconds=dt_local.second, microseconds=dt_local.microsecond)
+    if discard == timedelta(0):
+        return dt_local
+    return dt_local + (timedelta(minutes=step) - discard)
+
+
+def _today_time_menu_keyboard(task_id: int) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "30m", "callback_data": f"today:time:add:{task_id}:30"},
+                {"text": "60m", "callback_data": f"today:time:add:{task_id}:60"},
+                {"text": "90m", "callback_data": f"today:time:add:{task_id}:90"},
+            ],
+            [
+                {"text": "↩️ Назад", "callback_data": "today:refresh"},
+            ],
+        ]
+    }
+
+def _today_blocks_page_keyboard(page: int, total_pages: int) -> list[dict]:
+    if total_pages <= 1:
+        return []
+    prev_page = page - 1
+    next_page = page + 1
+    buttons: list[dict] = []
+    if prev_page >= 1:
+        buttons.append({"text": "⬅️", "callback_data": f"today:block:page:p{prev_page}"})
+    buttons.append({"text": f"Стр. {page}/{total_pages}", "callback_data": "today:refresh"})
+    if next_page <= total_pages:
+        buttons.append({"text": "➡️", "callback_data": f"today:block:page:p{next_page}"})
+    return buttons
+
+def _today_collect_blocks(day_str: str) -> list[dict]:
+    if not _p7_enabled():
+        return []
+    ok, data, status, err_text = _api_get_ex("/p7/day", {"date": day_str})
+    if not ok or not isinstance(data, dict):
+        print(f"today_blocks_error status={status} err={err_text}")
+        return []
+    blocks = data.get("blocks")
+    if not isinstance(blocks, list):
+        return []
+    title_cache: dict[int, str] = {}
+    items: list[dict] = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        block_id = b.get("id")
+        task_id = b.get("task_id")
+        start_at = b.get("start_at")
+        end_at = b.get("end_at")
+        if block_id is None or task_id is None or not start_at or not end_at:
+            continue
+        start_utc = _parse_iso_utc(str(start_at))
+        end_utc = _parse_iso_utc(str(end_at))
+        if start_utc is None or end_utc is None:
+            continue
+        title = b.get("title")
+        if not title:
+            if int(task_id) not in title_cache:
+                ok_t, data_t, _, _ = _api_get_ex(f"/p2/tasks/{int(task_id)}")
+                if ok_t and isinstance(data_t, dict):
+                    title_cache[int(task_id)] = _truncate(data_t.get("title") or "")
+                else:
+                    title_cache[int(task_id)] = f"#{int(task_id)}"
+            title = title_cache[int(task_id)]
+        items.append(
+            {
+                "id": int(block_id),
+                "task_id": int(task_id),
+                "title": _truncate(str(title)),
+                "start_utc": start_utc,
+                "end_utc": end_utc,
+            }
+        )
+    items.sort(key=lambda r: (r["start_utc"], r["id"]))
+    return items
+
+def _today_blocks_page(blocks: list[dict], page: int, page_size: int = 5) -> tuple[list[dict], int]:
+    if not blocks:
+        return [], 1
+    total_pages = max(1, (len(blocks) + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * page_size
+    end = start + page_size
+    return blocks[start:end], total_pages
+
+
+def _today_collect_tasks() -> list[dict]:
+    ok, data, status, err_text = _api_get_ex("/p2/tasks")
+    if not ok or not isinstance(data, list):
+        print(f"today_tasks_error status={status} err={err_text}")
+        return []
+    return data
+
+
+def _today_tasks_planned_today(tasks: list[dict], day_str: str) -> list[dict]:
+    items: list[dict] = []
+    for t in tasks:
+        state = (t.get("state") or "").strip().upper()
+        if state not in {"PLANNED", "SCHEDULED"}:
+            continue
+        planned_at = t.get("planned_at")
+        if not planned_at:
+            continue
+        parsed = _today_parse_planned_local(str(planned_at))
+        if not parsed:
+            continue
+        d, hhmm = parsed
+        if d != day_str:
+            continue
+        items.append(
+            {
+                "id": int(t.get("id") or 0),
+                "title": _truncate(t.get("title") or ""),
+                "time": hhmm,
+                "state": state,
+            }
+        )
+    items.sort(key=lambda r: r.get("time") or "")
+    return items[:5]
+
+
+def _today_backlog(tasks: list[dict]) -> list[dict]:
+    items: list[dict] = []
+    for t in tasks:
+        state = (t.get("state") or "").strip().upper()
+        status = (t.get("status") or "").strip().upper()
+        if state not in {"NEW", "IN_PROGRESS"} and not (not state and status in {"NEW", "IN_PROGRESS"}):
+            continue
+        items.append(
+            {
+                "id": int(t.get("id") or 0),
+                "title": _truncate(t.get("title") or ""),
+            }
+        )
+    items.sort(key=lambda r: r.get("id") or 0, reverse=True)
+    return items[:5]
+
+
+def _today_collect_regs(period_key: str, day_str: str) -> list[dict]:
+    ok_regs, data_regs, status_regs, err_regs = _api_get_ex("/p4/regulations")
+    if not ok_regs or not isinstance(data_regs, list):
+        print(f"today_regs_error status={status_regs} err={err_regs}")
+        return []
+    regs = [r for r in data_regs if (r.get("status") or "ACTIVE") == "ACTIVE"][:50]
+    items: list[dict] = []
+    for reg in regs:
+        reg_id = reg.get("id")
+        if reg_id is None:
+            continue
+        ok_run, data_run, status_run, err_run = _api_get_ex(
+            f"/p4/regulations/{int(reg_id)}/runs", {"period": period_key}
+        )
+        if not ok_run or not isinstance(data_run, list) or not data_run:
+            continue
+        run = data_run[0]
+        run_status = (run.get("status") or "").strip().upper()
+        if run_status not in {"DUE", "OPEN"}:
+            continue
+        if str(run.get("due_date") or "") != day_str:
+            continue
+        items.append(
+            {
+                "run_id": int(run.get("id") or 0),
+                "title": _truncate(reg.get("title") or ""),
+                "day_of_month": reg.get("day_of_month"),
+            }
+        )
+    items.sort(key=lambda r: (r.get("title") or "").lower())
+    return items[:5]
+
+
+def _today_build_message(
+    day_str: str,
+    tasks_today: list[dict],
+    blocks_today: list[dict],
+    blocks_page: int,
+    blocks_total_pages: int,
+    regs_today: list[dict],
+    backlog: list[dict],
+) -> tuple[str, dict]:
+    d = datetime.fromisoformat(day_str)
+    header = f"🧭 Сегодня — {d.strftime('%d.%m.%Y')}"
+    tasks_sorted = sorted(tasks_today, key=lambda r: r.get("time") or "")
+    lines = [header, "", "📌 Задачи на сегодня"]
+    if tasks_sorted:
+        for t in tasks_sorted:
+            state = t.get("state")
+            label = "В календаре" if state == "SCHEDULED" else "Запланирована"
+            lines.append(f"• #{t.get('id')} {t.get('title')} ({t.get('time')}) [{label}]")
+    else:
+        lines.append("• Пусто.")
+
+    lines.append("")
+    lines.append("⏱️ Блоки дня")
+    if blocks_today:
+        for b in blocks_today:
+            start_local = _format_local_hhmm(b["start_utc"])
+            end_local = _format_local_hhmm(b["end_utc"])
+            lines.append(
+                f"• [{start_local}–{end_local}] #{b.get('task_id')} {b.get('title')}"
+            )
+        if blocks_total_pages > 1:
+            lines.append(f"Стр. {blocks_page}/{blocks_total_pages}")
+    else:
+        lines.append("• Пусто.")
+
+    lines.append("")
+    lines.append("📅 Регламенты на сегодня")
+    if regs_today:
+        for r in regs_today:
+            lines.append(f"• {r.get('title')} (до {r.get('day_of_month')})")
+    else:
+        lines.append("• Пусто.")
+
+    lines.append("")
+    lines.append("📥 Backlog")
+    if backlog:
+        for b in backlog:
+            lines.append(f"• #{b.get('id')} {b.get('title')}")
+    else:
+        lines.append("• Пусто.")
+
+    lines.append("")
+    lines.append("⚠️ Сигналы")
+    lines.append(f"Drift: {DRIFT_MODE}")
+    lines.append(f"Overload: {OVERLOAD_MODE}")
+    lines.append(f"Nudges: {P5_NUDGES_MODE}")
+
+    kb_rows: list[list[dict]] = []
+    for t in tasks_sorted:
+        task_id = t.get("id")
+        if task_id:
+            kb_rows.append(
+                [
+                    {
+                        "text": "✅ Готово",
+                        "callback_data": f"today:task:done:{int(task_id)}",
+                    }
+                ]
+            )
+            if _p7_enabled():
+                kb_rows.append(
+                    [
+                        {
+                            "text": "📍 Выделить время",
+                            "callback_data": f"today:time:open:{int(task_id)}",
+                        }
+                    ]
+                )
+    if blocks_today:
+        for b in blocks_today:
+            block_id = b.get("id")
+            if block_id:
+                kb_rows.append(
+                    [
+                        {"text": "⬅️ -10", "callback_data": f"today:block:move:{int(block_id)}:-10"},
+                        {"text": "➡️ +10", "callback_data": f"today:block:move:{int(block_id)}:10"},
+                        {"text": "🗑 Удалить", "callback_data": f"today:block:del:{int(block_id)}"},
+                    ]
+                )
+        page_buttons = _today_blocks_page_keyboard(blocks_page, blocks_total_pages)
+        if page_buttons:
+            kb_rows.append(page_buttons)
+    for r in regs_today:
+        run_id = r.get("run_id")
+        if run_id:
+            kb_rows.append(
+                [
+                    {
+                        "text": "✅ Выполнить",
+                        "callback_data": f"today:reg:complete:{int(run_id)}",
+                    },
+                    {
+                        "text": "⏭ Пропустить",
+                        "callback_data": f"today:reg:skip:{int(run_id)}",
+                    },
+                ]
+            )
+    kb_rows.append(
+        [
+            {"text": "🔄 Обновить", "callback_data": "today:refresh"},
+            {"text": "📅 /regs", "callback_data": "today:open_regs"},
+            {"text": "📃 /list open", "callback_data": "today:open_list_open"},
+        ]
+    )
+    return "\n".join(lines), {"inline_keyboard": kb_rows}
+
+
+def _today_render(chat_id: int, message_id: int | None, page: int = 1) -> None:
+    today = datetime.now(_tz_local()).date()
+    day_str = today.isoformat()
+    tasks = _today_collect_tasks()
+    tasks_today = _today_tasks_planned_today(tasks, day_str)
+    blocks = _today_collect_blocks(day_str) if _p7_enabled() else []
+    blocks_page, total_pages = _today_blocks_page(blocks, page)
+    regs_today = _today_collect_regs(_regs_period_key(datetime.now(_tz_local())), day_str)
+    backlog = _today_backlog(tasks)
+    text, keyboard = _today_build_message(day_str, tasks_today, blocks_page, page, total_pages, regs_today, backlog)
+    if message_id is None:
+        _send_message_with_keyboard(chat_id, text, keyboard)
+        return
+    _edit_message_with_keyboard(chat_id, message_id, text, keyboard)
+
+
+def _render_list_open(chat_id: int) -> None:
+    ok_new, data_new, status_new, err_new = _api_get_ex("/p2/tasks", {"status": "NEW"})
+    ok_ip, data_ip, status_ip, err_ip = _api_get_ex("/p2/tasks", {"status": "IN_PROGRESS"})
+    if (
+        not ok_new
+        or not ok_ip
+        or not isinstance(data_new, list)
+        or not isinstance(data_ip, list)
+    ):
+        print(
+            "p2_list_open_error status_new=%s status_ip=%s err_new=%s err_ip=%s",
+            status_new,
+            status_ip,
+            err_new,
+            err_ip,
+        )
+        _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
+        return
+    items = data_new + data_ip
+    merged: dict[int, dict] = {}
+    for it in items:
+        try:
+            iid = int((it or {}).get("id") or 0)
+        except Exception:
+            continue
+        if iid <= 0:
+            continue
+        if iid not in merged:
+            merged[iid] = it
+    items_sorted = sorted(merged.values(), key=lambda r: int((r or {}).get("id") or 0), reverse=True)
+    page_items = _slice_page(items_sorted, 1)
+    if not page_items:
+        _send_message(chat_id, "Пусто.")
+        return
+    lines = []
+    for it in page_items:
+        iid = it.get("id")
+        status = (it.get("state") or "").strip()
+        title = _truncate(it.get("title") or "")
+        planned_local = _planned_at_local(it.get("planned_at"))
+        suffix = f" @ {planned_local}" if planned_local else ""
+        lines.append(f"#{iid} [{status}] {title}{suffix}".strip())
+    _send_message(chat_id, "\n".join(lines))
 
 
 def _truncate(text: str, max_len: int = 80) -> str:
@@ -569,6 +986,9 @@ def _p2_handle_text(chat_id: int, message_id: int | None, text: str) -> None:
         shortcut = _signals_shortcut_keyboard(str(chat_id))
         reply_markup["inline_keyboard"] = shortcut["inline_keyboard"] + reply_markup["inline_keyboard"]
         _send_message_with_keyboard(chat_id, text_line, reply_markup)
+        return
+    if raw in {"/today", "/status"}:
+        _today_render(chat_id, None)
         return
     if raw == "/reg add":
         _p2_pending_state[chat_id] = {
@@ -963,14 +1383,18 @@ def _p2_handle_text(chat_id: int, message_id: int | None, text: str) -> None:
                 print(f"p2_list_task_error source_msg_id={src_id} status={status_t} err={err_t}")
                 _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
             return
+        if not isinstance(data_t, dict):
+            print(f"p2_list_task_bad_payload source_msg_id={src_id} status={status_t}")
+            _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
+            return
         ok_s, data_s, status_s, err_s = _api_get_ex(f"/p2/tasks/{task_id}/subtasks")
         if not ok_s or not isinstance(data_s, list):
             print(f"p2_list_subtasks_error source_msg_id={src_id} status={status_s} err={err_s}")
             _send_message(chat_id, "⚠️ Команда не выполнена. Повтори позже.")
             return
-        title = _truncate((data_t or {}).get("title") or "")
-        status = ((data_t or {}).get("state") or "").strip()
-        planned_local = _planned_at_local((data_t or {}).get("planned_at"))
+        title = _truncate(data_t.get("title") or "")
+        status = (data_t.get("state") or "").strip()
+        planned_local = _planned_at_local(data_t.get("planned_at"))
         suffix = f" @ {planned_local}" if planned_local else ""
         lines = [f"task #{task_id} [{status}] {title}{suffix}".strip()]
         if not data_s:
@@ -1041,7 +1465,7 @@ def _p2_handle_voice(chat_id: int, message_id: int | None, voice: dict) -> None:
         print(f"p2_cmd_error source_msg_id={src_id} err={str(exc)[:200]}")
 
 
-def _tz_local() -> timezone:
+def _tz_local() -> tzinfo:
     if ZoneInfo is not None:
         try:
             return ZoneInfo(TIMEZONE)
@@ -1054,7 +1478,7 @@ def _api_url(method: str) -> str:
     return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
 
 
-def _safe_json(resp: requests.Response) -> dict | None:
+def _safe_json(resp: Any) -> dict | None:
     try:
         data = resp.json()
     except ValueError:
@@ -1172,14 +1596,15 @@ def _send_message(chat_id: int, text: str) -> None:
     last_exc: Exception | None = None
     for _ in range(max(1, TG_SEND_MAX_RETRIES)):
         try:
-            resp = requests.post(
+            req_mod = _require_requests()
+            resp = req_mod.post(
                 _api_url("sendMessage"),
                 json={"chat_id": chat_id, "text": text},
                 timeout=TG_HTTP_TIMEOUT,
             )
             resp.raise_for_status()
             return
-        except (requests.Timeout, requests.ConnectionError) as exc:
+        except _RETRY_EXCEPTIONS as exc:
             last_exc = exc
             time.sleep(0.3)
     if last_exc:
@@ -1190,14 +1615,15 @@ def _send_message_with_keyboard(chat_id: int, text: str, reply_markup: dict) -> 
     last_exc: Exception | None = None
     for _ in range(max(1, TG_SEND_MAX_RETRIES)):
         try:
-            resp = requests.post(
+            req_mod = _require_requests()
+            resp = req_mod.post(
                 _api_url("sendMessage"),
                 json={"chat_id": chat_id, "text": text, "reply_markup": reply_markup},
                 timeout=TG_HTTP_TIMEOUT,
             )
             resp.raise_for_status()
             return
-        except (requests.Timeout, requests.ConnectionError) as exc:
+        except _RETRY_EXCEPTIONS as exc:
             last_exc = exc
             time.sleep(0.3)
     if last_exc:
@@ -1236,7 +1662,8 @@ def _start_health_server() -> None:
 
 
 def _get_updates(offset: int) -> list[dict]:
-    resp = requests.get(
+    req_mod = _require_requests()
+    resp = req_mod.get(
         _api_url("getUpdates"),
         params={"timeout": TG_LONGPOLL_SEC, "offset": offset},
         timeout=TG_HTTP_TIMEOUT,
@@ -1337,7 +1764,8 @@ def _prune_p2_pending_state(state: dict[int, dict], now_ts: float) -> None:
 
 
 def _drain_updates() -> int:
-    resp = requests.get(_api_url("getUpdates"), params={"timeout": 0}, timeout=TG_HTTP_TIMEOUT)
+    req_mod = _require_requests()
+    resp = req_mod.get(_api_url("getUpdates"), params={"timeout": 0}, timeout=TG_HTTP_TIMEOUT)
     resp.raise_for_status()
     data = _safe_json(resp)
     if not data or not data.get("ok"):
@@ -1349,21 +1777,24 @@ def _drain_updates() -> int:
     return int(last_update_id + 1) if last_update_id else 0
 
 def _fetch_stats() -> dict | None:
-    resp = requests.get(f"{ORGANIZER_API_URL}/stats", timeout=TG_HTTP_TIMEOUT)
+    req_mod = _require_requests()
+    resp = req_mod.get(f"{ORGANIZER_API_URL}/stats", timeout=TG_HTTP_TIMEOUT)
     resp.raise_for_status()
     data = _safe_json(resp)
     return data if isinstance(data, dict) else None
 
 
 def _api_get(path: str, params: dict | None = None) -> dict | None:
-    resp = requests.get(f"{ORGANIZER_API_URL}{path}", params=params or {}, timeout=TG_HTTP_TIMEOUT)
+    req_mod = _require_requests()
+    resp = req_mod.get(f"{ORGANIZER_API_URL}{path}", params=params or {}, timeout=TG_HTTP_TIMEOUT)
     resp.raise_for_status()
     data = _safe_json(resp)
     return data if isinstance(data, dict) else None
 
 
 def _api_post(path: str, payload: dict) -> dict | None:
-    resp = requests.post(f"{ORGANIZER_API_URL}{path}", json=payload, timeout=TG_HTTP_TIMEOUT)
+    req_mod = _require_requests()
+    resp = req_mod.post(f"{ORGANIZER_API_URL}{path}", json=payload, timeout=TG_HTTP_TIMEOUT)
     resp.raise_for_status()
     data = _safe_json(resp)
     return data if isinstance(data, dict) else None
@@ -1372,12 +1803,13 @@ def _api_post(path: str, payload: dict) -> dict | None:
 def _api_answer_callback(callback_query_id: str, text: str = "") -> None:
     if not callback_query_id:
         return
-    payload = {"callback_query_id": callback_query_id}
+    payload: dict[str, object] = {"callback_query_id": callback_query_id}
     if text:
         payload["text"] = text
         payload["show_alert"] = False
     try:
-        resp = requests.post(_api_url("answerCallbackQuery"), json=payload, timeout=TG_HTTP_TIMEOUT)
+        req_mod = _require_requests()
+        resp = req_mod.post(_api_url("answerCallbackQuery"), json=payload, timeout=TG_HTTP_TIMEOUT)
         resp.raise_for_status()
     except Exception:
         # callback ack failure must not crash bot loop
@@ -1405,7 +1837,7 @@ def _format_pending(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _get_item_start_date(item_id: int, tz: timezone) -> date | None:
+def _get_item_start_date(item_id: int, tz: tzinfo) -> date | None:
     try:
         with _db_connect() as conn:
             row = conn.execute("SELECT start_at FROM items WHERE id=?", (int(item_id),)).fetchone()
@@ -1922,11 +2354,11 @@ def _handle_p2_callback(data: str, chat_id: int | None) -> str:
     if parts[:3] == ["p2", "goal", "continue"] and len(parts) >= 5:
         goal_id = int(parts[3])
         cycle_id = int(parts[4])
-        ok, data, status, err_text = _worker_post_ex(
+        ok, payload, status, err_text = _worker_post_ex(
             "/p2/commands/continue_cycle_goal",
             {"goal_id": goal_id, "target_cycle_id": cycle_id},
         )
-        if ok and data:
+        if ok and payload:
             _send_message(chat_id, f"✅ Цель продлена в цикл #{cycle_id}")
             return "Готово"
         print(f"p2_cmd=continue_cycle_goal ok=0 status={status} err={err_text}")
@@ -1935,11 +2367,11 @@ def _handle_p2_callback(data: str, chat_id: int | None) -> str:
     if parts[:3] == ["p2", "goal", "update"] and len(parts) >= 5:
         goal_id = int(parts[3])
         status_val = parts[4]
-        ok, data, status, err_text = _worker_post_ex(
+        ok, payload, status, err_text = _worker_post_ex(
             "/p2/commands/update_cycle_goal_status",
             {"goal_id": goal_id, "status": status_val},
         )
-        if ok and data:
+        if ok and payload:
             _send_message(chat_id, "✅ Обновил цель.")
             return "Готово"
         print(f"p2_cmd=update_cycle_goal_status ok=0 status={status} err={err_text}")
@@ -1981,10 +2413,20 @@ def _handle_p2_callback(data: str, chat_id: int | None) -> str:
             {"type": cycle_type, "period_key": period_key},
         )
         if ok and payload:
-            cycle_id = payload.get("id")
+            cycle_id_raw = payload.get("id")
+            if cycle_id_raw is None:
+                print("p2_cmd=start_cycle missing cycle_id")
+                _send_message(chat_id, "⚠️ Не удалось начать цикл.")
+                return "Ошибка"
+            try:
+                cycle_id = int(cycle_id_raw)
+            except Exception:
+                print("p2_cmd=start_cycle missing cycle_id")
+                _send_message(chat_id, "⚠️ Не удалось начать цикл.")
+                return "Ошибка"
             _send_message(chat_id, f"✅ Цикл начат: #{cycle_id} ({period_key})")
             ok_prev, data_prev, status_prev, err_prev = _api_get_ex(
-                f"/p2/cycles/{int(cycle_id)}/previous_goals"
+                f"/p2/cycles/{cycle_id}/previous_goals"
             )
             if ok_prev and isinstance(data_prev, list) and data_prev:
                 for g in data_prev:
@@ -2349,6 +2791,158 @@ def _handle_regs_callback(data: str, chat_id: int | None, message_id: int | None
     return "Некорректная команда"
 
 
+def _handle_today_callback(data: str, chat_id: int | None, message_id: int | None) -> str:
+    if not chat_id:
+        return ""
+    if len(data or "") > 64:
+        return "Некорректная команда"
+    parts = data.split(":")
+    if parts[:2] == ["today", "refresh"] and len(parts) == 2:
+        _today_render(chat_id, message_id, page=1)
+        return "Ок"
+    if parts[:3] == ["today", "block", "page"] and len(parts) == 4:
+        if not _p7_enabled():
+            return "Ок"
+        m = re.fullmatch(r"p(\d+)", parts[3])
+        if not m:
+            return "Некорректная команда"
+        page = int(m.group(1))
+        _today_render(chat_id, message_id, page=page)
+        return "Ок"
+    if parts[:3] == ["today", "block", "move"] and len(parts) == 5:
+        if not _p7_enabled():
+            return "Ок"
+        block_id = int(parts[3])
+        delta = int(parts[4])
+        if delta not in {-10, 10}:
+            return "Некорректная команда"
+        msg_id_use = int(message_id or 0)
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p7/commands/move_block",
+            {
+                "block_id": block_id,
+                "delta_minutes": delta,
+                "source_msg_id": _today_source_msg_id(chat_id, msg_id_use, "block:move"),
+            },
+        )
+        if ok and payload:
+            _today_render(chat_id, message_id, page=1)
+            return "Сдвинуто"
+        if status and status < 500 and err_text and "overlap" in err_text.lower():
+            return "Нельзя: пересечение"
+        return "Ошибка"
+    if parts[:3] == ["today", "block", "del"] and len(parts) == 4:
+        if not _p7_enabled():
+            return "Ок"
+        block_id = int(parts[3])
+        msg_id_use = int(message_id or 0)
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p7/commands/delete_block",
+            {
+                "block_id": block_id,
+                "source_msg_id": _today_source_msg_id(chat_id, msg_id_use, "block:del"),
+            },
+        )
+        if ok and payload:
+            _today_render(chat_id, message_id, page=1)
+            return "Удалено"
+        if status and status < 500 and err_text and "overlap" in err_text.lower():
+            return "Нельзя: пересечение"
+        return "Ошибка"
+    if parts[:3] == ["today", "task", "done"] and len(parts) == 4:
+        task_id = int(parts[3])
+        msg_id_use = int(message_id or 0)
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p2/commands/complete_task",
+            {
+                "task_id": task_id,
+                "source_msg_id": _today_source_msg_id(chat_id, msg_id_use, "task:done"),
+            },
+        )
+        if ok and payload:
+            _today_render(chat_id, message_id, page=1)
+            return "Готово"
+        print(f"p2_cmd=complete_task_today ok=0 status={status} err={err_text}")
+        return "Ошибка"
+    if parts[:3] == ["today", "time", "open"] and len(parts) == 4:
+        if not _p7_enabled():
+            return "Ок"
+        task_id = int(parts[3])
+        text = f"📍 Выделить время для задачи #{task_id}\nВыбери длительность:"
+        keyboard = _today_time_menu_keyboard(task_id)
+        if message_id is None:
+            _send_message_with_keyboard(chat_id, text, keyboard)
+        else:
+            _edit_message_with_keyboard(chat_id, message_id, text, keyboard)
+        return "Ок"
+    if parts[:3] == ["today", "time", "add"] and len(parts) == 5:
+        if not _p7_enabled():
+            return "Ок"
+        task_id = int(parts[3])
+        minutes = int(parts[4])
+        now_local = datetime.now(_tz_local())
+        start_local = _round_up_minutes(now_local, 10)
+        start_utc = start_local.astimezone(timezone.utc)
+        end_utc = start_utc + timedelta(minutes=minutes)
+        msg_id_use = int(message_id or 0)
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p7/commands/add_block",
+            {
+                "task_id": task_id,
+                "start_at": start_utc.isoformat(),
+                "end_at": end_utc.isoformat(),
+                "source_msg_id": _today_source_msg_id(chat_id, msg_id_use, f"time:add:{minutes}"),
+            },
+        )
+        if ok and payload:
+            start_local = _format_local_hhmm(start_utc)
+            end_local = _format_local_hhmm(end_utc)
+            _send_message(chat_id, f"✅ Время выделено: {start_local}–{end_local}")
+            _today_render(chat_id, message_id, page=1)
+            return "Готово"
+        print(f"p7_cmd=add_block ok=0 status={status} err={err_text}")
+        _send_message(chat_id, "⚠️ Не удалось выделить время.")
+        return "Ошибка"
+    if parts[:3] == ["today", "reg", "complete"] and len(parts) == 4:
+        run_id = int(parts[3])
+        msg_id_use = int(message_id or 0)
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p4/commands/complete_reg_run",
+            {
+                "run_id": run_id,
+                "source_msg_id": _today_source_msg_id(chat_id, msg_id_use, "reg:complete"),
+            },
+        )
+        if ok and payload:
+            _today_render(chat_id, message_id, page=1)
+            return "Готово"
+        print(f"p4_cmd=complete_reg_run_today ok=0 status={status} err={err_text}")
+        return "Ошибка"
+    if parts[:3] == ["today", "reg", "skip"] and len(parts) == 4:
+        run_id = int(parts[3])
+        msg_id_use = int(message_id or 0)
+        ok, payload, status, err_text = _worker_post_ex(
+            "/p4/commands/skip_reg_run",
+            {
+                "run_id": run_id,
+                "source_msg_id": _today_source_msg_id(chat_id, msg_id_use, "reg:skip"),
+            },
+        )
+        if ok and payload:
+            _today_render(chat_id, message_id, page=1)
+            return "Пропущено"
+        print(f"p4_cmd=skip_reg_run_today ok=0 status={status} err={err_text}")
+        return "Ошибка"
+    if parts[:2] == ["today", "open_regs"] and len(parts) == 2:
+        period_key = _regs_period_key(datetime.now(_tz_local()))
+        _regs_render(chat_id, message_id, period_key, page=1)
+        return "Ок"
+    if parts[:2] == ["today", "open_list_open"] and len(parts) == 2:
+        _render_list_open(chat_id)
+        return "Ок"
+    return "Некорректная команда"
+
+
 def _handle_voice_message(update_id: int, message: dict) -> None:
     chat_id = int(message["chat"]["id"])
     voice = message.get("voice") or {}
@@ -2472,6 +3066,16 @@ def main() -> None:
                             msg = callback.get("message") or {}
                             msg_id = msg.get("message_id")
                             resp_text = _handle_regs_callback(
+                                data, int(chat_id_cb) if chat_id_cb else None, int(msg_id) if msg_id else None
+                            )
+                            _api_answer_callback(cb_id, resp_text or "Ок")
+                        except Exception:
+                            _api_answer_callback(cb_id, "Ошибка")
+                    elif data.startswith("today:"):
+                        try:
+                            msg = callback.get("message") or {}
+                            msg_id = msg.get("message_id")
+                            resp_text = _handle_today_callback(
                                 data, int(chat_id_cb) if chat_id_cb else None, int(msg_id) if msg_id else None
                             )
                             _api_answer_callback(cb_id, resp_text or "Ок")
@@ -2634,7 +3238,8 @@ def main() -> None:
                                         ],
                                     ]
                                 }
-                                requests.post(
+                                req_mod = _require_requests()
+                                req_mod.post(
                                     _api_url("sendMessage"),
                                     json={
                                         "chat_id": chat_id,
@@ -2670,7 +3275,7 @@ def main() -> None:
                 print(f"processed update_id={update_id} kind={handled_kind}")
                 offset = update_id + 1
                 _save_offset(offset, update_id)
-        except (requests.Timeout, requests.ConnectionError) as exc:
+        except _RETRY_EXCEPTIONS as exc:
             now = time.time()
             if now - last_req_err_ts >= 10:
                 print(f"bot error: {exc}")
