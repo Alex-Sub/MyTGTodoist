@@ -1,0 +1,214 @@
+version: 2
+principles:
+  - "Бизнес-слой не угадывает. Если не хватает — задаёт один уточняющий вопрос."
+  - "Ссылки на сущности: сначала по смыслу (ref), номер (id) — опционально."
+  - "Если ML-слой вернул candidates и выбор не сделан — просим уточнить и показываем варианты."
+
+common:
+  refs:
+    task_ref:
+      description: "Ссылка на задачу по смыслу или по id"
+      fields:
+        id: { type: int, required: false }
+        query: { type: str, required: false }
+        time_range: { type: object, required: false, example: { from: "2026-02-01", to: "2026-02-15" } }
+        people: { type: list, required: false, example: ["Иван"] }
+        filters: { type: object, required: false, example: { cycle_id: 3, goal_id: 12, project: "Sales" } }
+        candidates: { type: list, required: false, description: "Кандидаты для выбора (id/title/when/score)" }
+        chosen_id: { type: int, required: false }
+        ask: { type: str, required: false, description: "Готовый вопрос для уточнения" }
+
+    timeblock_ref:
+      description: "Ссылка на блок времени по смыслу или по id"
+      fields:
+        id: { type: int, required: false }
+        start_at: { type: str, required: false }
+        date: { type: str, required: false }
+        task_ref: { type: object, required: false }
+        candidates: { type: list, required: false }
+        chosen_id: { type: int, required: false }
+        ask: { type: str, required: false }
+
+  disambiguation:
+    default_question: "Уточните, что именно вы имеете в виду?"
+    top_k: 5
+
+  status:
+    canonical:
+      WAITING:
+        ru: "Ожидание"
+        meaning: "Ждём внешнего действия/ответа/решения"
+        aliases_ru: ["ожидание", "жду", "ждем", "на согласовании", "жду ответ", "ждем решения"]
+      PAUSED:
+        ru: "Приостановлено"
+        meaning: "Не время, но задача остаётся актуальной"
+        aliases_ru: ["приостанови", "приостановлено", "пауза", "на паузу", "не сейчас", "не время", "пока не делаем"]
+      IN_PROGRESS:
+        ru: "В работе"
+        meaning: "Делаем сейчас"
+        aliases_ru: ["в работу", "делаю", "в процессе", "занимаюсь", "в работе"]
+
+intents:
+
+  task.create:
+    required: ["entities.title"]
+    question_on_missing: "Как назвать задачу?"
+    notes: "planned_at и source_msg_id опциональны."
+
+  task.complete:
+    required_any:
+      - "entities.task_id"
+      - "entities.task_ref"
+    question_on_missing: "Какую задачу завершить?"
+    disambiguation:
+      ref: "entities.task_ref"
+      question_fallback: "Какую именно задачу завершить?"
+
+  task.set_status:
+    meaning: "Перевести задачу в статус/состояние (WAITING/PAUSED/IN_PROGRESS/…)"
+    required_any:
+      - "entities.task_id"
+      - "entities.task_ref"
+    required: ["entities.status"]
+    question_on_missing: "В какой статус перевести задачу?"
+    disambiguation:
+      ref: "entities.task_ref"
+      question_fallback: "Какую именно задачу перевести в статус?"
+
+  task.reschedule:
+    meaning: "Перенести задачу по времени"
+    required_any:
+      - "entities.task_id"
+      - "entities.task_ref"
+    required_any_2:
+      - "entities.planned_at"
+      - "entities.when"
+    question_on_missing: "На когда перенести?"
+    notes: "Можно принимать duration_min/time_window как в legacy NLU (_extract_date_time/_extract_duration_minutes)."
+    disambiguation:
+      ref: "entities.task_ref"
+      question_fallback: "Какую именно задачу перенести?"
+
+  task.update:
+    required_any:
+      - "entities.task_id"
+      - "entities.task_ref"
+    required_one_of_fields:
+      - "entities.title"
+      - "entities.planned_at"
+      - "entities.status"
+      - "entities.state"
+      - "entities.parent_type"
+      - "entities.parent_id"
+    question_on_missing: "Что именно обновить в задаче?"
+    disambiguation:
+      ref: "entities.task_ref"
+      question_fallback: "Какую именно задачу обновить?"
+
+  task.move_to:
+    meaning: "Переместить задачу в структуру (проект/цикл/цель/родитель)"
+    required_any:
+      - "entities.task_id"
+      - "entities.task_ref"
+    required: ["entities.target_ref"]
+    question_on_missing: "Куда перенести задачу?"
+    disambiguation:
+      ref: "entities.task_ref"
+      question_fallback: "Какую именно задачу перенести?"
+
+  subtask.create:
+    required_any:
+      - "entities.task_id"
+      - "entities.task_ref"
+    required: ["entities.title"]
+    question_priority:
+      - if_missing: "entities.task_id|entities.task_ref"
+        ask: "К какой задаче добавить подзадачу?"
+      - if_missing: "entities.title"
+        ask: "Как назвать подзадачу?"
+    disambiguation:
+      ref: "entities.task_ref"
+      question_fallback: "К какой именно задаче добавить подзадачу?"
+
+  subtask.complete:
+    required_any:
+      - "entities.subtask_id"
+      - "entities.subtask_ref"
+    question_on_missing: "Какую подзадачу завершить?"
+
+  timeblock.create:
+    meaning: "Создать блок времени для задачи"
+    required_any:
+      - "entities.task_id"
+      - "entities.task_ref"
+    required: ["entities.start_at"]
+    required_any_2:
+      - "entities.end_at"
+      - "entities.duration_min"
+    question_priority:
+      - if_missing: "entities.task_id|entities.task_ref"
+        ask: "Для какой задачи создать блок времени?"
+      - if_missing: "entities.start_at"
+        ask: "Когда начать?"
+      - if_missing: "entities.end_at|entities.duration_min"
+        ask: "На сколько минут поставить блок?"
+    disambiguation:
+      ref: "entities.task_ref"
+      question_fallback: "Для какой именно задачи создать блок времени?"
+
+  timeblock.move:
+    required_any:
+      - "entities.time_block_id"
+      - "entities.timeblock_ref"
+    required_one_of_fields:
+      - "entities.start_at"
+      - "entities.end_at"
+      - "entities.duration_min"
+      - "entities.task_id"
+      - "entities.task_ref"
+    question_priority:
+      - if_missing: "entities.time_block_id|entities.timeblock_ref"
+        ask: "Какой блок времени изменить?"
+      - if_missing: "entities.start_at|entities.end_at|entities.duration_min|entities.task_id|entities.task_ref"
+        ask: "Что изменить в блоке времени?"
+    disambiguation:
+      ref: "entities.timeblock_ref"
+      question_fallback: "Какой именно блок времени изменить?"
+
+  timeblock.delete:
+    required_any:
+      - "entities.time_block_id"
+      - "entities.timeblock_ref"
+    question_on_missing: "Какой блок времени убрать?"
+    disambiguation:
+      ref: "entities.timeblock_ref"
+      question_fallback: "Какой именно блок времени убрать?"
+
+  reg.run:
+    required_any:
+      - "entities.regulation_id"
+      - "entities.regulation_ref"
+    required: ["entities.period_key", "entities.status", "entities.due_date"]
+    question_priority:
+      - if_missing: "entities.regulation_id|entities.regulation_ref"
+        ask: "Какое правило выполнить?"
+      - if_missing: "entities.period_key"
+        ask: "За какой период?"
+      - if_missing: "entities.status"
+        ask: "Какой статус поставить? Например DONE или SKIPPED."
+      - if_missing: "entities.due_date"
+        ask: "На какую дату?"
+    notes: "due_time_local опционален."
+
+  reg.status:
+    required: []
+    question_on_missing: null
+
+  state.get:
+    required: []
+    question_on_missing: null
+
+deprecated_intents:
+  task.move:
+    map_to: "task.set_status"
+    note: "Старый смысл 'move' трактуем как смену статуса; перенос по времени — task.reschedule."
