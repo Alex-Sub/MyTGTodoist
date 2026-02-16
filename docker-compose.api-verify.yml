@@ -1,0 +1,26 @@
+services:
+  organizer-api-verify:
+    build:
+      context: ./organizer-api
+    env_file:
+      - deploy/tenants/.env.alexey
+    environment:
+      DB_PATH: ${DB_PATH:-/data/organizer.db}
+      LOCAL_TZ_OFFSET_MIN: ${LOCAL_TZ_OFFSET_MIN:-180}
+      DT_MARKER_HOUR: ${DT_MARKER_HOUR:-6}
+      DT_MARKER_MINUTE: ${DT_MARKER_MINUTE:-0}
+    volumes:
+      - db_data:/data:ro
+      - ./migrations:/app/migrations:ro
+    ports:
+      - "8101:8000"
+    depends_on:
+      organizer-worker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped

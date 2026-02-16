@@ -82,6 +82,10 @@ def test_task_ref_disambiguation_returns_candidates(runtime_db: Path) -> None:
     )
     assert res["ok"] is False
     assert bool(res.get("clarifying_question"))
+    choices = res.get("choices")
+    assert isinstance(choices, list)
+    assert 1 <= len(choices) <= canon.get_disambiguation_top_k()
+    assert all(isinstance(ch.get("id"), int) and isinstance(ch.get("label"), str) for ch in choices)
     candidates = res.get("debug", {}).get("candidates_top")
     assert isinstance(candidates, list)
     assert len(candidates) >= 2

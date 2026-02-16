@@ -1,50 +1,51 @@
-# todo-telegram-calendar
+# MyTGTodoist
 
-Проект объединяет Telegram-бота и HTTP API, чтобы управлять задачами и событиями календаря через привычный чат-интерфейс. В основе — FastAPI для веб-части и aiogram для обработки апдейтов Telegram, с единым входом и централизованной конфигурацией через `.env`.
+Runtime-only репозиторий: бизнес-логика (worker + Telegram UX + read-only API). ML core стек (ASR/embeddings/RAG) внешний.
 
-Стартовая структура подготовлена под SQLite и планировщик задач, с логированием в stdout и файл. Дальше будет добавлена схема БД, интеграции с Google Calendar и экспорт данных.
+## Компоненты (каноничные)
+- `organizer-worker/` : single writer, применяет команды и пишет в SQLite.
+- `organizer-api/` : read-only API (порт `8101:8000` в локальном compose).
+- `telegram-bot/` : UX только, не пишет в БД (ходит в worker по HTTP).
+- `migrations/*.sql` : runtime SQL миграции, применяются worker'ом.
 
-## Установка зависимостей
+## Поддерживаемые intents
+- `task.create`
+- `task.complete`
+- `task.set_status`
+- `task.reschedule`
+- `task.move_to`
+- `task.move` (deprecated, backward compatible alias to `task.set_status`)
+- `task.update`
+- `subtask.create`
+- `subtask.complete`
+- `timeblock.create`
+- `timeblock.move`
+- `timeblock.delete`
+- `reg.run`
+- `reg.status`
+- `state.get`
+
+## Запуск (локально, docker compose)
+
+Требуется Docker Desktop (или docker engine) запущенный.
 
 ```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+docker compose up --build -d
+docker compose ps
 ```
 
-## FastAPI (dev)
-
-```bash
-uvicorn src.api.app:app --reload
-```
-
-## Alembic
-
-```bash
-alembic revision --autogenerate -m "init"
-alembic upgrade head
-```
+API health: `http://127.0.0.1:8101/health`
 
 ## Тесты
 
 ```bash
-pytest
+pytest -q
 ```
-
-## Режимы запуска
-
-В проде используется webhook (FastAPI принимает апдейты). В dev удобнее polling.
-
-- `DEV_POLLING=true` - запуск long polling
-- иначе - запуск FastAPI через uvicorn
 
 ## ASR (voice)
 
-Для распознавания голоса бот использует внешний ASR-сервис. Настройте переменные окружения:
-
-- `ASR_URL` (например `http://localhost:8088`)
-- `ASR_API_KEY`
-- `ASR_TIMEOUT_SECONDS` (по умолчанию 180)
+ASR сервис внешний. Укажите URL:
+- `ASR_SERVICE_URL` (например `http://localhost:8001`)
 
 ## Подтверждение действий (NLU/voice)
 

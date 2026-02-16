@@ -1,16 +1,4 @@
 services:
-  database:
-    image: alpine:3.20
-    command: ["sh", "-c", "mkdir -p /data && touch /data/organizer.db && tail -f /dev/null"]
-    volumes:
-      - db_data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "test -f /data/organizer.db"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    restart: unless-stopped
-
   organizer-api:
     build:
       context: ./organizer-api
@@ -27,7 +15,7 @@ services:
     ports:
       - "8101:8000"
     depends_on:
-      database:
+      organizer-worker:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()\""]
@@ -50,7 +38,8 @@ services:
       TIMEZONE: ${TIMEZONE:-Europe/Moscow}
       WORKER_INTERVAL_SEC: 5
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-      ASR_SERVICE_URL: http://asr-service:8001
+      # ML core (ASR) is external; override via ASR_SERVICE_URL if voice is used.
+      ASR_SERVICE_URL: ${ASR_SERVICE_URL:-http://host.docker.internal:8001}
       WORKER_TG_HTTP_READ_TIMEOUT: ${WORKER_TG_HTTP_READ_TIMEOUT:-90}
       WORKER_TG_SEND_MAX_RETRIES: ${WORKER_TG_SEND_MAX_RETRIES:-2}
       WORKER_NOTIFY_ON_DEAD: ${WORKER_NOTIFY_ON_DEAD:-1}
@@ -89,36 +78,11 @@ services:
       - db_data:/data
       - ./secrets:/secrets:ro
       - ./secrets/alexey/google_sa.json:/data/google_sa.json:ro
-    depends_on:
-      database:
-        condition: service_healthy
-      organizer-api:
-        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/worker.ok"]
       interval: 10s
       timeout: 3s
       retries: 5
-    restart: unless-stopped
-
-  asr-service:
-    build:
-      context: ./asr-service
-    ports:
-      - "${ASR_PORT}:8001"
-    environment:
-      WHISPER_MODEL: /app/models/ggml-large-v3.bin
-      WHISPER_LANG: ru
-      WHISPER_THREADS: "8"
-      ASR_MOCK: ${ASR_MOCK:-1}
-    volumes:
-      - ./asr-service/models:/app/models:rw
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health').read()\""]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
     restart: unless-stopped
 
   telegram-bot:
@@ -128,7 +92,8 @@ services:
       - deploy/tenants/.env.alexey
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-      ASR_SERVICE_URL: http://asr-service:8001
+      # ML core (ASR) is external; override via ASR_SERVICE_URL if voice is used.
+      ASR_SERVICE_URL: ${ASR_SERVICE_URL:-http://host.docker.internal:8001}
       ORGANIZER_API_URL: http://organizer-api:8000
       WORKER_COMMAND_URL: http://organizer-worker:8002
       STATE_PATH: /data/bot.offset
@@ -152,8 +117,6 @@ services:
       DB_PATH: ${DB_PATH:-/data/organizer.db}
     depends_on:
       organizer-api:
-        condition: service_healthy
-      asr-service:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/bot.ok"]

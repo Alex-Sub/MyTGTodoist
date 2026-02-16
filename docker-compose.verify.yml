@@ -1,0 +1,69 @@
+services:
+  organizer-worker:
+    volumes:
+      - ./migrations:/app/migrations:ro
+      - ./organizer-worker/worker.py:/app/worker.py:ro
+      - ./organizer-worker/src:/app/src:ro
+      - db_data:/data
+      - ./secrets:/secrets:ro
+
+  organizer-worker-verify:
+    image: organizer-alexey-organizer-worker:latest
+    container_name: organizer-worker-verify
+    env_file:
+      - deploy/tenants/.env.alexey
+    environment:
+      DB_PATH: /data/organizer.db
+      GOOGLE_CALENDAR_ID: ${GOOGLE_CALENDAR_ID}
+      GOOGLE_SERVICE_ACCOUNT_FILE: /data/google_sa.json
+      TIMEZONE_NAME: ${TIMEZONE_NAME:-Europe/Moscow}
+      TIMEZONE: ${TIMEZONE:-Europe/Moscow}
+      WORKER_INTERVAL_SEC: 5
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      # ML core (ASR) is external; override via ASR_SERVICE_URL if voice is used.
+      ASR_SERVICE_URL: ${ASR_SERVICE_URL:-http://host.docker.internal:8001}
+      WORKER_TG_HTTP_READ_TIMEOUT: ${WORKER_TG_HTTP_READ_TIMEOUT:-90}
+      WORKER_TG_SEND_MAX_RETRIES: ${WORKER_TG_SEND_MAX_RETRIES:-2}
+      WORKER_NOTIFY_ON_DEAD: ${WORKER_NOTIFY_ON_DEAD:-1}
+      ORGANIZER_API_URL: ${ORGANIZER_API_URL:-http://organizer-api:8000}
+      TG_HTTP_CONNECT_TIMEOUT: ${TG_HTTP_CONNECT_TIMEOUT:-10}
+      TG_HTTP_READ_TIMEOUT: ${TG_HTTP_READ_TIMEOUT:-90}
+      TG_HTTP_RETRIES: ${TG_HTTP_RETRIES:-3}
+      TG_HTTP_RETRY_SLEEP: ${TG_HTTP_RETRY_SLEEP:-1.0}
+      ASR_HTTP_READ_TIMEOUT: ${ASR_HTTP_READ_TIMEOUT:-180}
+      DT_DEFAULT_HOUR: ${DT_DEFAULT_HOUR:-10}
+      DT_DEFAULT_MINUTE: ${DT_DEFAULT_MINUTE:-0}
+      DT_MARKER_HOUR: ${DT_MARKER_HOUR:-6}
+      DT_MARKER_MINUTE: ${DT_MARKER_MINUTE:-0}
+      DT_REQUIRE_AMPM_FOR_SHORT_HOURS: ${DT_REQUIRE_AMPM_FOR_SHORT_HOURS:-1}
+      DT_SHORT_HOUR_MAX: ${DT_SHORT_HOUR_MAX:-12}
+      DT_AMBIGUOUS_MARKER_HOUR: ${DT_AMBIGUOUS_MARKER_HOUR:-6}
+      DT_AMBIGUOUS_MARKER_MINUTE: ${DT_AMBIGUOUS_MARKER_MINUTE:-0}
+      DT_DEFAULT_WEEKDAY: ${DT_DEFAULT_WEEKDAY:-0}
+      DT_DEFAULT_MONTHDAY: ${DT_DEFAULT_MONTHDAY:-1}
+      DT_DEFAULT_YEAR_MONTH: ${DT_DEFAULT_YEAR_MONTH:-1}
+      DT_DEFAULT_YEAR_MONTHDAY: ${DT_DEFAULT_YEAR_MONTHDAY:-1}
+      LOCAL_TZ_OFFSET_MIN: ${LOCAL_TZ_OFFSET_MIN:-180}
+      MEETING_DEFAULT_MINUTES: ${MEETING_DEFAULT_MINUTES:-30}
+      B2_QUEUE_MAX_NEW: ${B2_QUEUE_MAX_NEW:-50}
+      B2_QUEUE_MAX_TOTAL: ${B2_QUEUE_MAX_TOTAL:-500}
+      B2_CLAIM_LEASE_SEC: ${B2_CLAIM_LEASE_SEC:-120}
+      B2_MAX_ATTEMPTS: ${B2_MAX_ATTEMPTS:-5}
+      B2_REQUEUE_FAILED_EVERY_SEC: ${B2_REQUEUE_FAILED_EVERY_SEC:-15}
+      B2_REQUEUE_FAILED_BATCH: ${B2_REQUEUE_FAILED_BATCH:-10}
+      B2_IDLE_SLEEP_SEC: ${B2_IDLE_SLEEP_SEC:-0.5}
+      B2_SCHEMA_PATH: /app/migrations/001_inbox_queue.sql
+    volumes:
+      - db_data:/data
+      - ./organizer-worker/worker.py:/app/worker.py:ro
+      - ./organizer-worker/src:/app/src:ro
+      - ./migrations:/app/migrations:ro
+    depends_on:
+      organizer-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/worker.ok"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped

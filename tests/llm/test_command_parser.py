@@ -5,7 +5,7 @@ from typing import Any, Deque
 import pytest
 from jsonschema import ValidationError
 
-from src.llm import router
+from organizer_worker.llm import router
 
 
 def _base_payload(intent: str) -> dict[str, Any]:

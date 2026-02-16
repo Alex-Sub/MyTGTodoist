@@ -1,0 +1,4 @@
+services:
+  telegram-bot:
+    environment:
+      WORKER_COMMAND_URL: http://organizer-worker-verify:8002
