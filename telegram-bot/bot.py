@@ -215,6 +215,22 @@ def _handle_digest_callback(data: str, chat_id: int | None) -> str:
     mode = parts[1] if len(parts) > 1 else ""
     today = datetime.now(_digest_tz()).date().isoformat()
     tomorrow = (datetime.now(_digest_tz()).date() + timedelta(days=1)).isoformat()
+    max_items = 15
+
+    if mode == "task_status" and len(parts) >= 4:
+        task_id = int(parts[2])
+        status_value = str(parts[3]).strip().upper()
+        payload = _worker_runtime_command("task.set_status", {"task_id": task_id, "status": status_value}) or {}
+        ok = bool(payload.get("ok")) if isinstance(payload, dict) else False
+        if ok:
+            _send_message(chat_id, f"Задача #{task_id}: статус -> {status_value}.")
+            return "Готово"
+        _send_message(chat_id, f"Не удалось обновить статус задачи #{task_id}.")
+        return "Ошибка"
+
+    if mode == "task_time" and len(parts) >= 3:
+        task_id = int(parts[2])
+        return _handle_today_callback(f"today:time:open:{task_id}", chat_id, None)
 
     if mode == "goal_reschedule" and len(parts) >= 4:
         goal_id = int(parts[2])
@@ -264,12 +280,26 @@ def _handle_digest_callback(data: str, chat_id: int | None) -> str:
         if not goals:
             _send_message(chat_id, f"{title}: пусто")
             return "Ок"
-        _send_message(chat_id, f"{title}: {len(goals)}")
-        for g in goals[:10]:
+        lines = [f"{title}: {len(goals)}"]
+        for idx, g in enumerate(goals[:max_items], start=1):
             goal_id = int(g.get("id"))
             due = str(g.get("planned_end_date") or "")
             rs = int(g.get("reschedule_count") or 0)
-            text = f"🎯 #{goal_id} {str(g.get('title') or '').strip()}\nСрок: {due}\nПереносов: {rs}"
+            due_label = "срок не задан"
+            try:
+                due_date = date.fromisoformat(due)
+                delta_days = (due_date - date.fromisoformat(today)).days
+                due_label = f"просрочена на {abs(delta_days)}д" if delta_days < 0 else f"до срока {delta_days}д"
+            except Exception:
+                pass
+            lines.append(f"{idx}. #{goal_id} {str(g.get('title') or '').strip()} — {due_label}, переносов: {rs}")
+        if len(goals) > max_items:
+            lines.append(f"... и ещё {len(goals) - max_items}")
+        _send_message(chat_id, "\n".join(lines))
+        for idx, g in enumerate(goals[:max_items], start=1):
+            goal_id = int(g.get("id"))
+            due = str(g.get("planned_end_date") or "")
+            text = f"{idx}. 🎯 #{goal_id} {str(g.get('title') or '').strip()}"
             _send_message(
                 chat_id,
                 text,
@@ -305,11 +335,32 @@ def _handle_digest_callback(data: str, chat_id: int | None) -> str:
             _send_message(chat_id, f"{title}: пусто")
             return "Ок"
         lines = [title]
-        for t in items[:20]:
+        for idx, t in enumerate(items[:max_items], start=1):
             planned = str(t.get("planned_at") or "")[:16]
             suffix = f" ({planned})" if planned else ""
-            lines.append(f"- #{t.get('id')} {str(t.get('title') or '').strip()}{suffix}")
+            lines.append(f"{idx}. #{t.get('id')} {str(t.get('title') or '').strip()}{suffix}")
+        if len(items) > max_items:
+            lines.append(f"... и ещё {len(items) - max_items}")
         _send_message(chat_id, "\n".join(lines))
+        for idx, t in enumerate(items[:max_items], start=1):
+            task_id = int(t.get("id"))
+            title_line = f"{idx}. #{task_id} {str(t.get('title') or '').strip()}"
+            _send_message(
+                chat_id,
+                title_line,
+                reply_markup={
+                    "inline_keyboard": [
+                        [
+                            {"text": "▶️ В работу", "callback_data": f"digest:task_status:{task_id}:IN_PROGRESS"},
+                            {"text": "⏸ Пауза", "callback_data": f"digest:task_status:{task_id}:PAUSED"},
+                        ],
+                        [
+                            {"text": "✅ Done", "callback_data": f"digest:task_status:{task_id}:DONE"},
+                            {"text": "⏱ Время", "callback_data": f"digest:task_time:{task_id}"},
+                        ],
+                    ]
+                },
+            )
         return "Ок"
     return "Некорректно"
 
