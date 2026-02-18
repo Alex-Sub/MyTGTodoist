@@ -119,6 +119,57 @@ def _resolve_task_id_or_question(e: dict[str, Any], conn: Any) -> tuple[int | No
     return int(candidates[0]["id"]), None
 
 
+def _resolve_goal_id_or_question(e: dict[str, Any], conn: Any) -> tuple[int | None, HandlerResult | None]:
+    goal_id = e.get("goal_id")
+    if goal_id is not None:
+        try:
+            return int(goal_id), None
+        except Exception:
+            return None, _need("goal_id", "Нужен номер цели.")
+
+    goal_ref = e.get("goal_ref")
+    if goal_ref is None:
+        return None, _need("goal_ref", "Какую цель выбрать?")
+
+    if isinstance(goal_ref, dict):
+        chosen_id = goal_ref.get("chosen_id") or goal_ref.get("goal_id") or goal_ref.get("id")
+        if chosen_id is not None:
+            try:
+                return int(chosen_id), None
+            except Exception:
+                return None, _need("goal_ref.chosen_id", "Нужен корректный номер цели.")
+        candidates = goal_ref.get("candidates")
+        if isinstance(candidates, list) and candidates:
+            top = candidates[: canon.get_disambiguation_top_k()]
+            return None, {
+                "ok": False,
+                "user_message": "Нужны уточнения.",
+                "clarifying_question": str(goal_ref.get("ask") or "Какую именно цель выбрать?"),
+                "choices": _choices_from_candidates(top),
+                "debug": {"missing": "goal_ref.chosen_id", "candidates_top": top},
+            }
+        text_ref = goal_ref.get("query") or goal_ref.get("text") or ""
+        goal_ref = str(text_ref).strip()
+
+    if not isinstance(goal_ref, str) or not goal_ref.strip():
+        return None, _need("goal_ref", "Какую цель выбрать?")
+    if goal_ref.strip().isdigit():
+        return int(goal_ref.strip()), None
+
+    candidates = db.find_goal_candidates(conn, goal_ref=goal_ref.strip(), limit=canon.get_disambiguation_top_k())
+    if not candidates:
+        return None, _fail("Не нашел подходящую цель.", goal_ref=goal_ref)
+    if len(candidates) > 1:
+        return None, {
+            "ok": False,
+            "user_message": "Нужны уточнения.",
+            "clarifying_question": "Нашел несколько похожих целей. Какую именно выбрать?",
+            "choices": _choices_from_candidates(candidates[: canon.get_disambiguation_top_k()]),
+            "debug": {"missing": "goal_ref.chosen_id", "candidates_top": candidates[: canon.get_disambiguation_top_k()]},
+        }
+    return int(candidates[0]["id"]), None
+
+
 def _choices_from_candidates(candidates: list[Any]) -> list[dict[str, Any]]:
     choices: list[dict[str, Any]] = []
     for c in candidates:
@@ -484,15 +535,19 @@ def state_get(payload: dict[str, Any]) -> HandlerResult:
 
 def cycle_create(payload: dict[str, Any]) -> HandlerResult:
     e = _entities(payload)
-    title = (e.get("title") or "").strip()
-    if not title:
-        return _need("title", "Как назвать цикл?")
-    date_from = e.get("date_from")
-    date_to = e.get("date_to")
+    name = (e.get("name") or e.get("title") or "").strip()
+    start_date = e.get("start_date") or e.get("date_from")
+    end_date = e.get("end_date") or e.get("date_to")
+    if not name:
+        return _need("name", "Как назвать цикл?")
+    if not start_date:
+        return _need("start_date", "Какая дата начала цикла?")
+    if not end_date:
+        return _need("end_date", "Какая дата конца цикла?")
 
     try:
         with db.connect() as conn:
-            cycle_id = db.cycles_create(conn, title=title, date_from=(str(date_from) if date_from is not None else None), date_to=(str(date_to) if date_to is not None else None))
+            cycle_id = db.create_cycle(conn, name=name, start_date=str(start_date), end_date=str(end_date))
         return _ok("Цикл создан.", cycle_id=cycle_id)
     except Exception as exc:
         return _fail("Не получилось создать цикл. Попробуйте еще раз.", error=str(exc))
@@ -520,8 +575,8 @@ def cycle_close(payload: dict[str, Any]) -> HandlerResult:
 
     try:
         with db.connect() as conn:
-            db.cycles_close(conn, cycle_id=int(cycle_id))
-        return _ok("Цикл закрыт.", cycle_id=int(cycle_id))
+            summary = db.close_cycle(conn, cycle_id=int(cycle_id))
+        return _ok("Цикл закрыт.", cycle_id=int(cycle_id), summary=summary)
     except Exception as exc:
         return _fail("Не получилось закрыть цикл. Проверьте номер.", error=str(exc), cycle_id=cycle_id)
 
@@ -530,15 +585,32 @@ def goal_create(payload: dict[str, Any]) -> HandlerResult:
     e = _entities(payload)
     cycle_id = e.get("cycle_id")
     title = (e.get("title") or "").strip()
-    target = e.get("target")
+    success_criteria = (e.get("success_criteria") or "").strip()
+    planned_end_date = e.get("planned_end_date")
     if cycle_id is None:
-        return _need("cycle_id", "Для какого цикла добавить цель? Пришлите номер цикла.")
+        # default to active cycle
+        with db.connect() as conn:
+            active = db.get_active_cycle(conn)
+        if active is not None:
+            cycle_id = active.get("id")
+    if cycle_id is None:
+        return _need("cycle_id", "Для какого цикла добавить цель?")
     if not title:
         return _need("title", "Как назвать цель?")
+    if not success_criteria:
+        return _need("success_criteria", "По какому критерию понять, что цель достигнута?")
+    if not planned_end_date:
+        return _need("planned_end_date", "До какой даты запланирована цель?")
 
     try:
         with db.connect() as conn:
-            goal_id = db.goals_create(conn, cycle_id=int(cycle_id), title=title, target=(str(target) if target is not None else None))
+            goal_id = db.create_goal(
+                conn,
+                cycle_id=int(cycle_id),
+                title=title,
+                success_criteria=success_criteria,
+                planned_end_date=str(planned_end_date),
+            )
         return _ok("Цель добавлена.", goal_id=goal_id, cycle_id=int(cycle_id))
     except Exception as exc:
         return _fail("Не получилось добавить цель. Проверьте данные.", error=str(exc))
@@ -546,13 +618,13 @@ def goal_create(payload: dict[str, Any]) -> HandlerResult:
 
 def goal_update(payload: dict[str, Any]) -> HandlerResult:
     e = _entities(payload)
-    goal_id = e.get("goal_id")
-    if goal_id is None:
-        return _need("goal_id", "Какую цель обновить? Пришлите номер.")
-
     fields: dict[str, Any] = {}
     if e.get("title") is not None:
         fields["title"] = str(e.get("title")).strip()
+    if e.get("success_criteria") is not None:
+        fields["success_criteria"] = str(e.get("success_criteria")).strip()
+    if e.get("planned_end_date") is not None:
+        fields["planned_end_date"] = str(e.get("planned_end_date")).strip()
     if e.get("status") is not None:
         fields["status"] = str(e.get("status")).strip().upper()
     if not fields:
@@ -560,35 +632,76 @@ def goal_update(payload: dict[str, Any]) -> HandlerResult:
 
     try:
         with db.connect() as conn:
-            db.goals_update(conn, goal_id=int(goal_id), fields=fields)
-        return _ok("Готово. Обновил цель.", goal_id=int(goal_id))
+            goal_id, question = _resolve_goal_id_or_question(e, conn)
+            if question is not None:
+                return question
+            assert goal_id is not None
+            db.update_goal(conn, goal_id=goal_id, fields=fields)
+        return _ok("Готово. Обновил цель.", goal_id=goal_id)
     except Exception as exc:
-        return _fail("Не получилось обновить цель. Проверьте данные.", error=str(exc), goal_id=goal_id)
+        return _fail("Не получилось обновить цель. Проверьте данные.", error=str(exc))
+
+def goal_reschedule(payload: dict[str, Any]) -> HandlerResult:
+    e = _entities(payload)
+    new_end_date = e.get("new_end_date")
+    if not new_end_date:
+        return _need("new_end_date", "На какую дату перенести цель?")
+
+    try:
+        with db.connect() as conn:
+            goal_id, question = _resolve_goal_id_or_question(e, conn)
+            if question is not None:
+                return question
+            assert goal_id is not None
+            event_id = db.reschedule_goal(conn, goal_id=goal_id, new_end_date=str(new_end_date))
+        return _ok("Перенес срок цели.", goal_id=goal_id, event_id=event_id)
+    except Exception as exc:
+        return _fail("Не получилось перенести срок цели.", error=str(exc))
+
+
+def goal_link_task(payload: dict[str, Any]) -> HandlerResult:
+    e = _entities(payload)
+    try:
+        with db.connect() as conn:
+            goal_id, gq = _resolve_goal_id_or_question(e, conn)
+            if gq is not None:
+                return gq
+            task_id, tq = _resolve_task_id_or_question(e, conn)
+            if tq is not None:
+                return tq
+            assert goal_id is not None and task_id is not None
+            db.link_task_to_goal(conn, task_id=task_id, goal_id=goal_id)
+        return _ok("Привязал задачу к цели.", task_id=task_id, goal_id=goal_id)
+    except Exception as exc:
+        return _fail("Не получилось привязать задачу к цели.", error=str(exc))
 
 
 def goal_close(payload: dict[str, Any]) -> HandlerResult:
     e = _entities(payload)
-    goal_id = e.get("goal_id")
-    if goal_id is None:
-        return _need("goal_id", "Какую цель закрыть? Пришлите номер.")
+    close_as = str(e.get("close_as") or "DONE").strip().upper()
+    if close_as not in {"DONE", "DROPPED"}:
+        return _need("close_as", "Закрыть как DONE или DROPPED?")
 
     try:
         with db.connect() as conn:
-            db.goals_close(conn, goal_id=int(goal_id))
-        return _ok("Цель закрыта.", goal_id=int(goal_id))
+            goal_id, question = _resolve_goal_id_or_question(e, conn)
+            if question is not None:
+                return question
+            assert goal_id is not None
+            db.close_goal(conn, goal_id=goal_id, close_as=close_as)
+        return _ok("Цель закрыта.", goal_id=goal_id, close_as=close_as)
     except Exception as exc:
-        return _fail("Не получилось закрыть цель. Проверьте номер.", error=str(exc), goal_id=goal_id)
+        return _fail("Не получилось закрыть цель. Проверьте номер.", error=str(exc))
 
 
 def nudge_list(payload: dict[str, Any]) -> HandlerResult:
     e = _entities(payload)
-    user_id = e.get("user_id")
-    if user_id is None:
-        return _need("user_id", "Для какого пользователя показать подсказки?")
+    user_id = str(e.get("user_id") or "default")
+    today = str(e.get("today") or datetime.now(timezone.utc).date().isoformat())
 
     try:
         with db.connect() as conn:
-            rows = db.nudges_list(conn, user_id=str(user_id))
+            rows = db.list_nudges(conn, user_id=user_id, today=today)
         if not rows:
             return _ok("Сейчас ничего не нужно.", nudges=[])
         return _ok("Есть подсказки.", nudges=rows, count=len(rows))
@@ -598,19 +711,116 @@ def nudge_list(payload: dict[str, Any]) -> HandlerResult:
 
 def nudge_ack(payload: dict[str, Any]) -> HandlerResult:
     e = _entities(payload)
-    user_id = e.get("user_id")
+    user_id = str(e.get("user_id") or "default")
     nudge_id = e.get("nudge_id")
-    if user_id is None:
-        return _need("user_id", "Для какого пользователя?")
-    if not nudge_id:
+    nudge_type = e.get("nudge_type")
+    entity_type = e.get("entity_type")
+    entity_id = e.get("entity_id")
+
+    if nudge_id and (nudge_type is None or entity_type is None or entity_id is None):
+        parts = str(nudge_id).split(":")
+        if len(parts) == 3:
+            nudge_type, entity_type, entity_id = parts[0], parts[1], parts[2]
+    if nudge_type is None or entity_type is None or entity_id is None:
         return _need("nudge_id", "Какую подсказку отметить?")
 
     try:
         with db.connect() as conn:
-            db.nudges_ack(conn, user_id=str(user_id), nudge_id=str(nudge_id))
-        return _ok("Хорошо. Учту.", nudge_id=str(nudge_id))
+            db.ack_nudge(
+                conn,
+                user_id=user_id,
+                nudge_type=str(nudge_type),
+                entity_type=str(entity_type),
+                entity_id=int(entity_id),
+            )
+        return _ok("Хорошо. Учту.", nudge_type=str(nudge_type), entity_type=str(entity_type), entity_id=int(entity_id))
     except Exception as exc:
         return _fail("Не получилось отметить подсказку. Попробуйте еще раз.", error=str(exc))
+
+
+def digest_daily(payload: dict[str, Any]) -> HandlerResult:
+    e = _entities(payload)
+    today = str(e.get("today") or datetime.now(timezone.utc).date().isoformat())
+    tomorrow = str(e.get("tomorrow") or (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat())
+    user_id = str(e.get("user_id") or "default")
+    try:
+        with db.connect() as conn:
+            digest = db.compute_daily_digest(conn, today=today, tomorrow=tomorrow, user_id=user_id)
+        return _ok("Сводка готова.", digest=digest)
+    except Exception as exc:
+        return _fail("Не получилось собрать сводку.", error=str(exc))
+
+
+def tasks_list_today(payload: dict[str, Any]) -> HandlerResult:
+    e = _entities(payload)
+    today = str(e.get("today") or datetime.now(timezone.utc).date().isoformat())
+    limit = int(e.get("limit") or 50)
+    try:
+        with db.connect() as conn:
+            tasks = db.list_tasks_today(conn, today=today, limit=limit)
+        return _ok("Список задач на сегодня готов.", tasks=tasks, count=len(tasks), today=today)
+    except Exception as exc:
+        return _fail("Не получилось получить задачи на сегодня.", error=str(exc))
+
+
+def tasks_list_tomorrow(payload: dict[str, Any]) -> HandlerResult:
+    e = _entities(payload)
+    tomorrow = str(e.get("tomorrow") or (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat())
+    limit = int(e.get("limit") or 50)
+    try:
+        with db.connect() as conn:
+            tasks = db.list_tasks_tomorrow(conn, tomorrow=tomorrow, limit=limit)
+        return _ok("Список задач на завтра готов.", tasks=tasks, count=len(tasks), tomorrow=tomorrow)
+    except Exception as exc:
+        return _fail("Не получилось получить задачи на завтра.", error=str(exc))
+
+
+def tasks_list_active(payload: dict[str, Any]) -> HandlerResult:
+    e = _entities(payload)
+    limit = int(e.get("limit") or 100)
+    try:
+        with db.connect() as conn:
+            tasks = db.list_tasks_active(conn, limit=limit)
+        return _ok("Список активных задач готов.", tasks=tasks, count=len(tasks))
+    except Exception as exc:
+        return _fail("Не получилось получить активные задачи.", error=str(exc))
+
+
+def goals_list_overdue(payload: dict[str, Any]) -> HandlerResult:
+    e = _entities(payload)
+    today = str(e.get("today") or datetime.now(timezone.utc).date().isoformat())
+    limit = int(e.get("limit") or 20)
+    try:
+        with db.connect() as conn:
+            goals = db.list_goals_overdue(conn, today=today, limit=limit)
+        return _ok("Список просроченных целей готов.", goals=goals, count=len(goals), today=today)
+    except Exception as exc:
+        return _fail("Не получилось получить просроченные цели.", error=str(exc))
+
+
+def goals_list_due_soon(payload: dict[str, Any]) -> HandlerResult:
+    e = _entities(payload)
+    today = str(e.get("today") or datetime.now(timezone.utc).date().isoformat())
+    tomorrow = str(e.get("tomorrow") or (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat())
+    limit = int(e.get("limit") or 20)
+    try:
+        with db.connect() as conn:
+            goals = db.list_goals_due_soon(conn, today=today, tomorrow=tomorrow, limit=limit)
+        return _ok("Список целей со сроком сегодня/завтра готов.", goals=goals, count=len(goals), today=today, tomorrow=tomorrow)
+    except Exception as exc:
+        return _fail("Не получилось получить цели со сроком сегодня/завтра.", error=str(exc))
+
+
+def goals_list_at_risk(payload: dict[str, Any]) -> HandlerResult:
+    e = _entities(payload)
+    today = str(e.get("today") or datetime.now(timezone.utc).date().isoformat())
+    limit = int(e.get("limit") or 20)
+    try:
+        with db.connect() as conn:
+            goals = db.list_goals_at_risk(conn, today=today, limit=limit)
+        return _ok("Список целей под риском готов.", goals=goals, count=len(goals), today=today)
+    except Exception as exc:
+        return _fail("Не получилось получить цели под риском.", error=str(exc))
 
 
 INTENT_HANDLERS: dict[str, HandlerFn] = {
@@ -629,13 +839,21 @@ INTENT_HANDLERS: dict[str, HandlerFn] = {
     "reg.run": reg_run,
     "reg.status": reg_status,
     "cycle.create": cycle_create,
-    "cycle.set_active": cycle_set_active,
     "cycle.close": cycle_close,
     "goal.create": goal_create,
     "goal.update": goal_update,
     "goal.close": goal_close,
+    "goal.reschedule": goal_reschedule,
+    "goal.link_task": goal_link_task,
     "nudge.list": nudge_list,
     "nudge.ack": nudge_ack,
+    "digest.daily": digest_daily,
+    "tasks.list_today": tasks_list_today,
+    "tasks.list_tomorrow": tasks_list_tomorrow,
+    "tasks.list_active": tasks_list_active,
+    "goals.list_overdue": goals_list_overdue,
+    "goals.list_due_soon": goals_list_due_soon,
+    "goals.list_at_risk": goals_list_at_risk,
     "state.get": state_get,
 }
 

@@ -42,6 +42,13 @@ API health: `http://127.0.0.1:8101/health`
 pytest -q
 ```
 
+## Documentation
+
+- `docs/00_PHILOSOPHY.md`
+- `docs/01_SYSTEM_OVERVIEW.md`
+- `docs/02_RUNTIME_SPEC.md`
+- `docs/03_ML_CONTRACT.md`
+
 ## ASR (voice)
 
 ASR сервис внешний. Укажите URL:

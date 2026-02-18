@@ -4,7 +4,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterator
 
 
@@ -57,6 +57,17 @@ def _safe_count(conn: sqlite3.Connection, table: str) -> int:
     return int(row["c"] if row is not None else 0)
 
 
+def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    if not _table_exists(conn, table):
+        return False
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    for r in rows:
+        name = r["name"] if isinstance(r, sqlite3.Row) else r[1]
+        if str(name) == column:
+            return True
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class StateSnapshot:
     tasks_total: int
@@ -71,6 +82,7 @@ class StateSnapshot:
 
 
 def get_state(conn: sqlite3.Connection) -> StateSnapshot:
+    goals_table = "goals" if _table_exists(conn, "goals") else "cycle_goals"
     return StateSnapshot(
         tasks_total=_safe_count(conn, "tasks"),
         subtasks_total=_safe_count(conn, "subtasks"),
@@ -79,7 +91,7 @@ def get_state(conn: sqlite3.Connection) -> StateSnapshot:
         regulation_runs_total=_safe_count(conn, "regulation_runs"),
         queue_total=_safe_count(conn, "inbox_queue"),
         cycles_total=_safe_count(conn, "cycles"),
-        goals_total=_safe_count(conn, "cycle_goals"),
+        goals_total=_safe_count(conn, goals_table),
         nudges_total=_safe_count(conn, "user_nudges"),
     )
 
@@ -478,3 +490,454 @@ def nudges_ack(conn: sqlite3.Connection, *, user_id: str, nudge_id: str) -> None
         (now, next_at, now, user_id, nudge_id),
     )
     conn.commit()
+
+
+def find_goal_candidates(conn: sqlite3.Connection, *, goal_ref: str, limit: int = 5) -> list[dict[str, Any]]:
+    ref = (goal_ref or "").strip()
+    if not ref or not _table_exists(conn, "goals"):
+        return []
+    rows = conn.execute(
+        """
+        SELECT id, title, planned_end_date, status
+        FROM goals
+        WHERE CAST(id AS TEXT) = ?
+           OR title LIKE ?
+        ORDER BY
+            CASE WHEN CAST(id AS TEXT) = ? THEN 0 ELSE 1 END,
+            id DESC
+        LIMIT ?
+        """,
+        (ref, f"%{ref}%", ref, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# Strategic Layer v1
+def create_cycle(conn: sqlite3.Connection, *, name: str, start_date: str, end_date: str) -> int:
+    now = _now_iso_utc()
+    has_name = _table_has_column(conn, "cycles", "name")
+    has_start = _table_has_column(conn, "cycles", "start_date")
+    has_end = _table_has_column(conn, "cycles", "end_date")
+
+    if has_name and has_start and has_end:
+        cur = conn.execute(
+            """
+            INSERT INTO cycles (name, start_date, end_date, type, period_key, period_start, period_end, status, summary, source_msg_id, created_at, updated_at, closed_at)
+            VALUES (?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, ?, ?, NULL)
+            """,
+            (name, start_date, end_date, "CUSTOM", start_date, end_date, "OPEN", now, now),
+        )
+    else:
+        cur = conn.execute(
+            """
+            INSERT INTO cycles (type, period_key, period_start, period_end, status, summary, source_msg_id, created_at, updated_at, closed_at)
+            VALUES (?, NULL, ?, ?, ?, ?, NULL, ?, ?, NULL)
+            """,
+            ("CUSTOM", start_date, end_date, "OPEN", name, now, now),
+        )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def get_active_cycle(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    if not _table_exists(conn, "cycles"):
+        return None
+    row = conn.execute(
+        """
+        SELECT *
+        FROM cycles
+        WHERE closed_at IS NULL
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def close_cycle(conn: sqlite3.Connection, *, cycle_id: int) -> dict[str, Any]:
+    now = _now_iso_utc()
+    row = conn.execute("SELECT id FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
+    if row is None:
+        raise ValueError("cycle not found")
+    conn.execute("UPDATE cycles SET status = ?, closed_at = ?, updated_at = ? WHERE id = ?", ("DONE", now, now, cycle_id))
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    summary = {"goals_total": 0, "goals_done": 0, "goals_overdue": 0}
+    if _table_exists(conn, "goals"):
+        g_total = conn.execute("SELECT COUNT(1) AS c FROM goals WHERE cycle_id = ?", (cycle_id,)).fetchone()
+        g_done = conn.execute(
+            "SELECT COUNT(1) AS c FROM goals WHERE cycle_id = ? AND status = 'DONE'",
+            (cycle_id,),
+        ).fetchone()
+        g_overdue = conn.execute(
+            """
+            SELECT COUNT(1) AS c
+            FROM goals
+            WHERE cycle_id = ?
+              AND status = 'ACTIVE'
+              AND planned_end_date < ?
+            """,
+            (cycle_id, today),
+        ).fetchone()
+        summary = {
+            "goals_total": int(g_total["c"] if g_total else 0),
+            "goals_done": int(g_done["c"] if g_done else 0),
+            "goals_overdue": int(g_overdue["c"] if g_overdue else 0),
+        }
+    conn.commit()
+    return summary
+
+
+def create_goal(
+    conn: sqlite3.Connection,
+    *,
+    cycle_id: int,
+    title: str,
+    success_criteria: str,
+    planned_end_date: str,
+) -> int:
+    row = conn.execute("SELECT id FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
+    if row is None:
+        raise ValueError("cycle not found")
+    cur = conn.execute(
+        """
+        INSERT INTO goals (cycle_id, title, success_criteria, planned_end_date, status, created_at, completed_at)
+        VALUES (?, ?, ?, ?, 'ACTIVE', datetime('now'), NULL)
+        """,
+        (cycle_id, title, success_criteria, planned_end_date),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def update_goal(conn: sqlite3.Connection, *, goal_id: int, fields: dict[str, Any]) -> None:
+    row = conn.execute("SELECT id FROM goals WHERE id = ?", (goal_id,)).fetchone()
+    if row is None:
+        raise ValueError("goal not found")
+    sql_fields: list[str] = []
+    params: list[Any] = []
+    for key in ("title", "success_criteria", "planned_end_date", "status", "completed_at"):
+        if key in fields and fields[key] is not None:
+            sql_fields.append(f"{key} = ?")
+            params.append(fields[key])
+    if not sql_fields:
+        return
+    params.append(goal_id)
+    conn.execute(f"UPDATE goals SET {', '.join(sql_fields)} WHERE id = ?", params)
+    conn.commit()
+
+
+def close_goal(conn: sqlite3.Connection, *, goal_id: int, close_as: str = "DONE") -> None:
+    status = str(close_as or "DONE").upper()
+    if status not in {"DONE", "DROPPED"}:
+        raise ValueError("close_as must be DONE or DROPPED")
+    row = conn.execute("SELECT id FROM goals WHERE id = ?", (goal_id,)).fetchone()
+    if row is None:
+        raise ValueError("goal not found")
+    completed_at = _now_iso_utc() if status == "DONE" else None
+    conn.execute("UPDATE goals SET status = ?, completed_at = ? WHERE id = ?", (status, completed_at, goal_id))
+    conn.commit()
+
+
+def reschedule_goal(conn: sqlite3.Connection, *, goal_id: int, new_end_date: str) -> int:
+    row = conn.execute("SELECT planned_end_date FROM goals WHERE id = ?", (goal_id,)).fetchone()
+    if row is None:
+        raise ValueError("goal not found")
+    old_end_date = str(row["planned_end_date"])
+    cur = conn.execute(
+        """
+        INSERT INTO goal_reschedule_events (goal_id, old_end_date, new_end_date, changed_at)
+        VALUES (?, ?, ?, datetime('now'))
+        """,
+        (goal_id, old_end_date, new_end_date),
+    )
+    conn.execute("UPDATE goals SET planned_end_date = ? WHERE id = ?", (new_end_date, goal_id))
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def link_task_to_goal(conn: sqlite3.Connection, *, task_id: int, goal_id: int) -> None:
+    t_row = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if t_row is None:
+        raise ValueError("task not found")
+    g_row = conn.execute("SELECT id FROM goals WHERE id = ?", (goal_id,)).fetchone()
+    if g_row is None:
+        raise ValueError("goal not found")
+    now = _now_iso_utc()
+    conn.execute("UPDATE tasks SET goal_id = ?, updated_at = ? WHERE id = ?", (goal_id, now, task_id))
+    conn.commit()
+
+
+def list_nudges(conn: sqlite3.Connection, *, user_id: str, today: str) -> list[dict[str, Any]]:
+    digest = compute_daily_digest(conn, today=today, tomorrow=(date.fromisoformat(today) + timedelta(days=1)).isoformat(), user_id=user_id)
+    out: list[dict[str, Any]] = []
+    if int(digest["goals_overdue"]) > 0:
+        out.append({"nudge_type": "goals.overdue", "entity_type": "goal", "entity_id": 0, "payload": {"count": digest["goals_overdue"]}})
+    if int(digest["goals_due_soon"]) > 0:
+        out.append({"nudge_type": "goals.due_soon", "entity_type": "goal", "entity_id": 0, "payload": {"count": digest["goals_due_soon"]}})
+    if int(digest["goals_at_risk"]) > 0:
+        out.append({"nudge_type": "goals.at_risk", "entity_type": "goal", "entity_id": 0, "payload": {"count": digest["goals_at_risk"]}})
+    return out
+
+
+def ack_nudge(conn: sqlite3.Connection, *, user_id: str, nudge_type: str, entity_type: str, entity_id: int) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO nudge_ack (user_id, nudge_type, entity_type, entity_id, acked_at)
+        VALUES (?, ?, ?, ?, datetime('now'))
+        """,
+        (user_id, nudge_type, entity_type, entity_id),
+    )
+    conn.commit()
+
+
+def _goal_has_movement_last3d(conn: sqlite3.Connection, goal_id: int, today: date) -> bool:
+    from_day = (today - timedelta(days=3)).isoformat()
+    to_day = today.isoformat()
+    task_rows = conn.execute(
+        """
+        SELECT id, updated_at, completed_at
+        FROM tasks
+        WHERE goal_id = ?
+        """,
+        (goal_id,),
+    ).fetchall()
+    if not task_rows:
+        return False
+    task_ids = [int(r["id"]) for r in task_rows]
+    for r in task_rows:
+        upd = str(r["updated_at"] or "")[:10]
+        comp = str(r["completed_at"] or "")[:10]
+        if (upd and from_day <= upd <= to_day) or (comp and from_day <= comp <= to_day):
+            return True
+    placeholders = ",".join("?" for _ in task_ids)
+    tb_row = conn.execute(
+        f"""
+        SELECT COUNT(1) AS c
+        FROM time_blocks
+        WHERE task_id IN ({placeholders})
+          AND substr(created_at, 1, 10) >= ?
+          AND substr(created_at, 1, 10) <= ?
+        """,
+        (*task_ids, from_day, to_day),
+    ).fetchone()
+    return int(tb_row["c"] if tb_row else 0) > 0
+
+
+def _goal_has_time_blocks_next2d(conn: sqlite3.Connection, goal_id: int, today: date) -> bool:
+    task_rows = conn.execute("SELECT id FROM tasks WHERE goal_id = ?", (goal_id,)).fetchall()
+    if not task_rows:
+        return False
+    task_ids = [int(r["id"]) for r in task_rows]
+    from_day = today.isoformat()
+    to_day = (today + timedelta(days=2)).isoformat()
+    placeholders = ",".join("?" for _ in task_ids)
+    row = conn.execute(
+        f"""
+        SELECT COUNT(1) AS c
+        FROM time_blocks
+        WHERE task_id IN ({placeholders})
+          AND substr(start_at, 1, 10) >= ?
+          AND substr(start_at, 1, 10) <= ?
+        """,
+        (*task_ids, from_day, to_day),
+    ).fetchone()
+    return int(row["c"] if row else 0) > 0
+
+
+def list_goals_overdue(conn: sqlite3.Connection, *, today: str, limit: int = 20) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+            g.id,
+            g.cycle_id,
+            g.title,
+            g.success_criteria,
+            g.planned_end_date,
+            g.status,
+            COALESCE((SELECT COUNT(1) FROM goal_reschedule_events e WHERE e.goal_id = g.id), 0) AS reschedule_count
+        FROM goals g
+        WHERE g.status = 'ACTIVE'
+          AND g.planned_end_date < ?
+        ORDER BY g.planned_end_date ASC, g.id ASC
+        LIMIT ?
+        """,
+        (today, int(limit)),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_goals_due_soon(
+    conn: sqlite3.Connection,
+    *,
+    today: str,
+    tomorrow: str,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+            g.id,
+            g.cycle_id,
+            g.title,
+            g.success_criteria,
+            g.planned_end_date,
+            g.status,
+            COALESCE((SELECT COUNT(1) FROM goal_reschedule_events e WHERE e.goal_id = g.id), 0) AS reschedule_count
+        FROM goals g
+        WHERE g.status = 'ACTIVE'
+          AND g.planned_end_date IN (?, ?)
+        ORDER BY g.planned_end_date ASC, g.id ASC
+        LIMIT ?
+        """,
+        (today, tomorrow, int(limit)),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_goals_at_risk(conn: sqlite3.Connection, *, today: str, limit: int = 20) -> list[dict[str, Any]]:
+    today_d = date.fromisoformat(today)
+    goal_rows = conn.execute(
+        """
+        SELECT id, cycle_id, title, success_criteria, planned_end_date, status
+        FROM goals
+        WHERE status = 'ACTIVE'
+        ORDER BY planned_end_date ASC, id ASC
+        """
+    ).fetchall()
+
+    out: list[dict[str, Any]] = []
+    for g in goal_rows:
+        planned = date.fromisoformat(str(g["planned_end_date"]))
+        due_in = (planned - today_d).days
+        if due_in > 3:
+            continue
+        goal_id = int(g["id"])
+        movement = _goal_has_movement_last3d(conn, goal_id, today_d)
+        blocks_next2 = _goal_has_time_blocks_next2d(conn, goal_id, today_d)
+        res_row = conn.execute("SELECT COUNT(1) AS c FROM goal_reschedule_events WHERE goal_id = ?", (goal_id,)).fetchone()
+        res_cnt = int(res_row["c"] if res_row else 0)
+        if (not movement) or (not blocks_next2) or (res_cnt >= 3):
+            item = dict(g)
+            item["reschedule_count"] = res_cnt
+            out.append(item)
+        if len(out) >= int(limit):
+            break
+    return out
+
+
+def list_tasks_today(conn: sqlite3.Connection, *, today: str, limit: int = 50) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT id, title, planned_at, status, state, goal_id
+        FROM tasks
+        WHERE substr(COALESCE(planned_at,''), 1, 10) = ?
+        ORDER BY planned_at ASC, id ASC
+        LIMIT ?
+        """,
+        (today, int(limit)),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_tasks_tomorrow(conn: sqlite3.Connection, *, tomorrow: str, limit: int = 50) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT id, title, planned_at, status, state, goal_id
+        FROM tasks
+        WHERE substr(COALESCE(planned_at,''), 1, 10) = ?
+        ORDER BY planned_at ASC, id ASC
+        LIMIT ?
+        """,
+        (tomorrow, int(limit)),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_tasks_active(conn: sqlite3.Connection, *, limit: int = 100) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT id, title, planned_at, status, state, goal_id
+        FROM tasks
+        WHERE UPPER(COALESCE(status, '')) NOT IN ('DONE', 'ARCHIVED', 'CANCELED', 'CANCELLED')
+        ORDER BY
+            CASE WHEN planned_at IS NULL OR planned_at = '' THEN 1 ELSE 0 END,
+            planned_at ASC,
+            id ASC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def compute_daily_digest(conn: sqlite3.Connection, *, today: str, tomorrow: str, user_id: str) -> dict[str, int]:
+    _ = user_id  # reserved for per-user filters when multi-tenant user scoping is applied.
+    if not _table_exists(conn, "goals"):
+        return {
+            "goals_active": 0,
+            "goals_overdue": 0,
+            "goals_due_soon": 0,
+            "goals_at_risk": 0,
+            "tasks_today": 0,
+            "tasks_tomorrow": 0,
+            "tasks_active_total": 0,
+        }
+
+    today_d = date.fromisoformat(today)
+    goal_rows = conn.execute(
+        """
+        SELECT id, planned_end_date, status
+        FROM goals
+        WHERE status = 'ACTIVE'
+        """
+    ).fetchall()
+    goals_active = len(goal_rows)
+    goals_overdue = 0
+    goals_due_soon = 0
+    goals_at_risk = 0
+    for g in goal_rows:
+        goal_id = int(g["id"])
+        planned = date.fromisoformat(str(g["planned_end_date"]))
+        due_in = (planned - today_d).days
+        if due_in < 0:
+            goals_overdue += 1
+        if str(g["planned_end_date"]) in {today, tomorrow}:
+            goals_due_soon += 1
+
+        if due_in <= 3:
+            movement = _goal_has_movement_last3d(conn, goal_id, today_d)
+            blocks_next2 = _goal_has_time_blocks_next2d(conn, goal_id, today_d)
+            res_row = conn.execute("SELECT COUNT(1) AS c FROM goal_reschedule_events WHERE goal_id = ?", (goal_id,)).fetchone()
+            res_cnt = int(res_row["c"] if res_row else 0)
+            r1 = not movement
+            r2 = not blocks_next2
+            r3 = res_cnt >= 3
+            if r1 or r2 or r3:
+                goals_at_risk += 1
+
+    tasks_today_row = conn.execute(
+        "SELECT COUNT(1) AS c FROM tasks WHERE substr(COALESCE(planned_at,''), 1, 10) = ?",
+        (today,),
+    ).fetchone()
+    tasks_tom_row = conn.execute(
+        "SELECT COUNT(1) AS c FROM tasks WHERE substr(COALESCE(planned_at,''), 1, 10) = ?",
+        (tomorrow,),
+    ).fetchone()
+    tasks_active_row = conn.execute(
+        """
+        SELECT COUNT(1) AS c
+        FROM tasks
+        WHERE UPPER(COALESCE(status, '')) NOT IN ('DONE', 'ARCHIVED', 'CANCELED', 'CANCELLED')
+        """
+    ).fetchone()
+
+    return {
+        "goals_active": goals_active,
+        "goals_overdue": goals_overdue,
+        "goals_due_soon": goals_due_soon,
+        "goals_at_risk": goals_at_risk,
+        "tasks_today": int(tasks_today_row["c"] if tasks_today_row else 0),
+        "tasks_tomorrow": int(tasks_tom_row["c"] if tasks_tom_row else 0),
+        "tasks_active_total": int(tasks_active_row["c"] if tasks_active_row else 0),
+    }

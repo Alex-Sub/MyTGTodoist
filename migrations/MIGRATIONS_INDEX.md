@@ -20,3 +20,8 @@ Execution order is lexical by filename.
 - `024_regulations.sql` - Regulations (recurring rules) table.
 - `025_regulation_runs.sql` - Per-period execution state for regulations.
 - `026_time_blocks.sql` - Time blocks linked to tasks.
+- `027_cycles.sql` - Strategic cycle fields (`name/start_date/end_date`) on runtime `cycles`.
+- `028_goals.sql` - Strategic goals table linked to cycles.
+- `029_goal_reschedule_events.sql` - History of goal deadline changes.
+- `030_nudge_ack.sql` - User acknowledgements for strategic nudges.
+- `031_tasks_goal_id.sql` - Adds `tasks.goal_id` link to goals.

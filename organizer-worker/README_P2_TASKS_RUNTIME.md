@@ -24,4 +24,4 @@ Internal: services call `http://organizer-api:8000`.
 Curl: `curl http://127.0.0.1:8101/p2/tasks` and `curl http://127.0.0.1:8101/p2/tasks/1/subtasks`
 Smoke: `python - <<'PY'\nfrom worker import cmd_create_task, cmd_create_subtask\nr = cmd_create_task('T','NEW')\nprint(r)\nprint(cmd_create_subtask(r['id'],'S','NEW'))\nPY`
 
-P4 Regulations: `Docs/04_REGULATIONS.md`.
+P4 Regulations: see canonical docs in `docs/`.

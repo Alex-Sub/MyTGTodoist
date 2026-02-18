@@ -41,7 +41,7 @@ pytest-asyncio = "^0.23.7"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "organizer-worker/src"]
 
 [build-system]
 requires = ["poetry-core"]

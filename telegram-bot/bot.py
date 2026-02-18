@@ -71,8 +71,14 @@ DRIFT_MODE = (os.getenv("DRIFT_MODE", "off") or "off").strip().lower()
 OVERLOAD_MODE = (os.getenv("OVERLOAD_MODE", "off") or "off").strip().lower()
 P5_NUDGES_MODE = (os.getenv("P5_NUDGES_MODE", "off") or "off").strip().lower()
 P7_MODE = (os.getenv("P7_MODE", "off") or "off").strip().lower()
+DAILY_DIGEST_ENABLED = os.getenv("DAILY_DIGEST_ENABLED", "1") == "1"
+DAILY_DIGEST_TIME = os.getenv("DAILY_DIGEST_TIME", "09:00")
+DAILY_DIGEST_TIMEZONE = os.getenv("DAILY_DIGEST_TIMEZONE", "Europe/Berlin")
+_digest_chats_raw = os.getenv("DAILY_DIGEST_CHAT_IDS", "").strip()
+DAILY_DIGEST_CHAT_IDS = [int(x.strip()) for x in _digest_chats_raw.split(",") if x.strip().isdigit()]
 
 _p2_pending_state: dict[int, dict] = {}
+_daily_digest_sent_day: dict[int, str] = {}
 
 def _p7_enabled() -> bool:
     return P7_MODE == "on"
@@ -135,6 +141,196 @@ def _worker_post_ex(path: str, payload: dict) -> tuple[bool, dict | None, int | 
         return True, parsed if isinstance(parsed, dict) else None, status, None
     except Exception as exc:
         return False, None, None, str(exc)[:500]
+
+
+def _worker_runtime_command(intent: str, entities: dict) -> dict | None:
+    envelope = {
+        "trace_id": f"tg:{int(time.time() * 1000)}:{intent}",
+        "source": "telegram-bot",
+        "command": {
+            "intent": intent,
+            "entities": entities,
+        },
+    }
+    return _worker_post("/runtime/command", envelope)
+
+
+def _digest_tz() -> tzinfo:
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(DAILY_DIGEST_TIMEZONE)
+        except Exception:
+            pass
+    return _tz_local()
+
+
+def _digest_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "⚠️ Просроченные", "callback_data": "digest:overdue"},
+                {"text": "⏳ Истекают", "callback_data": "digest:due_soon"},
+            ],
+            [
+                {"text": "🟠 Под риском", "callback_data": "digest:at_risk"},
+                {"text": "📌 Сегодня", "callback_data": "digest:today"},
+            ],
+            [
+                {"text": "📌 Завтра", "callback_data": "digest:tomorrow"},
+                {"text": "📋 Все активные задачи", "callback_data": "digest:active"},
+            ],
+        ]
+    }
+
+
+def _format_daily_digest_text(digest: dict, now_local: datetime) -> str:
+    day_label = now_local.strftime("%d %b")
+    return (
+        f"Сегодня, {day_label}\n"
+        f"🎯 Активных целей: {int(digest.get('goals_active', 0))}\n"
+        f"⚠️ Просрочено: {int(digest.get('goals_overdue', 0))}\n"
+        f"⏳ Истекает сегодня/завтра: {int(digest.get('goals_due_soon', 0))}\n"
+        f"🟠 Под риском: {int(digest.get('goals_at_risk', 0))}\n"
+        f"📌 Задачи на сегодня: {int(digest.get('tasks_today', 0))}\n"
+        f"📌 Задачи на завтра: {int(digest.get('tasks_tomorrow', 0))}"
+    )
+
+
+def _send_daily_digest(chat_id: int) -> None:
+    now_local = datetime.now(_digest_tz())
+    today = now_local.date().isoformat()
+    tomorrow = (now_local.date() + timedelta(days=1)).isoformat()
+    payload = _worker_runtime_command("digest.daily", {"today": today, "tomorrow": tomorrow, "user_id": str(chat_id)})
+    digest = (payload or {}).get("debug", {}).get("digest") if isinstance(payload, dict) else None
+    if not isinstance(digest, dict):
+        return
+    text = _format_daily_digest_text(digest, now_local)
+    _send_message(chat_id, text, reply_markup=_digest_keyboard())
+
+
+def _handle_digest_callback(data: str, chat_id: int | None) -> str:
+    if chat_id is None:
+        return "Ошибка"
+    parts = data.split(":")
+    mode = parts[1] if len(parts) > 1 else ""
+    today = datetime.now(_digest_tz()).date().isoformat()
+    tomorrow = (datetime.now(_digest_tz()).date() + timedelta(days=1)).isoformat()
+
+    if mode == "goal_reschedule" and len(parts) >= 4:
+        goal_id = int(parts[2])
+        current_due = str(parts[3])
+        try:
+            base = date.fromisoformat(current_due)
+            new_due = (base + timedelta(days=7)).isoformat()
+        except Exception:
+            new_due = (datetime.now(_digest_tz()).date() + timedelta(days=7)).isoformat()
+        payload = _worker_runtime_command("goal.reschedule", {"goal_id": goal_id, "new_end_date": new_due}) or {}
+        ok = bool(payload.get("ok")) if isinstance(payload, dict) else False
+        if ok:
+            _send_message(chat_id, f"Цель #{goal_id}: срок перенесён на {new_due}.")
+            return "Готово"
+        _send_message(chat_id, f"Не удалось перенести цель #{goal_id}.")
+        return "Ошибка"
+
+    if mode == "goal_close_done" and len(parts) >= 3:
+        goal_id = int(parts[2])
+        payload = _worker_runtime_command("goal.close", {"goal_id": goal_id, "close_as": "DONE"}) or {}
+        ok = bool(payload.get("ok")) if isinstance(payload, dict) else False
+        _send_message(chat_id, f"Цель #{goal_id} закрыта как DONE." if ok else f"Не удалось закрыть цель #{goal_id}.")
+        return "Готово" if ok else "Ошибка"
+
+    if mode == "goal_close_drop" and len(parts) >= 3:
+        goal_id = int(parts[2])
+        payload = _worker_runtime_command("goal.close", {"goal_id": goal_id, "close_as": "DROPPED"}) or {}
+        ok = bool(payload.get("ok")) if isinstance(payload, dict) else False
+        _send_message(chat_id, f"Цель #{goal_id} снята (DROPPED)." if ok else f"Не удалось снять цель #{goal_id}.")
+        return "Готово" if ok else "Ошибка"
+
+    if mode in {"overdue", "due_soon", "at_risk"}:
+        intent_map = {
+            "overdue": "goals.list_overdue",
+            "due_soon": "goals.list_due_soon",
+            "at_risk": "goals.list_at_risk",
+        }
+        payload = _worker_runtime_command(
+            intent_map[mode],
+            {"user_id": str(chat_id), "today": today, "tomorrow": tomorrow, "limit": 20},
+        ) or {}
+        goals = payload.get("debug", {}).get("goals") if isinstance(payload, dict) else []
+        if not isinstance(goals, list):
+            goals = []
+        titles = {"overdue": "⚠️ Просроченные", "due_soon": "⏳ Истекают", "at_risk": "🟠 Под риском"}
+        title = titles.get(mode, "Список")
+        if not goals:
+            _send_message(chat_id, f"{title}: пусто")
+            return "Ок"
+        _send_message(chat_id, f"{title}: {len(goals)}")
+        for g in goals[:10]:
+            goal_id = int(g.get("id"))
+            due = str(g.get("planned_end_date") or "")
+            rs = int(g.get("reschedule_count") or 0)
+            text = f"🎯 #{goal_id} {str(g.get('title') or '').strip()}\nСрок: {due}\nПереносов: {rs}"
+            _send_message(
+                chat_id,
+                text,
+                reply_markup={
+                    "inline_keyboard": [
+                        [
+                            {"text": "⏭ Перенести +7д", "callback_data": f"digest:goal_reschedule:{goal_id}:{due}"},
+                            {"text": "✅ Закрыть", "callback_data": f"digest:goal_close_done:{goal_id}"},
+                        ],
+                        [
+                            {"text": "🗑 Снять", "callback_data": f"digest:goal_close_drop:{goal_id}"},
+                        ],
+                    ]
+                },
+            )
+        return "Ок"
+
+    if mode in {"today", "tomorrow", "active"}:
+        intent_map = {
+            "today": "tasks.list_today",
+            "tomorrow": "tasks.list_tomorrow",
+            "active": "tasks.list_active",
+        }
+        payload = _worker_runtime_command(
+            intent_map[mode],
+            {"user_id": str(chat_id), "today": today, "tomorrow": tomorrow, "limit": 50},
+        ) or {}
+        items = payload.get("debug", {}).get("tasks") if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            items = []
+        title = {"today": "📌 Сегодня", "tomorrow": "📌 Завтра", "active": "📋 Все активные задачи"}[mode]
+        if not items:
+            _send_message(chat_id, f"{title}: пусто")
+            return "Ок"
+        lines = [title]
+        for t in items[:20]:
+            planned = str(t.get("planned_at") or "")[:16]
+            suffix = f" ({planned})" if planned else ""
+            lines.append(f"- #{t.get('id')} {str(t.get('title') or '').strip()}{suffix}")
+        _send_message(chat_id, "\n".join(lines))
+        return "Ок"
+    return "Некорректно"
+
+
+def _daily_digest_loop() -> None:
+    while True:
+        try:
+            if DAILY_DIGEST_ENABLED and DAILY_DIGEST_CHAT_IDS:
+                now_local = datetime.now(_digest_tz())
+                hh, mm = [int(x) for x in DAILY_DIGEST_TIME.split(":")]
+                for chat_id in DAILY_DIGEST_CHAT_IDS:
+                    sent_key = _daily_digest_sent_day.get(chat_id)
+                    today_key = now_local.date().isoformat()
+                    if sent_key == today_key:
+                        continue
+                    if now_local.hour > hh or (now_local.hour == hh and now_local.minute >= mm):
+                        _send_daily_digest(chat_id)
+                        _daily_digest_sent_day[chat_id] = today_key
+        except Exception as exc:
+            print(f"digest_loop_error: {str(exc)[:200]}")
+        time.sleep(30)
 
 
 def _api_get_ex(path: str, params: dict | None = None) -> tuple[bool, dict | list | None, int | None, str | None]:
@@ -2979,6 +3175,7 @@ def main() -> None:
     _init_queue_schema()
     _start_health_server()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
+    threading.Thread(target=_daily_digest_loop, daemon=True).start()
     print("bot started")
 
     offset = _load_offset()
@@ -3078,6 +3275,12 @@ def main() -> None:
                             resp_text = _handle_today_callback(
                                 data, int(chat_id_cb) if chat_id_cb else None, int(msg_id) if msg_id else None
                             )
+                            _api_answer_callback(cb_id, resp_text or "Ок")
+                        except Exception:
+                            _api_answer_callback(cb_id, "Ошибка")
+                    elif data.startswith("digest:"):
+                        try:
+                            resp_text = _handle_digest_callback(data, int(chat_id_cb) if chat_id_cb else None)
                             _api_answer_callback(cb_id, resp_text or "Ок")
                         except Exception:
                             _api_answer_callback(cb_id, "Ошибка")

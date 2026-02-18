@@ -19,6 +19,8 @@ import requests
 
 
 _SRC_DIR = Path(__file__).resolve().parent / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 _P2_RUNTIME_PATH = _SRC_DIR / "p2_tasks_runtime.py"
 _P2_SPEC = importlib_util.spec_from_file_location("p2_tasks_runtime", _P2_RUNTIME_PATH)
 if _P2_SPEC is None or _P2_SPEC.loader is None:
@@ -26,6 +28,7 @@ if _P2_SPEC is None or _P2_SPEC.loader is None:
 p2: Any = importlib_util.module_from_spec(_P2_SPEC)
 sys.modules.setdefault("p2_tasks_runtime", p2)
 _P2_SPEC.loader.exec_module(p2)
+from organizer_worker.handlers import dispatch_intent
 
 DB_PATH = os.getenv("DB_PATH", "/data/organizer.db")
 TIMEZONE_NAME = os.getenv("TIMEZONE_NAME", os.getenv("TIMEZONE", "Europe/Moscow"))
@@ -2396,6 +2399,22 @@ class _CommandHandler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802 - stdlib API
         try:
             data = self._read_json()
+            if self.path == "/runtime/command":
+                trace_id = data.get("trace_id")
+                if not isinstance(trace_id, str) or not trace_id.strip():
+                    raise ValueError("trace_id is required")
+                command = data.get("command")
+                if not isinstance(command, dict):
+                    raise ValueError("command is required")
+                intent = command.get("intent")
+                if not isinstance(intent, str) or not intent.strip():
+                    raise ValueError("command.intent is required")
+                entities = command.get("entities")
+                if not isinstance(entities, dict):
+                    raise ValueError("command.entities must be object")
+                res = dispatch_intent(command)
+                self._send_json(200, res)
+                return
             if self.path == "/p2/commands/create_task":
                 res = cmd_create_task(
                     data.get("title") or "",

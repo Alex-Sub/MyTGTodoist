@@ -1,4 +1,4 @@
-version: 2
+version: "2.1"
 principles:
   - "Бизнес-слой не угадывает. Если не хватает — задаёт один уточняющий вопрос."
   - "Ссылки на сущности: сначала по смыслу (ref), номер (id) — опционально."
@@ -25,6 +25,24 @@ common:
         start_at: { type: str, required: false }
         date: { type: str, required: false }
         task_ref: { type: object, required: false }
+        candidates: { type: list, required: false }
+        chosen_id: { type: int, required: false }
+        ask: { type: str, required: false }
+
+    goal_ref:
+      description: "Ссылка на цель по смыслу или по id"
+      fields:
+        id: { type: int, required: false }
+        query: { type: str, required: false }
+        candidates: { type: list, required: false }
+        chosen_id: { type: int, required: false }
+        ask: { type: str, required: false }
+
+    cycle_ref:
+      description: "Ссылка на цикл по смыслу или по id"
+      fields:
+        id: { type: int, required: false }
+        query: { type: str, required: false }
         candidates: { type: list, required: false }
         chosen_id: { type: int, required: false }
         ask: { type: str, required: false }
@@ -183,6 +201,83 @@ intents:
     disambiguation:
       ref: "entities.timeblock_ref"
       question_fallback: "Какой именно блок времени убрать?"
+
+  cycle.create:
+    required: ["entities.name", "entities.start_date", "entities.end_date"]
+    question_on_missing: "Нужны название, дата начала и дата конца цикла."
+
+  cycle.close:
+    required: ["entities.cycle_id"]
+    question_on_missing: "Какой цикл закрыть?"
+
+  goal.create:
+    required: ["entities.title", "entities.success_criteria", "entities.planned_end_date"]
+    question_on_missing: "Нужны название цели, критерий успеха и срок."
+
+  goal.update:
+    required: ["entities.goal_id"]
+    required_one_of_fields:
+      - "entities.title"
+      - "entities.success_criteria"
+      - "entities.planned_end_date"
+      - "entities.status"
+    question_on_missing: "Что именно обновить в цели?"
+
+  goal.close:
+    required: ["entities.goal_id"]
+    question_on_missing: "Какую цель закрыть?"
+
+  goal.reschedule:
+    required: ["entities.goal_id", "entities.new_end_date"]
+    question_on_missing: "На какую дату перенести цель?"
+
+  goal.link_task:
+    required: ["entities.goal_id"]
+    required_any:
+      - "entities.task_id"
+      - "entities.task_ref"
+    question_on_missing: "Какую задачу привязать к цели?"
+    disambiguation:
+      ref: "entities.task_ref"
+      question_fallback: "Какую именно задачу привязать к цели?"
+
+  nudge.list:
+    required: []
+    question_on_missing: null
+
+  nudge.ack:
+    required_any:
+      - "entities.nudge_id"
+      - "entities.nudge_type|entities.entity_type|entities.entity_id"
+    question_on_missing: "Какую подсказку отметить?"
+
+  digest.daily:
+    required: []
+    question_on_missing: null
+
+  tasks.list_today:
+    required: []
+    question_on_missing: null
+
+  tasks.list_tomorrow:
+    required: []
+    question_on_missing: null
+
+  tasks.list_active:
+    required: []
+    question_on_missing: null
+
+  goals.list_overdue:
+    required: []
+    question_on_missing: null
+
+  goals.list_due_soon:
+    required: []
+    question_on_missing: null
+
+  goals.list_at_risk:
+    required: []
+    question_on_missing: null
 
   reg.run:
     required_any:
