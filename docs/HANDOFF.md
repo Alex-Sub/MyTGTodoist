@@ -21,6 +21,11 @@
 - Compose file set: `docker-compose.yml` + `docker-compose.vps.override.yml`
 - Required SA file on VPS: `/opt/mytgtodoist/secrets/alexey/google_sa.json` (regular file, not directory)
 
+## Production Branch Policy
+- Production always builds from branch: `runtime-stable`.
+- Never develop directly on `main` on VPS.
+- Before any deploy, verify current branch on VPS and abort if branch is not `runtime-stable`.
+
 ## C) Services And Ports
 - `organizer-api`: host `8101` -> container `8000`, health endpoint `/health`
 - `organizer-worker`: command server `8002` (internal), health marker `/tmp/worker.ok`
@@ -50,6 +55,12 @@
 - From `/opt/mytgtodoist`
 
 ```bash
+branch="$(git rev-parse --abbrev-ref HEAD)"
+if [ "$branch" != "runtime-stable" ]; then
+  echo "[ABORT] deploy allowed only from runtime-stable; current branch=$branch" >&2
+  exit 1
+fi
+
 docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml ps
 docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml logs --tail=200 organizer-worker
 docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml logs --tail=200 telegram-bot
