@@ -7,8 +7,8 @@ from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "p2_runtime.sqlite3"
-DB_PATH = os.getenv("DB_PATH", "")
 P2_ENFORCE_STATUS = os.getenv("P2_ENFORCE_STATUS", "0") == "1"
+_P2_DB_PATH_LOGGED = False
 
 _STATUS_ALIASES = {
     "INBOX": "NEW",
@@ -123,12 +123,20 @@ _ALLOWED_CYCLE_GOAL_STATUS = {"ACTIVE", "ACHIEVED", "DROPPED"}
 
 
 def _resolve_db_path() -> str:
+    global _P2_DB_PATH_LOGGED
     env_path = os.getenv("P2_DB_PATH")
     if env_path:
-        return env_path
-    if DB_PATH:
-        return DB_PATH
-    return str(DEFAULT_DB_PATH)
+        resolved = env_path
+    else:
+        db_path = os.getenv("DB_PATH")
+        if db_path:
+            resolved = db_path
+        else:
+            resolved = str(DEFAULT_DB_PATH)
+    if not _P2_DB_PATH_LOGGED:
+        logging.info("resolved_p2_db_path=%s", resolved)
+        _P2_DB_PATH_LOGGED = True
+    return resolved
 
 
 def _get_conn() -> sqlite3.Connection:

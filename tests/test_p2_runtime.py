@@ -39,12 +39,20 @@ def _apply_runtime_migrations(conn: sqlite3.Connection) -> None:
 def runtime_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     db_path = tmp_path / "runtime.db"
     monkeypatch.setenv("P2_DB_PATH", str(db_path))
-    p2.DB_PATH = str(db_path)
     worker.DB_PATH = str(db_path)
     with sqlite3.connect(str(db_path)) as conn:
         conn.execute("PRAGMA foreign_keys=ON")
         _apply_runtime_migrations(conn)
     return db_path
+
+
+def test_resolve_db_path_reads_db_path_at_call_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("P2_DB_PATH", raising=False)
+    monkeypatch.delenv("DB_PATH", raising=False)
+    default_path = p2._resolve_db_path()
+    assert default_path
+    monkeypatch.setenv("DB_PATH", "/tmp/late-bound.db")
+    assert p2._resolve_db_path() == "/tmp/late-bound.db"
 
 
 def test_convert_direction_to_project_idempotent(runtime_db: Path) -> None:
