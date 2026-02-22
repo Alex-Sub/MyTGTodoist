@@ -3523,6 +3523,21 @@ def _validate_calendar_service_account_on_startup() -> None:
     logging.info("calendar_service_account_file ok path=%s", sa_path)
 
 
+def _smoke_check_google_calendar_deps() -> None:
+    if CALENDAR_SYNC_MODE == "off":
+        return
+    try:
+        importlib.import_module("googleapiclient")
+        importlib.import_module("google.oauth2")
+    except Exception as exc:
+        msg = (
+            "Google Calendar deps missing; rebuild worker image with "
+            "google-api-python-client/google-auth"
+        )
+        logging.error("%s err=%s", msg, str(exc)[:200])
+        _disable_calendar_sync("config_error_missing_google_deps", msg)
+
+
 def _get_calendar_service():
     global _CAL_NOT_CONFIGURED_REASON
     _CAL_NOT_CONFIGURED_REASON = None
@@ -4884,6 +4899,7 @@ def main() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     logging.info("organizer-worker started")
     _validate_calendar_service_account_on_startup()
+    _smoke_check_google_calendar_deps()
     logging.info(
         "P3_CALENDAR_MODE mode=%s raw=%s",
         CALENDAR_SYNC_MODE,
