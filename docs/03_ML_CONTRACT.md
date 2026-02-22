@@ -99,3 +99,10 @@ Decision rule:
 - VPS `127.0.0.1:19000` -> local `127.0.0.1:9000`.
 - В контейнерах используется:
 - `ML_CORE_URL=http://host.docker.internal:19000`.
+- Reverse tunnel является обязательной runtime-зависимостью для ML-функций в production.
+
+## Clarification Contract (Runtime UX)
+
+- Runtime возвращает ровно один `clarifying_question` на шаг.
+- Если есть ambiguity candidates без `chosen_id`, Runtime всегда возвращает clarification (не execution).
+- Если есть варианты, Runtime добавляет `choices` (`id`, `label`) и не делает авто-выбор.

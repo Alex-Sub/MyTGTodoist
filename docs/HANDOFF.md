@@ -74,6 +74,17 @@ curl -fsS http://127.0.0.1:19000/health
 - `conflict:<conflict_id>:accept_remote`
 - `conflict:<conflict_id>:keep_local`
 
+## Known Production Constraints
+- Runtime DB один: SQLite файл `/data/organizer.db` в volume `deploy_db_data` (compose key `db_data`).
+- Нельзя запускать миграции без проверки целевого volume (`deploy_db_data`), иначе возможен split-brain.
+- Google SA JSON обязан существовать на VPS как файл:
+- `/opt/mytgtodoist/secrets/<user>/google_sa.json`
+- В контейнере он должен быть смонтирован как файл по пути:
+- `/data/google_sa.json`
+- Если source-файл отсутствует, Docker может создать directory вместо файла; это ломает Google sync.
+- Для service account нельзя использовать `GOOGLE_CALENDAR_ID=primary`; нужен ID расшаренного календаря.
+- ML-функции зависят от активного reverse SSH tunnel `127.0.0.1:19000 -> 127.0.0.1:9000`.
+
 ## H) Next Steps
 - Run 3–7 days of daily checks: `ps`, API health, worker/bot logs, Telegram smoke commands.
 - During test period, monitor pull-loop stability for Calendar/Tasks/Sheets and conflict queue depth.

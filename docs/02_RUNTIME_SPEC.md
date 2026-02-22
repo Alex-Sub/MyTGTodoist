@@ -260,6 +260,37 @@ Runtime считает и возвращает:
 - `telegram-bot` не зависит от `asr-service`.
 - Для VPS-режима используется compose override с networking-параметрами.
 
+## Production DB Architecture (final)
+
+- Один runtime DB backend: SQLite.
+- `DB_PATH=/data/organizer.db` для `organizer-worker`, `organizer-api`, `telegram-bot`.
+- Named volume в compose: `db_data`.
+- Фактическое имя Docker volume при проекте `deploy`: `deploy_db_data`.
+- `organizer-worker` и `organizer-api` обязаны смотреть в один и тот же `/data`.
+
+## Migration Safety (mandatory)
+
+- Перед миграциями всегда проверять целевой volume: `deploy_db_data`.
+- Исторический инцидент split-brain: миграции были применены в другой volume (`deploy_runtime_data`), из-за чего runtime видел схему без `tasks`.
+- Без проверки volume миграции выполнять нельзя.
+- После миграций обязательно подтверждать наличие `tasks` в `/data/organizer.db`.
+
+## Worker Startup Invariant
+
+- На старте worker логирует DB sanity: `DB_PATH`, `tables_count`, `required_tables`.
+- Required tables:
+- `tasks`
+- `subtasks`
+- `time_blocks`
+- `cycles`
+- `goals`
+- `regulation_runs`
+
+## ASR in Production
+
+- ASR-сервис не является критичной частью VPS runtime.
+- В прод-контуре ASR считается optional/profile-based и может быть отключён.
+
 ---
 
 ## 6) Минимальная модель данных (Runtime)
