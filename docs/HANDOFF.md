@@ -25,6 +25,19 @@
 - `telegram-bot`: Telegram long polling
 - ML tunnel on VPS: `0.0.0.0:19000` (sshd), forwards to home/VM `127.0.0.1:9000`
 
+## PROD (VPS) networking model
+- VPS services:
+- `organizer-api`
+- `organizer-worker`
+- `telegram-bot`
+- `database`
+- External ML stack:
+- accessed via SSH reverse tunnel
+- `127.0.0.1:19000` -> local `127.0.0.1:9000`
+- Container access:
+- `ML_CORE_URL=http://host.docker.internal:19000`
+- `host-gateway` `extra_hosts` required
+
 ## D) Canon + Migrations Mounts
 - `../canon:/canon:ro` (expects `/canon/intents_v2.yml`)
 - `../migrations:/app/migrations:ro`

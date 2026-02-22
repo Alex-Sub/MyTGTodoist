@@ -89,3 +89,13 @@ Decision rule:
   "choices": [...]
 }
 ```
+
+## VPS Production Routing
+
+- Голосовой endpoint ML: `/voice-command`.
+- VPS не обращается напрямую к ASR/LLM/REC сервисам.
+- Весь ML-трафик с VPS идёт только через ML-Gateway.
+- Для production обязателен reverse tunnel:
+- VPS `127.0.0.1:19000` -> local `127.0.0.1:9000`.
+- В контейнерах используется:
+- `ML_CORE_URL=http://host.docker.internal:19000`.

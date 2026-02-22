@@ -658,6 +658,17 @@ def _init_db() -> None:
             conn.execute("ALTER TABLE items ADD COLUMN tg_result_sent INTEGER NOT NULL DEFAULT 0")
         conn.commit()
         apply_migrations(conn)
+        _assert_required_tables(
+            conn,
+            required=(
+                "tasks",
+                "subtasks",
+                "time_blocks",
+                "cycles",
+                "goals",
+                "goal_reschedule_events",
+            ),
+        )
         columns_q = {as_dict(row).get("name") for row in conn.execute("PRAGMA table_info(inbox_queue)").fetchall()}
         if "ingested_at" not in columns_q:
             conn.execute("ALTER TABLE inbox_queue ADD COLUMN ingested_at TEXT")
@@ -714,6 +725,50 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
             (mig_name, datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
+
+
+def _assert_required_tables(conn: sqlite3.Connection, required: tuple[str, ...]) -> None:
+    rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    existing = {str(as_dict(r).get("name") or "").strip() for r in rows}
+    missing = [name for name in required if name not in existing]
+    if missing:
+        raise RuntimeError(f"missing required tables after migrations: {', '.join(missing)}")
+
+
+def _log_calendar_sqlite_context(scope: str, conn: sqlite3.Connection | None = None) -> None:
+    db_path_env = os.getenv("DB_PATH", DB_PATH)
+    cwd = os.getcwd()
+    used_temp_conn = False
+    active_conn = conn
+    try:
+        if active_conn is None:
+            active_conn = _get_conn()
+            used_temp_conn = True
+        cur = active_conn.cursor()
+        rows = cur.execute("PRAGMA database_list").fetchall()
+        logging.warning(
+            "%s sqlite_context db_path_env=%s cwd=%s sqlite_database_list=%s used_temp_conn=%s",
+            scope,
+            db_path_env,
+            cwd,
+            rows,
+            used_temp_conn,
+        )
+    except Exception as exc:
+        logging.warning(
+            "%s sqlite_context db_path_env=%s cwd=%s sqlite_database_list_err=%s used_temp_conn=%s",
+            scope,
+            db_path_env,
+            cwd,
+            str(exc)[:200],
+            used_temp_conn,
+        )
+    finally:
+        if used_temp_conn and active_conn is not None:
+            try:
+                active_conn.close()
+            except Exception:
+                pass
 
 
 def reap_claims(conn: sqlite3.Connection, now_ts: float) -> tuple[int, int]:
@@ -3705,9 +3760,11 @@ def _calendar_get_event(event_id: str) -> dict:
 # Suggestion: last_sync_at, sync_counter, or max N state flips per task per hour.
 def _p3_calendar_create_tick(limit: int = 10) -> None:
     # P3: for current logic (create_tick).
+    conn: sqlite3.Connection | None = None
     try:
-        with _get_conn() as conn:
-            rows = conn.execute(
+        with _get_conn() as conn_local:
+            conn = conn_local
+            rows = conn_local.execute(
                 """
                 SELECT id, title, planned_at
                 FROM tasks
@@ -3720,7 +3777,8 @@ def _p3_calendar_create_tick(limit: int = 10) -> None:
                 (int(limit),),
             ).fetchall()
     except Exception as exc:
-        logging.warning("%s err=%s", P3_CALENDAR_CREATE, str(exc)[:200])
+        logging.exception("%s fetch_failed", P3_CALENDAR_CREATE)
+        _log_calendar_sqlite_context(P3_CALENDAR_CREATE, conn)
         return
 
     for row in rows:
@@ -3839,23 +3897,25 @@ def _p3_calendar_create_tick(limit: int = 10) -> None:
                 res.get("err"),
             )
         except Exception as exc:
-            logging.warning(
-                "%s action=create_attempt task_id=%s planned_at=%s calendar_event_id=%s err=%s",
+            logging.exception(
+                "%s action=create_attempt task_id=%s planned_at=%s calendar_event_id=%s",
                 P3_CALENDAR_CREATE,
                 task_id,
                 planned_at,
                 "",
-                str(exc)[:200],
             )
+            _log_calendar_sqlite_context(P3_CALENDAR_CREATE)
             continue
 
 
 def _p3_calendar_update_tick(limit: int = 3) -> None:
     # P3: for current logic (update_tick).
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    conn: sqlite3.Connection | None = None
     try:
-        with _get_conn() as conn:
-            rows = conn.execute(
+        with _get_conn() as conn_local:
+            conn = conn_local
+            rows = conn_local.execute(
                 """
                 SELECT id, title, planned_at, calendar_event_id, state, updated_at
                 FROM tasks
@@ -3869,7 +3929,8 @@ def _p3_calendar_update_tick(limit: int = 3) -> None:
                 (cutoff, int(limit)),
             ).fetchall()
     except Exception as exc:
-        logging.warning("%s err=%s", P3_CALENDAR_UPDATE, str(exc)[:200])
+        logging.exception("%s fetch_failed", P3_CALENDAR_UPDATE)
+        _log_calendar_sqlite_context(P3_CALENDAR_UPDATE, conn)
         return
 
     for row in rows:
@@ -3972,22 +4033,24 @@ def _p3_calendar_update_tick(limit: int = 3) -> None:
                 res.get("err"),
             )
         except Exception as exc:
-            logging.warning(
-                "%s action=patch_attempt task_id=%s planned_at=%s calendar_event_id=%s err=%s",
+            logging.exception(
+                "%s action=patch_attempt task_id=%s planned_at=%s calendar_event_id=%s",
                 P3_CALENDAR_UPDATE,
                 row["id"],
                 "",
                 "",
-                str(exc)[:200],
             )
+            _log_calendar_sqlite_context(P3_CALENDAR_UPDATE)
             continue
 
 
 def _p4_calendar_cancel_tick(limit: int = 3) -> None:
     # P4: for future scaffold (cancel_tick). Do not call yet.
+    conn: sqlite3.Connection | None = None
     try:
-        with _get_conn() as conn:
-            rows = conn.execute(
+        with _get_conn() as conn_local:
+            conn = conn_local
+            rows = conn_local.execute(
                 """
                 SELECT id, title, planned_at, calendar_event_id, state, updated_at
                 FROM tasks
@@ -4000,7 +4063,8 @@ def _p4_calendar_cancel_tick(limit: int = 3) -> None:
                 (int(limit),),
             ).fetchall()
     except Exception as exc:
-        logging.warning("%s err=%s", P4_CALENDAR_CANCEL, str(exc)[:200])
+        logging.exception("%s fetch_failed", P4_CALENDAR_CANCEL)
+        _log_calendar_sqlite_context(P4_CALENDAR_CANCEL, conn)
         return
     for row in rows:
         try:
@@ -4048,13 +4112,13 @@ def _p4_calendar_cancel_tick(limit: int = 3) -> None:
                 res.get("err"),
             )
         except Exception as exc:
-            logging.warning(
-                "%s action=cancel_failed task_id=%s calendar_event_id=%s err=%s",
+            logging.exception(
+                "%s action=cancel_failed task_id=%s calendar_event_id=%s",
                 P4_CALENDAR_CANCEL,
                 row["id"],
                 row.get("calendar_event_id"),
-                str(exc)[:200],
             )
+            _log_calendar_sqlite_context(P4_CALENDAR_CANCEL)
             continue
 
 def _p4_reg_nudge_should_emit(mode: str, today: date, due_date: date) -> bool:

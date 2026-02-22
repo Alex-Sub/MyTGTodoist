@@ -248,6 +248,20 @@ Runtime считает и возвращает:
 
 ---
 
+## VPS Thin-Runtime Model
+
+- VPS работает как thin-runtime.
+- ML-логика вынесена полностью в локальный ML-Gateway.
+- На VPS в прод-контуре нет отдельного `asr-service`.
+- Для доступа к ML используется reverse tunnel:
+- `127.0.0.1:19000` (VPS) -> `127.0.0.1:9000` (local ML host).
+- Контейнеры обращаются к ML через:
+- `ML_CORE_URL=http://host.docker.internal:19000`
+- `telegram-bot` не зависит от `asr-service`.
+- Для VPS-режима используется compose override с networking-параметрами.
+
+---
+
 ## 6) Минимальная модель данных (Runtime)
 
 ### Стратегический слой
