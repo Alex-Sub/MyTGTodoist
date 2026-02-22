@@ -85,6 +85,17 @@ curl -fsS http://127.0.0.1:19000/health
 - Для service account нельзя использовать `GOOGLE_CALENDAR_ID=primary`; нужен ID расшаренного календаря.
 - ML-функции зависят от активного reverse SSH tunnel `127.0.0.1:19000 -> 127.0.0.1:9000`.
 
+## Google SA JSON Diagnostics (common failure)
+- Частая ошибка: файл начинается с `"type": ...` без открывающей `{`.
+- Вторая частая ошибка: лишний мусор после закрывающей `}`.
+- Диагностика на VPS:
+```bash
+nl -ba /opt/mytgtodoist/secrets/<user>/google_sa.json | sed -n '1,15p'
+```
+- Быстрый фикс:
+- добавить `{` в самое начало файла, если её нет;
+- удалить любой лишний текст после финальной `}`.
+
 ## H) Next Steps
 - Run 3–7 days of daily checks: `ps`, API health, worker/bot logs, Telegram smoke commands.
 - During test period, monitor pull-loop stability for Calendar/Tasks/Sheets and conflict queue depth.

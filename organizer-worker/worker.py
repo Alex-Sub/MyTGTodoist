@@ -3479,7 +3479,7 @@ def _disable_calendar_sync(reason: str, detail: str) -> None:
     prev_mode = CALENDAR_SYNC_MODE
     CALENDAR_SYNC_MODE = "off"
     logging.error(
-        "calendar_sync_disabled reason=%s detail=%s previous_mode=%s current_mode=%s",
+        "calendar_sync_disabled reason=%s detail=%s previous_mode=%s current_mode=%s calendar_mode=NOT_CONFIGURED",
         reason,
         detail,
         prev_mode,
@@ -3499,6 +3499,26 @@ def _validate_calendar_service_account_on_startup() -> None:
         return
     if not os.path.isfile(sa_path):
         _disable_calendar_sync("file_is_directory", f"service account path is not a file: {sa_path}")
+        return
+    try:
+        size = os.path.getsize(sa_path)
+    except Exception as exc:
+        _disable_calendar_sync("file_stat_error", f"failed to stat service account file: {type(exc).__name__}")
+        return
+    if size <= 0:
+        _disable_calendar_sync("empty_file", f"service account file is empty: {sa_path}")
+        return
+    try:
+        with open(sa_path, "r", encoding="utf-8") as f:
+            _ = json.load(f)
+    except json.JSONDecodeError:
+        _disable_calendar_sync(
+            "invalid_json",
+            "service account json invalid (likely missing leading '{' or extra non-json text)",
+        )
+        return
+    except Exception as exc:
+        _disable_calendar_sync("read_error", f"failed to read service account file: {type(exc).__name__}")
         return
     logging.info("calendar_service_account_file ok path=%s", sa_path)
 
