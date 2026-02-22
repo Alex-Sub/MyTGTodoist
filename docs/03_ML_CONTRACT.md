@@ -54,9 +54,20 @@ ML понимает, Runtime исполняет.
 
 ## 5) Поведение при неуверенности/отказе ML
 
-Если ML вернул `rejected` или очень низкую уверенность, Runtime не выполняет действие и возвращает безопасный ответ:
+Пороги Runtime:
+- `CLARIFY_CONFIDENCE = 0.40`
+- `EXECUTE_CONFIDENCE = 0.75`
 
-`"Я не понял команду. Сформулируйте иначе."`
+Decision rule:
+- Если `rejected=true` или `confidence < 0.40` -> safe-fail (без исполнения).
+- Если есть `candidates` и не передан `chosen_id` -> всегда clarification (с `choices`).
+- Если `0.40 <= confidence < 0.75` -> clarification (предпочесть уточнение, не исполнять).
+- Если `confidence >= 0.75` -> проверить required поля; при missing вернуть clarification.
+- Исполнение только при `confidence >= 0.75` и полном наборе required полей.
+
+При safe-fail Runtime не выполняет действие и возвращает безопасный ответ:
+
+`"Не могу выполнить. Уточните запрос."`
 
 ## 6) Формат ответа Runtime
 
