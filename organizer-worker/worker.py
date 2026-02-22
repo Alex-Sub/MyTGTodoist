@@ -3548,12 +3548,21 @@ def _get_calendar_service():
         Credentials = getattr(creds_mod, "Credentials", None)
         build = getattr(discovery_mod, "build", None)
         if Credentials is None or build is None:
-            logging.warning("google api libs not available; skipping")
-            _CAL_NOT_CONFIGURED_REASON = "missing_libs"
+            logging.error(
+                "calendar_config_error: google api deps missing or broken; "
+                "install google api deps (google-auth, google-auth-oauthlib, "
+                "google-api-python-client, googleapis-common-protos, httplib2)"
+            )
+            _CAL_NOT_CONFIGURED_REASON = "config_error_missing_google_deps"
             return None
     except Exception as exc:
-        logging.warning("google api libs not available; skipping (%s)", str(exc)[:200])
-        _CAL_NOT_CONFIGURED_REASON = "missing_libs"
+        logging.error(
+            "calendar_config_error: google api deps import failed err=%s; "
+            "install google api deps (google-auth, google-auth-oauthlib, "
+            "google-api-python-client, googleapis-common-protos, httplib2)",
+            str(exc)[:200],
+        )
+        _CAL_NOT_CONFIGURED_REASON = "config_error_missing_google_deps"
         return None
 
     creds = Credentials.from_service_account_file(

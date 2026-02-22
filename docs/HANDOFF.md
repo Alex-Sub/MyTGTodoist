@@ -88,6 +88,10 @@ curl -fsS http://127.0.0.1:19000/health
 ## Google SA JSON Diagnostics (common failure)
 - Частая ошибка: файл начинается с `"type": ...` без открывающей `{`.
 - Вторая частая ошибка: лишний мусор после закрывающей `}`.
+- В `organizer-worker` image нет утилиты `file`; проверку JSON делаем через Python:
+```bash
+python -c "import json; json.load(open('/data/google_sa.json','r',encoding='utf-8')); print('OK')"
+```
 - Диагностика на VPS:
 ```bash
 nl -ba /opt/mytgtodoist/secrets/<user>/google_sa.json | sed -n '1,15p'
@@ -95,6 +99,12 @@ nl -ba /opt/mytgtodoist/secrets/<user>/google_sa.json | sed -n '1,15p'
 - Быстрый фикс:
 - добавить `{` в самое начало файла, если её нет;
 - удалить любой лишний текст после финальной `}`.
+- Startup preflight (entrypoint) в `CALENDAR_SYNC_MODE=full/create` работает fail-fast:
+- если `/data/google_sa.json` невалиден или `GOOGLE_CALENDAR_ID=primary`, контейнер завершится с понятной ошибкой.
+- Симптом missing deps:
+- `No module named 'google'` в логах worker => calendar принудительно переводится в `NOT_CONFIGURED`.
+- Фикс:
+- пересобрать `organizer-worker` image с Google API зависимостями и перезапустить контейнер.
 
 ## H) Next Steps
 - Run 3–7 days of daily checks: `ps`, API health, worker/bot logs, Telegram smoke commands.

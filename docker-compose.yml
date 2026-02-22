@@ -88,7 +88,11 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD-SHELL", "test -f /tmp/worker.ok"]
+      test:
+        [
+          "CMD-SHELL",
+          "test -f /tmp/worker.ok && python -c \"import json,os,pathlib,sys; m=(os.getenv('CALENDAR_SYNC_MODE','full') or 'full').strip().lower(); p=os.getenv('GOOGLE_SERVICE_ACCOUNT_FILE','/data/google_sa.json'); c=(os.getenv('GOOGLE_CALENDAR_ID','') or '').strip().lower(); path=pathlib.Path(p); ok=(m=='off') or (c not in ('','primary') and path.exists() and path.is_file() and path.stat().st_size>0 and (json.load(path.open('r',encoding='utf-8')) is not None or True)); sys.exit(0 if ok else 1)\"",
+        ]
       interval: 10s
       timeout: 3s
       retries: 5
