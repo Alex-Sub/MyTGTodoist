@@ -104,7 +104,10 @@ nl -ba /opt/mytgtodoist/secrets/<user>/google_sa.json | sed -n '1,15p'
 - Симптом missing deps:
 - `No module named 'google'` в логах worker => calendar принудительно переводится в `NOT_CONFIGURED`.
 - Фикс:
-- пересобрать `organizer-worker` image с Google API зависимостями и перезапустить контейнер.
+- добавить Google deps в `pyproject.toml` и `poetry.lock`, затем пересобрать `organizer-worker` image и перезапустить контейнер.
+- Важно:
+- `pip install` внутри уже запущенного контейнера — временно и теряется при recreate.
+- Зависимости должны быть зафиксированы в Dockerfile/образе и доставляться только через rebuild image.
 
 ## H) Next Steps
 - Run 3–7 days of daily checks: `ps`, API health, worker/bot logs, Telegram smoke commands.

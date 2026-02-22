@@ -105,6 +105,7 @@ services:
       - deploy/tenants/.env.alexey
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      GOOGLE_CALENDAR_ID: ${GOOGLE_CALENDAR_ID}
       # ML gateway is external.
       ML_CORE_URL: ${ML_CORE_URL:-http://host.docker.internal:19000}
       # Legacy (unused): ASR_SERVICE_URL
