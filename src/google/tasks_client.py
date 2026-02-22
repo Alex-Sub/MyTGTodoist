@@ -64,6 +64,44 @@ class TasksClient:
             resp.raise_for_status()
             return resp.json()
 
+    def create_task(
+        self,
+        tasklist_id: str,
+        *,
+        title: str,
+        notes: str | None = None,
+        due: str | None = None,
+        parent: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"title": title}
+        if notes:
+            payload["notes"] = notes
+        if due:
+            payload["due"] = due
+        params: dict[str, Any] = {}
+        if parent:
+            params["parent"] = parent
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(
+                f"{GOOGLE_TASKS_API}/lists/{tasklist_id}/tasks",
+                headers=self._headers(),
+                params=params,
+                json=payload,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    def complete_task(self, tasklist_id: str, task_id: str) -> dict[str, Any]:
+        payload = {"status": "completed"}
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.patch(
+                f"{GOOGLE_TASKS_API}/lists/{tasklist_id}/tasks/{task_id}",
+                headers=self._headers(),
+                json=payload,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
     def delete_task(self, tasklist_id: str, task_id: str) -> None:
         with httpx.Client(timeout=10.0) as client:
             resp = client.delete(

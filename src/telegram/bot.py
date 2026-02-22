@@ -62,6 +62,7 @@ from src.google.drive_client import DriveClient
 from src.google.sync_in import sync_in_calendar
 from src.google.sync_out import sync_out_meeting
 from src.google.tasks_client import TasksClient
+from src.google.conflict_engine import apply_conflict_choice, open_conflicts_clarification
 from src.telegram.parsers import parse_meet_args
 
 bot = Bot(token=settings.telegram_bot_token)
@@ -91,6 +92,39 @@ def _short_id(value: str | None) -> str:
 def _llm_enabled() -> bool:
     value = os.getenv("LLM_NORMALIZE_ENABLED", "false")
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _conflict_choice_keyboard(conflict_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Принять remote",
+                    callback_data=f"conflict:{conflict_id}:accept_remote",
+                ),
+                InlineKeyboardButton(
+                    text="Оставить local",
+                    callback_data=f"conflict:{conflict_id}:keep_local",
+                ),
+            ]
+        ]
+    )
+
+
+def _conflicts_batch_text(clarification: dict) -> tuple[str, InlineKeyboardMarkup | None]:
+    question = str(clarification.get("clarifying_question") or "Нужны уточнения.")
+    choices = clarification.get("choices") or []
+    lines = [question]
+    for choice in choices[:5]:
+        cid = str(choice.get("id") or "").strip()
+        label = str(choice.get("label") or "").strip()
+        if cid and label:
+            lines.append(f"- {label}")
+    first_id = ""
+    if choices:
+        first_id = str(choices[0].get("id") or "").strip()
+    keyboard = _conflict_choice_keyboard(first_id) if first_id and not first_id.startswith("new:") else None
+    return "\n".join(lines), keyboard
 
 
 def _format_dt_local(value: datetime | None) -> str:
@@ -2695,6 +2729,13 @@ async def handle_user_text(message: types.Message, text: str, source: str) -> No
     if await _handle_pending_field_input(message):
         return
 
+    with get_session() as session:
+        clarification = open_conflicts_clarification(session, limit=5)
+    if clarification is not None:
+        text, keyboard = _conflicts_batch_text(clarification)
+        await message.answer(text, reply_markup=keyboard)
+        return
+
     if _is_meetings_query(work_text):
         period = _parse_meetings_period(work_text)
         await _send_meetings(message, period)
@@ -2831,6 +2872,35 @@ async def echo_text(message: types.Message) -> None:
     await handle_user_text(message, text, source="text")
 
 
+async def on_conflict_choice(callback: types.CallbackQuery) -> None:
+    data = callback.data or ""
+    parts = data.split(":", 2)
+    if len(parts) != 3 or parts[0] != "conflict":
+        await callback.answer("Некорректный callback", show_alert=True)
+        return
+    conflict_id = parts[1].strip()
+    choice = parts[2].strip()
+    if choice not in {"accept_remote", "keep_local"}:
+        await callback.answer("Некорректный выбор", show_alert=True)
+        return
+    try:
+        with get_session() as session:
+            apply_conflict_choice(session, conflict_id, choice)
+            next_clarification = open_conflicts_clarification(session, limit=5)
+    except Exception as exc:
+        logger.error("conflict resolve failed id={} err={}", conflict_id, exc)
+        await callback.answer("Не удалось применить выбор", show_alert=True)
+        return
+
+    if callback.message is not None:
+        if next_clarification:
+            text, keyboard = _conflicts_batch_text(next_clarification)
+            await callback.message.edit_text(text, reply_markup=keyboard)
+        else:
+            await callback.message.edit_text("Конфликты синхронизации разобраны.")
+    await callback.answer("Готово")
+
+
 def setup_handlers(dispatcher: Dispatcher) -> None:
     dispatcher.message.register(cmd_start, Command("start"))
     dispatcher.message.register(cmd_meet, Command("meet"))
@@ -2854,6 +2924,7 @@ def setup_handlers(dispatcher: Dispatcher) -> None:
     dispatcher.message.register(echo_text, F.text)
     dispatcher.callback_query.register(on_pending_callback, F.data.startswith("pa:"))
     dispatcher.callback_query.register(on_inbox_callback, F.data.startswith("inbox:"))
+    dispatcher.callback_query.register(on_conflict_choice, F.data.startswith("conflict:"))
     dispatcher.callback_query.register(on_resolve_action, ResolveAction.filter())
     dispatcher.callback_query.register(on_work_action, WorkAction.filter())
     dispatcher.callback_query.register(on_open_action, OpenAction.filter())

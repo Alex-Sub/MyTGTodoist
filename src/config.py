@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     sync_out_interval_sec: int = 60
     sync_window_days: int = 7
     sync_timezone: str | None = None
+    google_task_sync_retry_enabled: bool = True
+    google_task_sync_retry_interval_sec: int = 60
+    google_tasks_pull_interval_sec: int = 120
+    google_sheets_pull_interval_sec: int = 180
+    google_sheets_spreadsheet_id: str = ""
+    google_sheets_range: str = "Tasks!A1:Z"
     google_drive_enabled: bool = True
     google_drive_folder_name: str = "TGTodoist Exports"
     google_drive_mode: str = "latest"

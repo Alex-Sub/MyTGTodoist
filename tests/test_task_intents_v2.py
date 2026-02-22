@@ -110,3 +110,70 @@ def test_timeblock_create_requires_duration_or_end(runtime_db: Path) -> None:
     )
     assert res["ok"] is False
     assert res.get("clarifying_question") == "На сколько минут поставить блок?"
+
+
+def test_confidence_074_returns_clarification_not_execute(runtime_db: Path) -> None:
+    res = handlers.dispatch_intent(
+        {
+            "intent": "task.create",
+            "confidence": 0.74,
+            "entities": {"title": "Не должна создаться"},
+        }
+    )
+    assert res["ok"] is False
+    assert bool(res.get("clarifying_question"))
+    with sqlite3.connect(str(runtime_db)) as conn:
+        row = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
+    assert int(row[0]) == 0
+
+
+def test_confidence_076_with_missing_required_returns_clarification(runtime_db: Path) -> None:
+    t = handlers.dispatch_intent({"intent": "task.create", "entities": {"title": "Сдвинуть задачу"}})
+    assert t["ok"] is True
+    task_id = int(t["debug"]["task_id"])
+
+    res = handlers.dispatch_intent(
+        {
+            "intent": "task.reschedule",
+            "confidence": 0.76,
+            "entities": {"task_id": task_id},
+        }
+    )
+    assert res["ok"] is False
+    assert res.get("clarifying_question") == "На когда перенести?"
+
+
+def test_confidence_095_candidates_without_choice_returns_choices(runtime_db: Path) -> None:
+    res = handlers.dispatch_intent(
+        {
+            "intent": "task.set_status",
+            "confidence": 0.95,
+            "entities": {
+                "status": "пауза",
+                "task_ref": {
+                    "candidates": [
+                        {"id": 101, "title": "Отчет для клиента"},
+                        {"id": 202, "title": "Отчет для команды"},
+                    ]
+                },
+            },
+        }
+    )
+    assert res["ok"] is False
+    assert bool(res.get("clarifying_question"))
+    choices = res.get("choices")
+    assert isinstance(choices, list)
+    assert len(choices) >= 1
+    assert all(isinstance(ch.get("id"), int) and isinstance(ch.get("label"), str) for ch in choices)
+
+
+def test_confidence_02_returns_safe_fail(runtime_db: Path) -> None:
+    res = handlers.dispatch_intent(
+        {
+            "intent": "task.create",
+            "confidence": 0.2,
+            "entities": {"title": "Не должна создаться"},
+        }
+    )
+    assert res["ok"] is False
+    assert res.get("debug", {}).get("reason") == "safe_fail"

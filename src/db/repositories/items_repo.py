@@ -33,6 +33,11 @@ def _log_event(session: Session, item_id: str, event_type: str, meta: dict | str
     )
 
 
+def _mark_google_pending(item: Item) -> None:
+    item.google_sync_status = "pending"
+    item.google_sync_error = None
+
+
 def create_item(
     session: Session,
     *,
@@ -66,6 +71,7 @@ def create_item(
     )
     session.add(item)
     session.flush()
+    _mark_google_pending(item)
     _log_event(session, item.id, "created")
     session.commit()
     session.refresh(item)
@@ -122,6 +128,7 @@ def create_task(
     )
     session.add(item)
     session.flush()
+    _mark_google_pending(item)
     _log_event(session, item.id, "created_task")
     session.commit()
     session.refresh(item)
@@ -168,6 +175,7 @@ def create_subtask(
     )
     session.add(item)
     session.flush()
+    _mark_google_pending(item)
     _log_event(session, item.id, "created_subtask", meta={"parent_id": parent.id})
     session.commit()
     session.refresh(item)
@@ -215,6 +223,7 @@ def update_item(session: Session, item_id: str, **fields) -> Item:
     now = datetime.now(timezone.utc)
     item.updated_at = now
     item.last_touched_at = now
+    _mark_google_pending(item)
     _log_event(session, item.id, "updated", meta={"fields": list(fields.keys())})
     session.commit()
     session.refresh(item)
@@ -242,6 +251,7 @@ def move_item(
     now = datetime.now(timezone.utc)
     item.updated_at = now
     item.last_touched_at = now
+    _mark_google_pending(item)
     _log_event(session, item.id, "moved", meta=meta)
     session.commit()
     session.refresh(item)
@@ -257,6 +267,7 @@ def complete_item(session: Session, item_id: str) -> Item:
     item.status = "done"
     item.updated_at = now
     item.last_touched_at = now
+    _mark_google_pending(item)
     _log_event(session, item.id, "completed")
     session.commit()
     session.refresh(item)

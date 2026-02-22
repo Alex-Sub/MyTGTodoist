@@ -183,16 +183,29 @@ def _digest_keyboard() -> dict:
     }
 
 
+COPYBOOK_DIGEST_HEADER = "Ежедневная управленческая сводка"
+COPYBOOK_DIGEST_LINE_ACTIVE_GOALS = "Активные цели: {value}"
+COPYBOOK_DIGEST_LINE_OVERDUE_GOALS = "Просроченные цели: {value}"
+COPYBOOK_DIGEST_LINE_DUE_SOON_GOALS = "Цели со сроком сегодня/завтра: {value}"
+COPYBOOK_DIGEST_LINE_AT_RISK_GOALS = "Цели под риском: {value}"
+COPYBOOK_DIGEST_LINE_TASKS_TODAY = "Задачи на сегодня: {value}"
+COPYBOOK_DIGEST_LINE_TASKS_TOMORROW = "Задачи на завтра: {value}"
+COPYBOOK_DIGEST_LINE_TASKS_ACTIVE = "Активные задачи: {value}"
+COPYBOOK_LIST_EMPTY = "Список пуст."
+COPYBOOK_ACTION_OK = "Команда выполнена."
+COPYBOOK_ACTION_FAIL = "Команда не выполнена."
+
+
 def _format_daily_digest_text(digest: dict, now_local: datetime) -> str:
-    day_label = now_local.strftime("%d %b")
     return (
-        f"Сегодня, {day_label}\n"
-        f"🎯 Активных целей: {int(digest.get('goals_active', 0))}\n"
-        f"⚠️ Просрочено: {int(digest.get('goals_overdue', 0))}\n"
-        f"⏳ Истекает сегодня/завтра: {int(digest.get('goals_due_soon', 0))}\n"
-        f"🟠 Под риском: {int(digest.get('goals_at_risk', 0))}\n"
-        f"📌 Задачи на сегодня: {int(digest.get('tasks_today', 0))}\n"
-        f"📌 Задачи на завтра: {int(digest.get('tasks_tomorrow', 0))}"
+        f"{COPYBOOK_DIGEST_HEADER}\n"
+        f"{COPYBOOK_DIGEST_LINE_ACTIVE_GOALS.format(value=int(digest.get('goals_active', 0)))}\n"
+        f"{COPYBOOK_DIGEST_LINE_OVERDUE_GOALS.format(value=int(digest.get('goals_overdue', 0)))}\n"
+        f"{COPYBOOK_DIGEST_LINE_DUE_SOON_GOALS.format(value=int(digest.get('goals_due_soon', 0)))}\n"
+        f"{COPYBOOK_DIGEST_LINE_AT_RISK_GOALS.format(value=int(digest.get('goals_at_risk', 0)))}\n"
+        f"{COPYBOOK_DIGEST_LINE_TASKS_TODAY.format(value=int(digest.get('tasks_today', 0)))}\n"
+        f"{COPYBOOK_DIGEST_LINE_TASKS_TOMORROW.format(value=int(digest.get('tasks_tomorrow', 0)))}\n"
+        f"{COPYBOOK_DIGEST_LINE_TASKS_ACTIVE.format(value=int(digest.get('tasks_active_total', 0)))}"
     )
 
 
@@ -210,7 +223,7 @@ def _send_daily_digest(chat_id: int) -> None:
 
 def _handle_digest_callback(data: str, chat_id: int | None) -> str:
     if chat_id is None:
-        return "Ошибка"
+        return COPYBOOK_ACTION_FAIL
     parts = data.split(":")
     mode = parts[1] if len(parts) > 1 else ""
     today = datetime.now(_digest_tz()).date().isoformat()
@@ -224,9 +237,9 @@ def _handle_digest_callback(data: str, chat_id: int | None) -> str:
         ok = bool(payload.get("ok")) if isinstance(payload, dict) else False
         if ok:
             _send_message(chat_id, f"Задача #{task_id}: статус -> {status_value}.")
-            return "Готово"
+            return COPYBOOK_ACTION_OK
         _send_message(chat_id, f"Не удалось обновить статус задачи #{task_id}.")
-        return "Ошибка"
+        return COPYBOOK_ACTION_FAIL
 
     if mode == "task_time" and len(parts) >= 3:
         task_id = int(parts[2])
@@ -244,23 +257,23 @@ def _handle_digest_callback(data: str, chat_id: int | None) -> str:
         ok = bool(payload.get("ok")) if isinstance(payload, dict) else False
         if ok:
             _send_message(chat_id, f"Цель #{goal_id}: срок перенесён на {new_due}.")
-            return "Готово"
+            return COPYBOOK_ACTION_OK
         _send_message(chat_id, f"Не удалось перенести цель #{goal_id}.")
-        return "Ошибка"
+        return COPYBOOK_ACTION_FAIL
 
     if mode == "goal_close_done" and len(parts) >= 3:
         goal_id = int(parts[2])
         payload = _worker_runtime_command("goal.close", {"goal_id": goal_id, "close_as": "DONE"}) or {}
         ok = bool(payload.get("ok")) if isinstance(payload, dict) else False
         _send_message(chat_id, f"Цель #{goal_id} закрыта как DONE." if ok else f"Не удалось закрыть цель #{goal_id}.")
-        return "Готово" if ok else "Ошибка"
+        return COPYBOOK_ACTION_OK if ok else COPYBOOK_ACTION_FAIL
 
     if mode == "goal_close_drop" and len(parts) >= 3:
         goal_id = int(parts[2])
         payload = _worker_runtime_command("goal.close", {"goal_id": goal_id, "close_as": "DROPPED"}) or {}
         ok = bool(payload.get("ok")) if isinstance(payload, dict) else False
         _send_message(chat_id, f"Цель #{goal_id} снята (DROPPED)." if ok else f"Не удалось снять цель #{goal_id}.")
-        return "Готово" if ok else "Ошибка"
+        return COPYBOOK_ACTION_OK if ok else COPYBOOK_ACTION_FAIL
 
     if mode in {"overdue", "due_soon", "at_risk"}:
         intent_map = {
@@ -278,8 +291,8 @@ def _handle_digest_callback(data: str, chat_id: int | None) -> str:
         titles = {"overdue": "⚠️ Просроченные", "due_soon": "⏳ Истекают", "at_risk": "🟠 Под риском"}
         title = titles.get(mode, "Список")
         if not goals:
-            _send_message(chat_id, f"{title}: пусто")
-            return "Ок"
+            _send_message(chat_id, f"{title}\n{COPYBOOK_LIST_EMPTY}")
+            return COPYBOOK_ACTION_OK
         lines = [f"{title}: {len(goals)}"]
         for idx, g in enumerate(goals[:max_items], start=1):
             goal_id = int(g.get("id"))
@@ -299,7 +312,7 @@ def _handle_digest_callback(data: str, chat_id: int | None) -> str:
         for idx, g in enumerate(goals[:max_items], start=1):
             goal_id = int(g.get("id"))
             due = str(g.get("planned_end_date") or "")
-            text = f"{idx}. 🎯 #{goal_id} {str(g.get('title') or '').strip()}"
+            text = f"{idx}. #{goal_id} {str(g.get('title') or '').strip()}"
             _send_message(
                 chat_id,
                 text,
@@ -315,7 +328,7 @@ def _handle_digest_callback(data: str, chat_id: int | None) -> str:
                     ]
                 },
             )
-        return "Ок"
+        return COPYBOOK_ACTION_OK
 
     if mode in {"today", "tomorrow", "active"}:
         intent_map = {
@@ -332,8 +345,8 @@ def _handle_digest_callback(data: str, chat_id: int | None) -> str:
             items = []
         title = {"today": "📌 Сегодня", "tomorrow": "📌 Завтра", "active": "📋 Все активные задачи"}[mode]
         if not items:
-            _send_message(chat_id, f"{title}: пусто")
-            return "Ок"
+            _send_message(chat_id, f"{title}\n{COPYBOOK_LIST_EMPTY}")
+            return COPYBOOK_ACTION_OK
         lines = [title]
         for idx, t in enumerate(items[:max_items], start=1):
             planned = str(t.get("planned_at") or "")[:16]
@@ -355,14 +368,14 @@ def _handle_digest_callback(data: str, chat_id: int | None) -> str:
                             {"text": "⏸ Пауза", "callback_data": f"digest:task_status:{task_id}:PAUSED"},
                         ],
                         [
-                            {"text": "✅ Done", "callback_data": f"digest:task_status:{task_id}:DONE"},
+                            {"text": "✅ Завершить", "callback_data": f"digest:task_status:{task_id}:DONE"},
                             {"text": "⏱ Время", "callback_data": f"digest:task_time:{task_id}"},
                         ],
                     ]
                 },
             )
-        return "Ок"
-    return "Некорректно"
+        return COPYBOOK_ACTION_OK
+    return COPYBOOK_ACTION_FAIL
 
 
 def _daily_digest_loop() -> None:

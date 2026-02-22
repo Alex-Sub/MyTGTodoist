@@ -18,6 +18,23 @@ import urllib.request
 import requests
 
 
+def _ensure_local_no_proxy() -> None:
+    hosts = ("127.0.0.1", "localhost")
+    for key in ("NO_PROXY", "no_proxy"):
+        raw = os.getenv(key, "")
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        changed = False
+        for host in hosts:
+            if host not in parts:
+                parts.append(host)
+                changed = True
+        if changed:
+            os.environ[key] = ",".join(parts)
+
+
+_ensure_local_no_proxy()
+
+
 _SRC_DIR = Path(__file__).resolve().parent / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
@@ -638,17 +655,27 @@ def _init_db() -> None:
         if "tg_result_sent" not in columns:
             conn.execute("ALTER TABLE items ADD COLUMN tg_result_sent INTEGER NOT NULL DEFAULT 0")
         conn.commit()
-        sql = Path(SCHEMA_PATH).read_text(encoding="utf-8")
-        conn.executescript(sql)
-        conn.commit()
-        _apply_sql_migrations(conn)
+        apply_migrations(conn)
         columns_q = {as_dict(row).get("name") for row in conn.execute("PRAGMA table_info(inbox_queue)").fetchall()}
         if "ingested_at" not in columns_q:
             conn.execute("ALTER TABLE inbox_queue ADD COLUMN ingested_at TEXT")
             conn.commit()
 
 
-def _apply_sql_migrations(conn: sqlite3.Connection) -> None:
+def _sorted_migration_files(migrations_dir: Path) -> list[Path]:
+    files = [p for p in migrations_dir.iterdir() if p.is_file() and p.suffix.lower() == ".sql"]
+
+    def _sort_key(path: Path) -> tuple[int, str]:
+        head = path.name.split("_", 1)[0]
+        try:
+            return (int(head), path.name)
+        except Exception:
+            return (10**9, path.name)
+
+    return sorted(files, key=_sort_key)
+
+
+def apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -659,83 +686,32 @@ def _apply_sql_migrations(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
 
-    mig_name = "005_items_tg_voice_meta.sql"
-    row = conn.execute(
-        "SELECT 1 FROM schema_migrations WHERE name = ?",
-        (mig_name,),
-    ).fetchone()
-    if row:
-        return
+    migrations_path = Path(MIGRATIONS_DIR)
+    if not migrations_path.exists():
+        raise RuntimeError(f"migrations directory not found: {migrations_path}")
+    if not migrations_path.is_dir():
+        raise RuntimeError(f"migrations path is not a directory: {migrations_path}")
 
-    columns = {as_dict(r).get("name") for r in conn.execute("PRAGMA table_info(items)").fetchall()}
-    stmts: list[str] = []
-    if "tg_update_id" not in columns:
-        stmts.append("ALTER TABLE items ADD COLUMN tg_update_id INTEGER NULL")
-    if "tg_voice_file_id" not in columns:
-        stmts.append("ALTER TABLE items ADD COLUMN tg_voice_file_id TEXT NULL")
-    if "tg_voice_unique_id" not in columns:
-        stmts.append("ALTER TABLE items ADD COLUMN tg_voice_unique_id TEXT NULL")
-    if "tg_voice_duration" not in columns:
-        stmts.append("ALTER TABLE items ADD COLUMN tg_voice_duration INTEGER NULL")
-    if "asr_text" not in columns:
-        stmts.append("ALTER TABLE items ADD COLUMN asr_text TEXT NULL")
-    if stmts:
-        for stmt in stmts:
-            conn.execute(stmt)
+    files = _sorted_migration_files(migrations_path)
+    if not files:
+        raise RuntimeError(f"no *.sql migrations found in {migrations_path}")
+
+    for path in files:
+        mig_name = path.name
+        row = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = ?",
+            (mig_name,),
+        ).fetchone()
+        if row:
+            continue
+        logging.info("applying migration: %s", mig_name)
+        sql = path.read_text(encoding="utf-8")
+        conn.executescript(sql)
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS ix_items_tg_voice_unique_id ON items(tg_voice_unique_id)"
+            "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+            (mig_name, datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
-
-    conn.execute(
-        "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
-        (mig_name, datetime.now(timezone.utc).isoformat()),
-    )
-    conn.commit()
-
-    mig_name = "0009_items_tasks_subtasks.sql"
-    row = conn.execute(
-        "SELECT 1 FROM schema_migrations WHERE name = ?",
-        (mig_name,),
-    ).fetchone()
-    if row:
-        return
-
-    columns = {as_dict(r).get("name") for r in conn.execute("PRAGMA table_info(items)").fetchall()}
-    if "type" not in columns:
-        conn.execute("ALTER TABLE items ADD COLUMN type TEXT NOT NULL DEFAULT 'task'")
-        conn.execute(
-            """
-            UPDATE items
-            SET type = CASE
-                WHEN start_at IS NOT NULL OR end_at IS NOT NULL THEN 'meeting'
-                ELSE 'task'
-            END
-            WHERE type IS NULL OR type = ''
-            """
-        )
-        conn.commit()
-
-    if "parent_id" in columns:
-        if "parent_id_int" not in columns:
-            conn.execute("ALTER TABLE items ADD COLUMN parent_id_int INTEGER NULL")
-            conn.execute("CREATE INDEX IF NOT EXISTS ix_items_parent_id_int ON items(parent_id_int)")
-            conn.commit()
-        conn.execute(
-            "UPDATE items SET parent_id_int = CAST(parent_id AS INTEGER) "
-            "WHERE parent_id IS NOT NULL AND (parent_id_int IS NULL OR parent_id_int = 0)"
-        )
-        conn.commit()
-    else:
-        conn.execute("ALTER TABLE items ADD COLUMN parent_id INTEGER NULL")
-        conn.execute("CREATE INDEX IF NOT EXISTS ix_items_parent_id ON items(parent_id)")
-        conn.commit()
-
-    conn.execute(
-        "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
-        (mig_name, datetime.now(timezone.utc).isoformat()),
-    )
-    conn.commit()
 
 
 def reap_claims(conn: sqlite3.Connection, now_ts: float) -> tuple[int, int]:
@@ -3455,7 +3431,52 @@ def _get_calendar_service():
     return service
 
 
-def _create_event(title: str, start: datetime, end: datetime) -> str | None:
+def _env_flag_enabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _short_event_label(value: str, *, max_len: int, max_words: int) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    words = text.split()
+    if len(words) > max_words:
+        text = " ".join(words[:max_words])
+    if len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
+    return text
+
+
+def _calendar_title_description_from_item(item: dict[str, Any]) -> tuple[str, str | None]:
+    base_title = str(item.get("title") or "").strip()
+    root_title = str(item.get("root_title") or "").strip()
+    parent_title = str(item.get("parent_title") or "").strip()
+    task_title = str(item.get("task_title") or base_title).strip()
+    calendar_add = _env_flag_enabled(item.get("calendar_add"))
+
+    if not (calendar_add and root_title):
+        return base_title, None
+
+    root_short = _short_event_label(root_title, max_len=20, max_words=2)
+    task_short = _short_event_label(task_title or base_title, max_len=48, max_words=6)
+    event_title = f"{root_short}: {task_short}".strip(": ").strip()
+    if not event_title:
+        event_title = base_title
+
+    parts: list[str] = []
+    for part in (root_title, parent_title, task_title or base_title):
+        part_norm = str(part or "").strip()
+        if part_norm and part_norm not in parts:
+            parts.append(part_norm)
+    description = f"Path: {' / '.join(parts)}" if parts else None
+    return event_title, description
+
+
+def _create_event(title: str, start: datetime, end: datetime, description: str | None = None) -> str | None:
     service = _get_calendar_service()
     if service is None:
         logging.warning("calendar service not configured; skipping")
@@ -3466,6 +3487,8 @@ def _create_event(title: str, start: datetime, end: datetime) -> str | None:
         "start": {"dateTime": start.isoformat(), "timeZone": TIMEZONE_NAME},
         "end": {"dateTime": end.isoformat(), "timeZone": TIMEZONE_NAME},
     }
+    if description:
+        event["description"] = description
     created = service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
     return created.get("id")
 
@@ -3591,10 +3614,10 @@ def _calendar_result(
     }
 
 
-def _calendar_create_event(title: str, start: datetime, end: datetime) -> dict:
+def _calendar_create_event(title: str, start: datetime, end: datetime, description: str | None = None) -> dict:
     # TODO(P4): store calendar_etag when schema allows.
     try:
-        event_id = _create_event(title, start, end)
+        event_id = _create_event(title, start, end, description=description)
     except Exception as exc:
         status = _calendar_http_status(exc)
         return _calendar_result(False, None, status, f"exception:{type(exc).__name__}", None)
@@ -4356,7 +4379,8 @@ def _sync_calendar_for_item(item: dict) -> None:
     end = datetime.fromisoformat(item["end_at"])
 
     try:
-        event_id = _create_event(title, start, end)  # must return str|None
+        event_title, event_description = _calendar_title_description_from_item(item)
+        event_id = _create_event(event_title, start, end, description=event_description)  # must return str|None
     except Exception as e:
         event_id = None
         err_text, err_transient = _calendar_error_info(e)
@@ -4488,7 +4512,8 @@ def _process_items() -> None:
             logging.info("[%s] calendar_state after=%s", item_id, cal_before)
             continue
         try:
-            event_id = _create_event(title, start, end)
+            event_title, event_description = _calendar_title_description_from_item(row)
+            event_id = _create_event(event_title, start, end, description=event_description)
         except Exception as exc:
             event_id = None
             err_text, err_transient = _calendar_error_info(exc)
@@ -4601,7 +4626,8 @@ def _retry_pending_events() -> None:
             continue
 
         try:
-            event_id = _create_event(title, start, end)
+            event_title, event_description = _calendar_title_description_from_item(row)
+            event_id = _create_event(event_title, start, end, description=event_description)
         except Exception as exc:
             event_id = None
             err_text, err_transient = _calendar_error_info(exc)

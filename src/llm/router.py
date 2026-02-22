@@ -28,6 +28,9 @@ COMMAND_SYSTEM_PROMPT = (
     "You are the command_parser. Return ONLY valid JSON matching the command schema. "
     "Top-level keys must be exactly: intent, confidence, text_original, text_normalized, "
     "datetime_context, entities, needs_clarification, clarifying_question, notes. "
+    "Inside entities, extract explicitly when possible: root_title (top-level context), "
+    "parent_title (optional parent context), task_title (atomic action), due_datetime (ISO-8601), "
+    "calendar_add (boolean true/false). "
     "Do NOT include any other top-level keys (no asr_text, no now_iso, etc.). "
     "No extra text."
 )
@@ -57,6 +60,8 @@ ASSISTANT_SYSTEM_PROMPT = (
 STRICT_JSON_PROMPT = (
     "Return ONLY valid JSON matching the schema. Top-level keys must be exactly: "
     "intent, confidence, text_original, text_normalized, datetime_context, entities, "
+    "For entities extraction, include when possible: root_title, parent_title, task_title, "
+    "due_datetime, calendar_add. "
     "needs_clarification, clarifying_question, notes. Do NOT include any other "
     "top-level keys (no asr_text, no now_iso, etc.). Do not include any extra text."
 )

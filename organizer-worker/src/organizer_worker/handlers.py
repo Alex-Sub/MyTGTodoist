@@ -11,6 +11,26 @@ from organizer_worker.time_legacy.aliases import TASK_STATUS_NORMALIZATION
 HandlerResult = dict[str, Any]
 HandlerFn = Callable[[dict[str, Any]], HandlerResult]
 
+EXECUTE_CONFIDENCE = 0.75
+CLARIFY_CONFIDENCE = 0.40
+
+
+def build_clarification(
+    question: str,
+    choices: list[dict[str, Any]] | None = None,
+    debug: dict[str, Any] | None = None,
+) -> HandlerResult:
+    out: HandlerResult = {
+        "ok": False,
+        "user_message": "Нужны уточнения.",
+        "clarifying_question": question,
+    }
+    if choices:
+        out["choices"] = choices
+    if debug:
+        out["debug"] = debug
+    return out
+
 
 def _entities(payload: dict[str, Any]) -> dict[str, Any]:
     # Accept either flat payload or command-parser shaped payload with "entities".
@@ -21,7 +41,7 @@ def _entities(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _need(field: str, question: str) -> HandlerResult:
-    return {"ok": False, "user_message": "Нужны уточнения.", "clarifying_question": question, "debug": {"missing": field}}
+    return build_clarification(question=question, debug={"missing": field})
 
 
 def _ok(msg: str, **debug: Any) -> HandlerResult:
@@ -35,6 +55,18 @@ def _fail(msg: str, **debug: Any) -> HandlerResult:
     out: HandlerResult = {"ok": False, "user_message": msg}
     if debug:
         out["debug"] = debug
+    return out
+
+
+def _safe_fail(**debug: Any) -> HandlerResult:
+    out: HandlerResult = {
+        "ok": False,
+        "user_message": "Не могу выполнить. Уточните запрос.",
+    }
+    details = {"reason": "safe_fail"}
+    if debug:
+        details.update(debug)
+    out["debug"] = details
     return out
 
 
@@ -64,6 +96,7 @@ def _normalize_status(value: Any) -> str | None:
 
 
 def _resolve_task_id_or_question(e: dict[str, Any], conn: Any) -> tuple[int | None, HandlerResult | None]:
+    top_k = canon.get_disambiguation_top_k()
     task_id = e.get("task_id")
     if task_id is not None:
         try:
@@ -85,15 +118,13 @@ def _resolve_task_id_or_question(e: dict[str, Any], conn: Any) -> tuple[int | No
 
         candidates = task_ref.get("candidates")
         if isinstance(candidates, list) and candidates:
-            top = candidates[:5]
+            top = candidates[:top_k]
             choices = _choices_from_candidates(top)
-            return None, {
-                "ok": False,
-                "user_message": "Нужны уточнения.",
-                "clarifying_question": "Нашел несколько похожих задач. Какую именно выбрать?",
-                "choices": choices,
-                "debug": {"missing": "task_ref.chosen_id", "candidates_top": top},
-            }
+            return None, build_clarification(
+                question="Нашел несколько похожих задач. Какую именно выбрать?",
+                choices=choices,
+                debug={"missing": "task_ref.chosen_id", "candidates_top": top},
+            )
 
         text_ref = task_ref.get("text") or task_ref.get("query") or ""
         task_ref = str(text_ref).strip()
@@ -104,22 +135,22 @@ def _resolve_task_id_or_question(e: dict[str, Any], conn: Any) -> tuple[int | No
     if task_ref.strip().isdigit():
         return int(task_ref.strip()), None
 
-    candidates = db.find_task_candidates(conn, task_ref=task_ref.strip(), limit=5)
+    candidates = db.find_task_candidates(conn, task_ref=task_ref.strip(), limit=top_k)
     if not candidates:
         return None, _fail("Не нашел подходящую задачу.", task_ref=task_ref)
     if len(candidates) > 1:
-        choices = _choices_from_candidates(candidates[:5])
-        return None, {
-            "ok": False,
-            "user_message": "Нужны уточнения.",
-            "clarifying_question": "Нашел несколько похожих задач. Какую именно выбрать?",
-            "choices": choices,
-            "debug": {"missing": "task_ref.chosen_id", "candidates_top": candidates},
-        }
+        top = candidates[:top_k]
+        choices = _choices_from_candidates(top)
+        return None, build_clarification(
+            question="Нашел несколько похожих задач. Какую именно выбрать?",
+            choices=choices,
+            debug={"missing": "task_ref.chosen_id", "candidates_top": top},
+        )
     return int(candidates[0]["id"]), None
 
 
 def _resolve_goal_id_or_question(e: dict[str, Any], conn: Any) -> tuple[int | None, HandlerResult | None]:
+    top_k = canon.get_disambiguation_top_k()
     goal_id = e.get("goal_id")
     if goal_id is not None:
         try:
@@ -140,14 +171,12 @@ def _resolve_goal_id_or_question(e: dict[str, Any], conn: Any) -> tuple[int | No
                 return None, _need("goal_ref.chosen_id", "Нужен корректный номер цели.")
         candidates = goal_ref.get("candidates")
         if isinstance(candidates, list) and candidates:
-            top = candidates[: canon.get_disambiguation_top_k()]
-            return None, {
-                "ok": False,
-                "user_message": "Нужны уточнения.",
-                "clarifying_question": str(goal_ref.get("ask") or "Какую именно цель выбрать?"),
-                "choices": _choices_from_candidates(top),
-                "debug": {"missing": "goal_ref.chosen_id", "candidates_top": top},
-            }
+            top = candidates[:top_k]
+            return None, build_clarification(
+                question=str(goal_ref.get("ask") or "Какую именно цель выбрать?"),
+                choices=_choices_from_candidates(top),
+                debug={"missing": "goal_ref.chosen_id", "candidates_top": top},
+            )
         text_ref = goal_ref.get("query") or goal_ref.get("text") or ""
         goal_ref = str(text_ref).strip()
 
@@ -156,17 +185,16 @@ def _resolve_goal_id_or_question(e: dict[str, Any], conn: Any) -> tuple[int | No
     if goal_ref.strip().isdigit():
         return int(goal_ref.strip()), None
 
-    candidates = db.find_goal_candidates(conn, goal_ref=goal_ref.strip(), limit=canon.get_disambiguation_top_k())
+    candidates = db.find_goal_candidates(conn, goal_ref=goal_ref.strip(), limit=top_k)
     if not candidates:
         return None, _fail("Не нашел подходящую цель.", goal_ref=goal_ref)
     if len(candidates) > 1:
-        return None, {
-            "ok": False,
-            "user_message": "Нужны уточнения.",
-            "clarifying_question": "Нашел несколько похожих целей. Какую именно выбрать?",
-            "choices": _choices_from_candidates(candidates[: canon.get_disambiguation_top_k()]),
-            "debug": {"missing": "goal_ref.chosen_id", "candidates_top": candidates[: canon.get_disambiguation_top_k()]},
-        }
+        top = candidates[:top_k]
+        return None, build_clarification(
+            question="Нашел несколько похожих целей. Какую именно выбрать?",
+            choices=_choices_from_candidates(top),
+            debug={"missing": "goal_ref.chosen_id", "candidates_top": top},
+        )
     return int(candidates[0]["id"]), None
 
 
@@ -176,16 +204,18 @@ def _choices_from_candidates(candidates: list[Any]) -> list[dict[str, Any]]:
         if not isinstance(c, dict):
             continue
         cid = c.get("id")
-        if cid is None:
-            continue
         title = str(c.get("title") or "").strip()
-        planned_at = c.get("planned_at")
-        if planned_at:
-            label = f"{title} ({planned_at})" if title else str(planned_at)
-        else:
-            label = title or f"Задача #{cid}"
-        choices.append({"id": int(cid), "label": label})
-    return choices
+        parsed_id: int | None = None
+        if cid is not None:
+            try:
+                parsed_id = int(cid)
+            except Exception:
+                parsed_id = None
+        if parsed_id is None:
+            continue
+        label = f"#{parsed_id} {title}".strip()
+        choices.append({"id": parsed_id, "label": label})
+    return sorted(choices, key=lambda x: (int(x["id"]), str(x["label"])))
 
 
 def _canon_ref_disambiguation(intent: str, entities: dict[str, Any]) -> HandlerResult | None:
@@ -219,13 +249,49 @@ def _canon_ref_disambiguation(intent: str, entities: dict[str, Any]) -> HandlerR
     top_k = canon.get_disambiguation_top_k()
     top = candidates[:top_k]
     choices = _choices_from_candidates(top)
-    return {
-        "ok": False,
-        "user_message": "Нужны уточнения.",
-        "clarifying_question": q,
-        "choices": choices,
-        "debug": {"missing": f"{ref_key}.chosen_id", "candidates_top": top},
-    }
+    return build_clarification(
+        question=q,
+        choices=choices,
+        debug={"missing": f"{ref_key}.chosen_id", "candidates_top": top},
+    )
+
+
+def _read_confidence(cmd: dict[str, Any], payload: dict[str, Any]) -> float:
+    raw = payload.get("confidence")
+    if raw is None:
+        raw = cmd.get("confidence")
+    try:
+        value = float(raw)
+    except Exception:
+        return 1.0
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return value
+
+
+def _is_rejected(cmd: dict[str, Any], payload: dict[str, Any]) -> bool:
+    rejected = payload.get("rejected")
+    if rejected is None:
+        rejected = cmd.get("rejected")
+    return rejected is True
+
+
+def _choices_if_any(entities: dict[str, Any]) -> list[dict[str, Any]] | None:
+    top_k = canon.get_disambiguation_top_k()
+    for value in entities.values():
+        if not isinstance(value, dict):
+            continue
+        if value.get("chosen_id") is not None:
+            continue
+        candidates = value.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            continue
+        choices = _choices_from_candidates(candidates[:top_k])
+        if choices:
+            return choices
+    return None
 
 
 def task_create(payload: dict[str, Any]) -> HandlerResult:
@@ -879,21 +945,25 @@ def dispatch_intent(cmd: dict[str, Any]) -> HandlerResult:
         return _fail("Я не понял команду. Сформулируйте иначе.", reason="missing_intent")
     intent_norm = intent.strip()
     entities = _entities(payload)
+    confidence = _read_confidence(cmd, payload)
+    rejected = _is_rejected(cmd, payload)
+
+    if rejected or confidence < CLARIFY_CONFIDENCE:
+        return _safe_fail(confidence=confidence, rejected=rejected)
 
     # Canon v2: if candidates were provided and choice is not made, ask one clarifying question.
     dis = _canon_ref_disambiguation(intent_norm, entities)
     if dis is not None:
         return dis
 
+    if confidence < EXECUTE_CONFIDENCE:
+        question = canon.build_one_question(intent_norm, entities) or "Подтвердите, что именно нужно сделать."
+        return build_clarification(question=question, choices=_choices_if_any(entities), debug={"confidence": confidence})
+
     # Canon v2: centralized required-field validation and one-question clarification.
     missing = canon.validate_required(intent_norm, entities)
     if missing:
         question = canon.build_one_question(intent_norm, entities) or "Нужны уточнения."
-        return {
-            "ok": False,
-            "user_message": "Нужны уточнения.",
-            "clarifying_question": question,
-            "debug": {"missing": missing},
-        }
+        return build_clarification(question=question, debug={"missing": missing})
 
     return dispatch(intent_norm, payload)

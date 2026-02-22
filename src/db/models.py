@@ -67,6 +67,14 @@ class Item(Base):
     etag: Mapped[str | None] = mapped_column(String(255), nullable=True)
     g_updated: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     sync_state: Mapped[str] = mapped_column(String(32), default="synced", server_default="synced", nullable=False)
+    google_task_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    google_parent_task_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    google_sync_status: Mapped[str] = mapped_column(
+        String(32), default="pending", server_default="pending", nullable=False, index=True
+    )
+    google_sync_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    google_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    google_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     project: Mapped[Project | None] = relationship("Project", back_populates="items")
     parent: Mapped[Optional["Item"]] = relationship("Item", remote_side="Item.id", back_populates="children")
@@ -156,3 +164,20 @@ class PendingAction(Base):
     meta_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class Conflict(Base):
+    __tablename__ = "conflicts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    item_id: Mapped[str] = mapped_column(ForeignKey("items.id"), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    field_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    local_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    remote_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    remote_patch_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open", server_default="open", index=True)
+    resolution: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    row_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
