@@ -47,3 +47,9 @@ Docs/archive/
 
 # --- secrets ---
 secrets/
+# local scratch
+/docs/OPS_JOURNAL.md
+/docs/бэкап.txt
+/вызов htop.md
+/deploy-kit/
+/scripts/
