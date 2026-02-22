@@ -34,20 +34,20 @@ def _load_env() -> None:
 
 def _log_asr_config(config) -> None:
     logger.info(
-        "ASR configured: url={} timeout={} key_set={}",
-        config.url or "<missing>",
+        "ML voice configured: ml_core_url={} timeout={} key_set={} legacy_asr_url={}",
+        config.ml_core_url or "<missing>",
         config.timeout_seconds or "<missing>",
         bool(config.api_key),
+        config.legacy_asr_url or "<empty>",
     )
 
 
 def _require_asr_config(config) -> None:
-    if config.url and config.api_key:
+    if config.ml_core_url:
         return
     logger.error(
-        "ASR FATAL: missing configuration (ASR_URL={}, ASR_API_KEY={})",
-        config.url or "missing",
-        "set" if config.api_key else "missing",
+        "ML voice FATAL: missing configuration (ML_CORE_URL={})",
+        config.ml_core_url or "missing",
     )
     sys.exit(1)
 

@@ -38,8 +38,10 @@ services:
       TIMEZONE: ${TIMEZONE:-Europe/Moscow}
       WORKER_INTERVAL_SEC: 5
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-      # ML core (ASR) is external; override via ASR_SERVICE_URL if voice is used.
-      ASR_SERVICE_URL: ${ASR_SERVICE_URL:-http://host.docker.internal:8001}
+      # ML gateway is external.
+      ML_CORE_URL: ${ML_CORE_URL:-http://host.docker.internal:19000}
+      # Legacy (unused): ASR_SERVICE_URL
+      ASR_SERVICE_URL: ${ASR_SERVICE_URL:-}
       WORKER_TG_HTTP_READ_TIMEOUT: ${WORKER_TG_HTTP_READ_TIMEOUT:-90}
       WORKER_TG_SEND_MAX_RETRIES: ${WORKER_TG_SEND_MAX_RETRIES:-2}
       WORKER_NOTIFY_ON_DEAD: ${WORKER_NOTIFY_ON_DEAD:-1}
@@ -78,6 +80,8 @@ services:
       - db_data:/data
       - ./secrets:/secrets:ro
       - ./secrets/alexey/google_sa.json:/data/google_sa.json:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/worker.ok"]
       interval: 10s
@@ -92,8 +96,10 @@ services:
       - deploy/tenants/.env.alexey
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-      # ML core (ASR) is external; override via ASR_SERVICE_URL if voice is used.
-      ASR_SERVICE_URL: ${ASR_SERVICE_URL:-http://host.docker.internal:8001}
+      # ML gateway is external.
+      ML_CORE_URL: ${ML_CORE_URL:-http://host.docker.internal:19000}
+      # Legacy (unused): ASR_SERVICE_URL
+      ASR_SERVICE_URL: ${ASR_SERVICE_URL:-}
       ORGANIZER_API_URL: http://organizer-api:8000
       WORKER_COMMAND_URL: http://organizer-worker:8002
       STATE_PATH: /data/bot.offset
@@ -126,6 +132,8 @@ services:
     volumes:
       - ./migrations:/app/migrations:ro
       - db_data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
 volumes:

@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     log_path: str = "logs/app.log"
     base_url: str = "https://example.com"
     webhook_path: str = "/telegram/webhook"
+    ml_core_url: str = "http://host.docker.internal:19000"
+    asr_service_url_legacy: str = ""
     google_client_id: str = ""
     google_client_secret: str = ""
     google_redirect_uri: str = "http://localhost:8000/oauth2/callback"

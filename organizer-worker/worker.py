@@ -78,7 +78,9 @@ BACKLOG_LIMIT = int(os.getenv("BACKLOG_LIMIT", "50"))
 P7_MODE = (os.getenv("P7_MODE", "off") or "off").strip().lower()
 ASR_DT_SELF_CHECK = os.getenv("ASR_DT_SELF_CHECK", "0") == "1"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ASR_SERVICE_URL = os.getenv("ASR_SERVICE_URL", "http://asr-service:8001")
+ML_CORE_URL = os.getenv("ML_CORE_URL", "http://host.docker.internal:19000").strip()
+# Legacy env (kept for compatibility, intentionally unused).
+ASR_SERVICE_URL = os.getenv("ASR_SERVICE_URL", "").strip()
 TG_HTTP_CONNECT_TIMEOUT = int(os.getenv("TG_HTTP_CONNECT_TIMEOUT", "3"))
 TG_HTTP_READ_TIMEOUT = int(os.getenv("TG_HTTP_READ_TIMEOUT", "90"))
 TG_HTTP_RETRIES = int(os.getenv("TG_HTTP_RETRIES", "2"))
@@ -1104,12 +1106,26 @@ def _tg_notify_calendar_dead(item_id: int) -> None:
         logging.warning("tg notify dead failed item_id=%s err=%s", item_id, str(exc)[:200])
 
 
-def _asr_transcribe(audio: bytes) -> str:
+def _ml_voice_command(audio: bytes) -> str:
+    logging.info("voice transcribe via ml_gateway url=%s", f"{ML_CORE_URL.rstrip('/')}/voice-command")
     files = {"file": ("voice.ogg", audio, "audio/ogg")}
-    resp = requests.post(f"{ASR_SERVICE_URL}/transcribe", files=files, timeout=(3, ASR_HTTP_READ_TIMEOUT))
+    resp = requests.post(f"{ML_CORE_URL.rstrip('/')}/voice-command", files=files, timeout=(3, ASR_HTTP_READ_TIMEOUT))
     resp.raise_for_status()
-    data = resp.json()
-    return (data.get("text") or "").strip()
+    data = resp.json() if resp.content else {}
+    if not isinstance(data, dict):
+        return ""
+    text = (data.get("text") or "").strip()
+    if text:
+        return text
+    command = data.get("command")
+    if isinstance(command, dict):
+        return str(
+            command.get("text")
+            or command.get("text_normalized")
+            or command.get("utterance")
+            or ""
+        ).strip()
+    return ""
 
 def _api_schedule_item(item_id: int, when: datetime, duration: int) -> dict:
     url = f"{ORGANIZER_API_URL}/items/{item_id}/schedule"
@@ -3150,7 +3166,7 @@ def _process_queue_item(row: dict) -> None:
             text = existing_asr_text
         else:
             audio = _tg_download_voice(file_id)
-            text = _asr_transcribe(audio)
+            text = _ml_voice_command(audio)
         if not text or len(text.strip()) < 3:
             raise RuntimeError("empty text")
         pending = _get_pending_clarify(chat_id)
