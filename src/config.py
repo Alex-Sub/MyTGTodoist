@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     google_sheets_pull_interval_sec: int = 180
     google_sheets_spreadsheet_id: str = ""
     google_sheets_range: str = "Tasks!A1:Z"
+    google_vitrina_sheet_name: str = "VITRINA_TASKS"
+    google_ops_log_sheet_name: str = "OPS_LOG"
+    google_vitrina_refresh_interval_sec: int = 3600
+    google_ops_retention_days: int = 14
     google_drive_enabled: bool = True
     google_drive_folder_name: str = "TGTodoist Exports"
     google_drive_mode: str = "latest"
