@@ -1,0 +1,15 @@
+services:
+  organizer-api:
+    environment:
+      DB_PATH: ${DB_PATH:-/data/organizer.db}
+
+  organizer-worker:
+    environment:
+      DB_PATH: ${DB_PATH:-/data/organizer.db}
+
+  telegram-bot:
+    environment:
+      DB_PATH: ${DB_PATH:-/data/organizer.db}
+
+volumes:
+  db_data:

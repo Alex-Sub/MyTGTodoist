@@ -775,12 +775,21 @@ def _log_worker_startup_db_facts(conn: sqlite3.Connection) -> None:
         tables_count = int(row[0]) if row else -1
     except Exception:
         tables_count = -1
+    required = ("tasks", "subtasks", "time_blocks")
+    required_presence: dict[str, bool] = {name: False for name in required}
+    try:
+        table_rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        existing = {str(as_dict(r).get("name") or "").strip() for r in table_rows}
+        required_presence = {name: (name in existing) for name in required}
+    except Exception:
+        pass
     logging.info(
-        "startup_db_facts DB_PATH=%s cwd=%s sqlite_database_list=%s tables_count=%s",
+        "startup_db_facts DB_PATH=%s cwd=%s sqlite_database_list=%s tables_count=%s required_tables=%s",
         db_path_env,
         cwd,
         db_list,
         tables_count,
+        required_presence,
     )
 
 
@@ -3463,6 +3472,37 @@ P3_CALENDAR_CREATE = "P3_CALENDAR_CREATE"
 P3_CALENDAR_UPDATE = "P3_CALENDAR_UPDATE"
 P4_CALENDAR_CANCEL = "P4_CALENDAR_CANCEL"
 
+
+def _disable_calendar_sync(reason: str, detail: str) -> None:
+    global CALENDAR_SYNC_MODE, _CAL_NOT_CONFIGURED_REASON
+    _CAL_NOT_CONFIGURED_REASON = reason
+    prev_mode = CALENDAR_SYNC_MODE
+    CALENDAR_SYNC_MODE = "off"
+    logging.error(
+        "calendar_sync_disabled reason=%s detail=%s previous_mode=%s current_mode=%s",
+        reason,
+        detail,
+        prev_mode,
+        CALENDAR_SYNC_MODE,
+    )
+
+
+def _validate_calendar_service_account_on_startup() -> None:
+    if CALENDAR_SYNC_MODE == "off":
+        return
+    sa_path = (GOOGLE_SERVICE_ACCOUNT_FILE or "").strip()
+    if not sa_path:
+        _disable_calendar_sync("missing_file", "GOOGLE_SERVICE_ACCOUNT_FILE is empty")
+        return
+    if not os.path.exists(sa_path):
+        _disable_calendar_sync("missing_file", f"service account file not found: {sa_path}")
+        return
+    if not os.path.isfile(sa_path):
+        _disable_calendar_sync("file_is_directory", f"service account path is not a file: {sa_path}")
+        return
+    logging.info("calendar_service_account_file ok path=%s", sa_path)
+
+
 def _get_calendar_service():
     global _CAL_NOT_CONFIGURED_REASON
     _CAL_NOT_CONFIGURED_REASON = None
@@ -4814,6 +4854,7 @@ def main() -> None:
         marker.write("ok\n")
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     logging.info("organizer-worker started")
+    _validate_calendar_service_account_on_startup()
     logging.info(
         "P3_CALENDAR_MODE mode=%s raw=%s",
         CALENDAR_SYNC_MODE,

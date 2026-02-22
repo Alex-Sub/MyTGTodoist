@@ -79,7 +79,12 @@ services:
       - ./organizer-worker/src:/app/src:ro
       - db_data:/data
       - ./secrets:/secrets:ro
-      - ./secrets/alexey/google_sa.json:/data/google_sa.json:ro
+      - type: bind
+        source: ${GOOGLE_SA_FILE_HOST:-./secrets/alexey/google_sa.json}
+        target: /data/google_sa.json
+        read_only: true
+        bind:
+          create_host_path: false
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:

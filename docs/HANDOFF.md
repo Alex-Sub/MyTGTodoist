@@ -18,6 +18,8 @@
 - OS: Ubuntu 24.04
 - Project path: `/opt/mytgtodoist`
 - Compose project name: `deploy`
+- Compose file set: `docker-compose.yml` + `docker-compose.vps.override.yml`
+- Required SA file on VPS: `/opt/mytgtodoist/secrets/alexey/google_sa.json` (regular file, not directory)
 
 ## C) Services And Ports
 - `organizer-api`: host `8101` -> container `8000`, health endpoint `/health`
@@ -41,18 +43,19 @@
 ## D) Canon + Migrations Mounts
 - `../canon:/canon:ro` (expects `/canon/intents_v2.yml`)
 - `../migrations:/app/migrations:ro`
-- `runtime_data:/data`
+- `db_data:/data` (shared named volume for `organizer-worker`, `organizer-api`, `telegram-bot`)
+- Worker SA bind mount target: `/data/google_sa.json` from host path `${GOOGLE_SA_FILE_HOST:-./secrets/alexey/google_sa.json}`
 
 ## E) How To Operate (Copy-Paste)
 - From `/opt/mytgtodoist`
 
 ```bash
-docker compose -p deploy -f deploy/docker-compose.prod.yml --env-file .env.prod ps
-docker compose -p deploy -f deploy/docker-compose.prod.yml --env-file .env.prod logs --tail=200 organizer-worker
-docker compose -p deploy -f deploy/docker-compose.prod.yml --env-file .env.prod logs --tail=200 telegram-bot
-docker compose -p deploy -f deploy/docker-compose.prod.yml --env-file .env.prod logs --tail=200 organizer-api
+docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml ps
+docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml logs --tail=200 organizer-worker
+docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml logs --tail=200 telegram-bot
+docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml logs --tail=200 organizer-api
 curl -fsS http://127.0.0.1:8101/health
-docker compose -p deploy -f deploy/docker-compose.prod.yml --env-file .env.prod exec -T organizer-worker python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=5).read().decode())"
+docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml exec -T organizer-worker python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=5).read().decode())"
 ss -tulpn | grep 19000
 curl -fsS http://127.0.0.1:19000/health
 ```
@@ -64,6 +67,7 @@ curl -fsS http://127.0.0.1:19000/health
 
 ## G) Known Constraints
 - Calendar may be `NOT_CONFIGURED` (accepted during current test stage).
+- For service account mode, do not use `GOOGLE_CALENDAR_ID=primary`; use the explicitly shared calendar ID (`...@group.calendar.google.com` or concrete calendar id visible in Calendar settings).
 - `curl` is not installed in worker image; use Python `urllib` health check from inside container.
 - Open sync conflicts block normal command execution until resolved.
 - Conflict resolution goes via Telegram inline buttons:
