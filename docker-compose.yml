@@ -77,6 +77,7 @@ services:
       - ./migrations:/app/migrations:ro
       - ./organizer-worker/worker.py:/app/worker.py:ro
       - ./organizer-worker/src:/app/src:ro
+      - ./canon:/canon:ro
       - db_data:/data
       - ./secrets:/secrets:ro
       - type: bind
@@ -141,6 +142,7 @@ services:
       retries: 5
     volumes:
       - ./migrations:/app/migrations:ro
+      - ./canon:/canon:ro
       - db_data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"

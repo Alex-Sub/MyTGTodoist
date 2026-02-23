@@ -48,8 +48,8 @@
 - `host-gateway` `extra_hosts` required
 
 ## D) Canon + Migrations Mounts
-- `../canon:/canon:ro` (expects `/canon/intents_v2.yml`)
-- `../migrations:/app/migrations:ro`
+- `./canon:/canon:ro` (expects `/canon/intents_v2.yml`)
+- `./migrations:/app/migrations:ro`
 - `db_data:/data` (shared named volume for `organizer-worker`, `organizer-api`, `telegram-bot`)
 - Worker SA bind mount target: `/data/google_sa.json` from host path `${GOOGLE_SA_FILE_HOST:-./secrets/alexey/google_sa.json}`
 
