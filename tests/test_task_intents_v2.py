@@ -69,6 +69,77 @@ def test_task_reschedule_requires_when(runtime_db: Path) -> None:
     assert "entities.planned_at|entities.when" in missing
 
 
+def test_task_reschedule_empty_when_returns_clarification(runtime_db: Path) -> None:
+    t = handlers.dispatch_intent({"intent": "task.create", "entities": {"title": "Сдвинуть задачу пустым when"}})
+    assert t["ok"] is True
+    task_id = int(t["debug"]["task_id"])
+
+    res = handlers.dispatch_intent({"intent": "task.reschedule", "entities": {"task_id": task_id, "when": "   "}})
+    assert res["ok"] is False
+    assert bool(res.get("clarifying_question"))
+
+    with sqlite3.connect(str(runtime_db)) as conn:
+        row = conn.execute("SELECT planned_at FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert row is not None
+    assert row[0] is None
+
+
+def test_timeblock_create_empty_start_at_returns_clarification(runtime_db: Path) -> None:
+    t = handlers.dispatch_intent({"intent": "task.create", "entities": {"title": "ТБ задача пустой старт"}})
+    assert t["ok"] is True
+    task_id = int(t["debug"]["task_id"])
+
+    res = handlers.dispatch_intent(
+        {
+            "intent": "timeblock.create",
+            "entities": {"task_id": task_id, "start_at": "   ", "duration_min": 30},
+        }
+    )
+    assert res["ok"] is False
+    assert bool(res.get("clarifying_question"))
+
+    with sqlite3.connect(str(runtime_db)) as conn:
+        cnt = conn.execute("SELECT COUNT(*) FROM time_blocks WHERE task_id = ?", (task_id,)).fetchone()
+    assert cnt is not None
+    assert int(cnt[0]) == 0
+
+
+def test_timeblock_move_empty_datetimes_returns_clarification_no_changes(runtime_db: Path) -> None:
+    t = handlers.dispatch_intent({"intent": "task.create", "entities": {"title": "ТБ задача move пустой старт"}})
+    assert t["ok"] is True
+    task_id = int(t["debug"]["task_id"])
+    create_tb = handlers.dispatch_intent(
+        {
+            "intent": "timeblock.create",
+            "entities": {
+                "task_id": task_id,
+                "start_at": "2026-02-18T10:00:00Z",
+                "duration_min": 30,
+            },
+        }
+    )
+    assert create_tb["ok"] is True
+    tb_id = int(create_tb["debug"]["time_block_id"])
+
+    with sqlite3.connect(str(runtime_db)) as conn:
+        before = conn.execute("SELECT start_at, end_at FROM time_blocks WHERE id = ?", (tb_id,)).fetchone()
+    assert before is not None
+
+    res = handlers.dispatch_intent(
+        {
+            "intent": "timeblock.move",
+            "entities": {"time_block_id": tb_id, "start_at": " ", "end_at": "   "},
+        }
+    )
+    assert res["ok"] is False
+    assert bool(res.get("clarifying_question"))
+
+    with sqlite3.connect(str(runtime_db)) as conn:
+        after = conn.execute("SELECT start_at, end_at FROM time_blocks WHERE id = ?", (tb_id,)).fetchone()
+    assert after is not None
+    assert tuple(after) == tuple(before)
+
+
 def test_task_ref_disambiguation_returns_candidates(runtime_db: Path) -> None:
     r1 = handlers.dispatch_intent({"intent": "task.create", "entities": {"title": "Отчет для клиента"}})
     r2 = handlers.dispatch_intent({"intent": "task.create", "entities": {"title": "Отчет для команды"}})

@@ -27,6 +27,14 @@
 - Any hotfix on VPS must go via a separate branch -> push -> merge (do not patch `main` directly on VPS).
 - VPS must be clean (no modified/untracked files) before switching branch.
 - Before any deploy, verify current branch on VPS and abort if branch is not `runtime-stable`.
+- Any change flow: local -> commit -> push -> VPS pull -> rebuild/recreate.
+- Pre-deploy checks on VPS:
+- `git status --porcelain` must be empty.
+- `git rev-parse --abbrev-ref HEAD` must be `runtime-stable`.
+- Branch sync commands:
+- `git fetch --all --prune`
+- `git checkout runtime-stable`
+- `git pull --ff-only`
 
 ## C) Services And Ports
 - `organizer-api`: host `8101` -> container `8000`, health endpoint `/health`
@@ -44,18 +52,24 @@
 - accessed via SSH reverse tunnel
 - `127.0.0.1:19000` -> local `127.0.0.1:9000`
 - Container access:
-- `ML_CORE_URL=http://host.docker.internal:19000`
+- `ML_CORE_URL` points to ML-Gateway (VPS example: `http://host.docker.internal:19000`)
 - `host-gateway` `extra_hosts` required
+- Voice flow in `telegram-bot`:
+- `POST ${ML_CORE_URL}/voice-command?profile=organizer`
+- multipart field: `file=@audio`
+- header: `X-Timezone: Europe/Amsterdam`
+- Relative date/time resolution is done only in ML-Gateway (`now_iso` context).
 
 ## D) Canon + Migrations Mounts
 - `./canon:/canon:ro` (expects `/canon/intents_v2.yml`)
 - `./migrations:/app/migrations:ro`
 - `db_data:/data` (shared named volume for `organizer-worker`, `organizer-api`, `telegram-bot`)
 - Worker SA bind mount target: `/data/google_sa.json` from host path `${GOOGLE_SA_FILE_HOST:-./secrets/alexey/google_sa.json}`
+- `telegram-bot` must also mount canon: `./canon:/canon:ro`
 - Canon diagnostics:
 ```bash
 dc="docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml"
-$dc exec organizer-worker ls -la /canon/intents_v2.yml
+$dc exec -T organizer-worker ls -la /canon/intents_v2.yml
 ```
 
 ## E) How To Operate (Copy-Paste)
@@ -109,6 +123,63 @@ dc="docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docke
 $dc logs --tail=200 organizer-worker | grep -E "calendar_idempotent|iCalUID|google_event_id"
 ```
 - Повторная обработка одного `item_id` должна логироваться как `action=reuse_*` или `action=update`, без второго insert.
+
+## Google Calendar Stabilization
+- `GOOGLE_CALENDAR_ID` must come from `.env.prod` (single source for worker + bot).
+- Hardcoded `primary` is forbidden for service-account mode.
+- `GOOGLE_SERVICE_ACCOUNT_FILE=/data/google_sa.json`.
+- Required deps source-of-truth: `pyproject.toml` + `poetry.lock`.
+- Required deps:
+- `google-api-python-client`
+- `google-auth`
+- `google-auth-oauthlib`
+- `PyYAML` (`import yaml`)
+- Missing deps symptoms:
+- `ModuleNotFoundError: No module named 'google'`
+- `ModuleNotFoundError: No module named 'yaml'`
+- Fix:
+- add deps to `pyproject.toml`
+- update `poetry.lock`
+- rebuild `organizer-worker` image
+
+## Telegram Stability
+- Rule: `TG_HTTP_READ_TIMEOUT >= TG_LONGPOLL_SEC + 10`.
+- Reason: lower read-timeout causes long-poll timeouts, retries, and repeated updates.
+- Recommended prod values:
+- `TG_LONGPOLL_SEC=25`
+- `TG_HTTP_READ_TIMEOUT=60`
+
+## Calendar Idempotency Standard
+- Calendar create is performed only by `organizer-worker`.
+- `iCalUID` format: `mytgtodoist-{item_id}@mytgtodoist`.
+- Before `events.insert`, worker calls `events.list(iCalUID=...)`.
+- If found, worker reuses existing event (no second create).
+- `google_event_id` is stored in DB field `calendar_event_id`.
+- If `calendar_event_id` exists, worker patches event (update path) instead of insert.
+
+## ASR Preparation
+- Voice path goes through `ML_CORE_URL` (ML-Gateway), not direct ASR endpoint.
+- Required env key in `.env.prod`: `ML_CORE_URL`.
+- Bot sends timezone context with header `X-Timezone: Europe/Amsterdam` (fixed value).
+- `ASR_SERVICE_URL` remains legacy and non-critical in current prod contour.
+
+## Troubleshooting Checklist
+- If worker restarts:
+- `docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml logs --tail=200 organizer-worker`
+- search for `ModuleNotFoundError`
+- verify canon mount `/canon/intents_v2.yml`
+- verify google deps + yaml in image
+- If calendar duplicates appear:
+- verify Telegram timeout config (`TG_HTTP_READ_TIMEOUT`, `TG_LONGPOLL_SEC`)
+- verify idempotency logs (`iCalUID`, `action=reuse_*`, `action=update`)
+- If voice fails:
+- verify `ML_CORE_URL` value in env
+- verify ML-Gateway endpoints:
+- `curl -fsS $ML_CORE_URL/health`
+- `curl -fsS $ML_CORE_URL/diag/upstreams`
+- inspect `telegram-bot` logs
+- Quick green tests (local):
+- `pytest -q tests/test_telegram_voice_gateway.py tests/test_task_intents_v2.py`
 
 ## Known Production Constraints
 - Runtime DB один: SQLite файл `/data/organizer.db` в volume `deploy_db_data` (compose key `db_data`).

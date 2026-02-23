@@ -95,6 +95,13 @@ def _normalize_status(value: Any) -> str | None:
     return alias.upper()
 
 
+def _normalized_datetime_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def _resolve_task_id_or_question(e: dict[str, Any], conn: Any) -> tuple[int | None, HandlerResult | None]:
     top_k = canon.get_disambiguation_top_k()
     task_id = e.get("task_id")
@@ -356,7 +363,11 @@ def task_set_status(payload: dict[str, Any]) -> HandlerResult:
 
 def task_reschedule(payload: dict[str, Any]) -> HandlerResult:
     e = _entities(payload)
-    when = e.get("when") or e.get("planned_at") or e.get("start_at")
+    when = (
+        _normalized_datetime_value(e.get("when"))
+        or _normalized_datetime_value(e.get("planned_at"))
+        or _normalized_datetime_value(e.get("start_at"))
+    )
     if when is None:
         return _need("when", "На когда перенести задачу?")
 
@@ -463,8 +474,8 @@ def subtask_complete(payload: dict[str, Any]) -> HandlerResult:
 
 def timeblock_create(payload: dict[str, Any]) -> HandlerResult:
     e = _entities(payload)
-    start_at = e.get("start_at")
-    end_at = e.get("end_at")
+    start_at = _normalized_datetime_value(e.get("start_at"))
+    end_at = _normalized_datetime_value(e.get("end_at"))
     duration_min = e.get("duration_min")
     if not start_at:
         return _need("start_at", "Когда начать? Пришлите дату и время начала.")
@@ -492,8 +503,8 @@ def timeblock_move(payload: dict[str, Any]) -> HandlerResult:
     if tb_id is None:
         return _need("time_block_id", "Какой блок времени изменить? Пришлите номер блока.")
 
-    start_at = e.get("start_at")
-    end_at = e.get("end_at")
+    start_at = _normalized_datetime_value(e.get("start_at"))
+    end_at = _normalized_datetime_value(e.get("end_at"))
     task_id = e.get("task_id")
     if start_at is None and end_at is None and task_id is None:
         return _need("fields", "Что изменить в блоке времени?")

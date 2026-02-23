@@ -1,4 +1,5 @@
 import json
+import mimetypes
 import os
 import sqlite3
 import threading
@@ -44,6 +45,11 @@ _RETRY_EXCEPTIONS = _build_retry_exceptions()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ORGANIZER_API_URL = os.getenv("ORGANIZER_API_URL", "http://organizer-api:8000")
 WORKER_COMMAND_URL = os.getenv("WORKER_COMMAND_URL", "http://organizer-worker:8002")
+ML_CORE_URL = (os.getenv("ML_CORE_URL", "") or "").strip()
+VOICE_X_TIMEZONE = "Europe/Amsterdam"
+ML_HTTP_CONNECT_TIMEOUT = float(os.getenv("ML_HTTP_CONNECT_TIMEOUT", "10"))
+ML_HTTP_READ_TIMEOUT = float(os.getenv("ML_HTTP_READ_TIMEOUT", "90"))
+ML_HTTP_TIMEOUT = (ML_HTTP_CONNECT_TIMEOUT, ML_HTTP_READ_TIMEOUT)
 HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8082"))
 STATE_PATH = os.getenv("STATE_PATH", "/data/bot.offset")
 TG_DRAIN_ON_START = os.getenv("TG_DRAIN_ON_START", "0") == "1"
@@ -202,6 +208,8 @@ COPYBOOK_DIGEST_LINE_TASKS_ACTIVE = "Активные задачи: {value}"
 COPYBOOK_LIST_EMPTY = "Список пуст."
 COPYBOOK_ACTION_OK = "Команда выполнена."
 COPYBOOK_ACTION_FAIL = "Команда не выполнена."
+VOICE_RETRY_TEXT = "Не получилось разобрать речь. Попробуй сказать ещё раз."
+VOICE_LATER_TEXT = "Я сейчас не могу корректно обработать запрос. Давай попробуем позже."
 
 
 def _format_daily_digest_text(digest: dict, now_local: datetime) -> str:
@@ -438,6 +446,223 @@ def _timeout_seconds() -> float:
     if isinstance(t, (tuple, list)) and len(t) == 1:
         return float(t[0])
     return 10.0
+
+
+def _is_timeout_exception(exc: Exception) -> bool:
+    name = type(exc).__name__.lower()
+    return "timeout" in name
+
+
+def _runtime_intent_from_ml(ml_intent: str) -> str:
+    raw = (ml_intent or "").strip()
+    if not raw:
+        return "unknown"
+    if "." in raw:
+        return raw
+    intent = raw.lower()
+    mapping = {
+        "create_task": "task.create",
+        "update_task": "task.update",
+        "complete_task": "task.complete",
+        "delete_task": "task.complete",
+        "create_event": "timeblock.create",
+        "update_event": "timeblock.move",
+        "delete_event": "timeblock.delete",
+        "list_tasks": "tasks.list_active",
+    }
+    return mapping.get(intent, "unknown")
+
+
+def _extract_task_id_hint(text: str) -> int | None:
+    s = (text or "").strip()
+    if not s:
+        return None
+    m = re.search(r"#\s*(\d+)", s)
+    if not m and s.isdigit():
+        m = re.match(r"^(\d+)$", s)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _build_runtime_entities_from_ml(runtime_intent: str, command: dict, transcript_norm: str) -> dict:
+    entities: dict[str, Any] = {}
+    title = str(command.get("title") or "").strip()
+    details = str(command.get("details") or "").strip()
+    when = str(command.get("when") or "").strip()
+    priority = str(command.get("priority") or "").strip()
+    tags = command.get("tags")
+    assignees = command.get("assignees")
+
+    if runtime_intent == "task.create":
+        entities["title"] = title or transcript_norm
+    elif runtime_intent in {"task.complete", "task.update", "timeblock.create", "timeblock.move", "timeblock.delete"}:
+        task_id = _extract_task_id_hint(title)
+        if task_id is not None:
+            entities["task_id"] = task_id
+        elif title:
+            entities["task_ref"] = {"query": title}
+
+    if when:
+        if runtime_intent in {"task.create", "task.update", "task.reschedule"}:
+            entities["planned_at"] = when
+            entities["when"] = when
+        elif runtime_intent in {"timeblock.create", "timeblock.move"}:
+            entities["start_at"] = when
+
+    if details:
+        entities["details"] = details
+    if priority:
+        entities["priority"] = priority
+    if isinstance(tags, list):
+        entities["tags"] = [str(v).strip() for v in tags if str(v).strip()]
+    if isinstance(assignees, list):
+        entities["assignees"] = [str(v).strip() for v in assignees if str(v).strip()]
+    return entities
+
+
+def _build_runtime_envelope_from_ml_response(
+    *,
+    chat_id: int,
+    update_id: int,
+    message_id: int | None,
+    response_json: dict,
+) -> tuple[dict | None, str | None]:
+    transcript = str(response_json.get("transcript") or "").strip()
+    transcript_norm = str(response_json.get("transcript_norm") or "").strip()
+    if not transcript_norm:
+        transcript_norm = transcript
+    if not transcript_norm:
+        print("event=asr_empty source=voice")
+        return None, "asr_empty"
+
+    command = response_json.get("command")
+    if not isinstance(command, dict):
+        print("event=llm_invalid_output source=voice reason=command_missing")
+        return None, "llm_invalid_output"
+
+    ml_intent = str(command.get("intent") or "").strip()
+    if not ml_intent:
+        print("event=llm_invalid_output source=voice reason=intent_missing")
+        return None, "llm_invalid_output"
+
+    runtime_intent = _runtime_intent_from_ml(ml_intent)
+    entities = _build_runtime_entities_from_ml(runtime_intent, command, transcript_norm)
+    source_msg_id = _source_msg_id(chat_id, message_id)
+    if source_msg_id:
+        entities.setdefault("source_msg_id", source_msg_id)
+    entities.setdefault("voice_transcript", transcript_norm)
+
+    envelope = {
+        "trace_id": f"tgvoice:{update_id}:{int(time.time() * 1000)}",
+        "source": "telegram-bot",
+        "command": {
+            "intent": runtime_intent,
+            "entities": entities,
+        },
+    }
+    return envelope, None
+
+
+def _format_runtime_reply(payload: dict) -> str:
+    if bool(payload.get("ok")):
+        return str(payload.get("user_message") or "Команда выполнена.")
+    question = str(payload.get("clarifying_question") or "").strip()
+    if question:
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return question
+        lines = [question]
+        for ch in choices[:5]:
+            if not isinstance(ch, dict):
+                continue
+            label = str(ch.get("label") or "").strip()
+            if label:
+                lines.append(f"- {label}")
+        return "\n".join(lines)
+    user_message = str(payload.get("user_message") or "").strip()
+    return user_message or VOICE_LATER_TEXT
+
+
+def _tg_get_file_path(file_id: str) -> str:
+    req_mod = _require_requests()
+    resp = req_mod.get(
+        _api_url("getFile"),
+        params={"file_id": file_id},
+        timeout=TG_HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = _safe_json(resp) or {}
+    result = data.get("result") if isinstance(data, dict) else None
+    file_path = str((result or {}).get("file_path") or "").strip()
+    if not file_path:
+        raise RuntimeError("telegram_file_path_missing")
+    return file_path
+
+
+def _tg_download_file(file_path: str) -> tuple[bytes, str, str]:
+    req_mod = _require_requests()
+    url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+    resp = req_mod.get(url, timeout=TG_HTTP_TIMEOUT)
+    resp.raise_for_status()
+    ext = Path(file_path).suffix or ".ogg"
+    filename = f"voice{ext}"
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return resp.content, filename, mime
+
+
+def _ml_gateway_voice_command(audio_bytes: bytes, *, filename: str, mime_type: str) -> tuple[dict | None, str | None]:
+    if not ML_CORE_URL:
+        print("event=asr_unavailable source=voice reason=ml_core_url_empty")
+        return None, "asr_unavailable"
+    try:
+        req_mod = _require_requests()
+        resp = req_mod.post(
+            f"{ML_CORE_URL.rstrip('/')}/voice-command",
+            params={"profile": "organizer"},
+            headers={"X-Timezone": VOICE_X_TIMEZONE},
+            files={"file": (filename, audio_bytes, mime_type)},
+            timeout=ML_HTTP_TIMEOUT,
+        )
+    except Exception as exc:
+        if _is_timeout_exception(exc):
+            print(f"event=asr_timeout source=voice err={type(exc).__name__}")
+            return None, "asr_timeout"
+        print(f"event=asr_unavailable source=voice err={type(exc).__name__}")
+        return None, "asr_unavailable"
+
+    if int(resp.status_code) >= 300:
+        print(f"event=asr_unavailable source=voice status={int(resp.status_code)}")
+        return None, "asr_unavailable"
+
+    try:
+        data = resp.json()
+    except Exception:
+        print("event=llm_invalid_output source=voice reason=json_decode")
+        return None, "llm_invalid_output"
+    if not isinstance(data, dict):
+        print("event=llm_invalid_output source=voice reason=json_not_object")
+        return None, "llm_invalid_output"
+    return data, None
+
+
+def _ml_health_status() -> tuple[bool, str]:
+    if not ML_CORE_URL:
+        return False, "ML_CORE_URL не задан."
+    try:
+        req_mod = _require_requests()
+        resp = req_mod.get(f"{ML_CORE_URL.rstrip('/')}/health", timeout=ML_HTTP_TIMEOUT)
+        status = int(resp.status_code)
+        if status >= 300:
+            return False, f"ML health: status={status}"
+        data = _safe_json(resp) or {}
+        ok = bool((data or {}).get("ok", True))
+        return ok, f"ML health: status={status} ok={ok}"
+    except Exception as exc:
+        return False, f"ML health error: {type(exc).__name__}"
 
 
 def _normalize_ws(text: str) -> str:
@@ -3271,30 +3496,45 @@ def _handle_today_callback(data: str, chat_id: int | None, message_id: int | Non
 def _handle_voice_message(update_id: int, message: dict) -> None:
     chat_id = int(message["chat"]["id"])
     voice = message.get("voice") or {}
-
-    # Validate minimal voice payload early
-    file_id = voice.get("file_id")
+    file_id = str(voice.get("file_id") or "").strip()
     if not file_id:
-        _send_message(chat_id, "Не удалось принять voice (нет file_id). Отправь ещё раз.")
+        _send_message(chat_id, VOICE_RETRY_TEXT)
         return
 
-    depth_new, depth_total = _queue_depths()
-    if depth_new >= B2_QUEUE_MAX_NEW or depth_total >= B2_QUEUE_MAX_TOTAL:
-        if B2_BACKPRESSURE_MODE == "reject":
-            _send_message(chat_id, "Очередь перегружена. Подожди 1–2 минуты и отправь ещё раз.")
+    try:
+        file_path = _tg_get_file_path(file_id)
+        audio_bytes, filename, mime_type = _tg_download_file(file_path)
+        ml_response, ml_err = _ml_gateway_voice_command(audio_bytes, filename=filename, mime_type=mime_type)
+        if ml_err:
+            if ml_err in {"asr_unavailable", "asr_timeout", "asr_empty"}:
+                _send_message(chat_id, VOICE_RETRY_TEXT)
+            else:
+                _send_message(chat_id, VOICE_LATER_TEXT)
             return
 
-    inserted, depth_new_after = _enqueue_voice(
-        update_id=update_id,
-        chat_id=chat_id,
-        message_id=message.get("message_id"),
-        voice=voice,
-    )
-    _p2_handle_voice(chat_id, message.get("message_id"), voice)
-    if inserted:
-        _send_message(chat_id, f"Принято. В очереди: {depth_new_after}.")
-    else:
-        _send_message(chat_id, f"Уже принято ранее. В очереди: {depth_new}.")
+        envelope, env_err = _build_runtime_envelope_from_ml_response(
+            chat_id=chat_id,
+            update_id=update_id,
+            message_id=message.get("message_id"),
+            response_json=ml_response or {},
+        )
+        if env_err:
+            if env_err == "asr_empty":
+                _send_message(chat_id, VOICE_RETRY_TEXT)
+            else:
+                _send_message(chat_id, VOICE_LATER_TEXT)
+            return
+
+        ok, payload, status, err_text = _worker_post_ex("/runtime/command", envelope or {})
+        if not ok or not isinstance(payload, dict):
+            print(f"event=voice_runtime_failed status={status} err={(err_text or '')[:200]}")
+            _send_message(chat_id, VOICE_LATER_TEXT)
+            return
+
+        _send_message(chat_id, _format_runtime_reply(payload))
+    except Exception as exc:
+        print(f"event=asr_unavailable source=voice err={type(exc).__name__}")
+        _send_message(chat_id, VOICE_RETRY_TEXT)
 
 def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
@@ -3512,6 +3752,10 @@ def main() -> None:
                     elif text_msg == "/health":
                         _send_message(chat_id, "ok")
                         handled_kind = "health"
+                    elif text_msg == "/diag":
+                        ok_diag, diag_text = _ml_health_status()
+                        _send_message(chat_id, diag_text)
+                        handled_kind = "diag_ok" if ok_diag else "diag_fail"
                     elif text_msg == "/status":
                         try:
                             stats = _fetch_stats()

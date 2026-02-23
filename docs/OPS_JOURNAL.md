@@ -46,6 +46,20 @@
 - Result: схема синхронизирована с runtime DB, инцидент закрыт.
 - Prevention: перед любыми миграциями всегда проверять volume name (`deploy_db_data`) и `DB_PATH=/data/organizer.db`.
 
+### 2026-02-23 00:00 UTC — Calendar/canon stabilization + ASR prep baseline
+- Symptom: repeated `NOT_CONFIGURED` transitions, missing `/canon/intents_v2.yml`, and duplicate Calendar events under retries.
+- Impact: unstable calendar sync, possible duplicate meetings, and worker restarts on missing dependencies/mounts.
+- Root cause: non-deterministic deploy state (branch drift/local VPS edits), missing/incorrect mounts, weak long-poll timeout coupling, and non-idempotent event create path.
+- Action taken:
+- enforced prod branch policy (`runtime-stable`, clean tree before deploy);
+- fixed critical mounts (`./canon:/canon:ro`, `./migrations:/app/migrations:ro`);
+- documented Google requirements (`GOOGLE_CALENDAR_ID` from env, no `primary`, SA file at `/data/google_sa.json`);
+- fixed Telegram stability rule (`TG_HTTP_READ_TIMEOUT >= TG_LONGPOLL_SEC + 10`) and dedup behavior;
+- implemented calendar idempotency (`iCalUID`, pre-list/reuse, DB `calendar_event_id` reuse/update path);
+- recorded ASR prep contract (`ASR_SERVICE_URL`, `/health`, `/asr`).
+- Result: prod contour documented as deterministic with explicit troubleshooting checklist.
+- Prevention: all prod updates go through local commit/push and VPS pull/rebuild from `runtime-stable` only.
+
 ## PROD-V0 STABLE
 
 Дата фиксации: 2026-02-21

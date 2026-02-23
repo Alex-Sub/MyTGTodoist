@@ -291,6 +291,18 @@ Runtime считает и возвращает:
 - ASR-сервис не является критичной частью VPS runtime.
 - В прод-контуре ASR считается optional/profile-based и может быть отключён.
 
+## Production Deploy Baseline
+
+- Production branch: `runtime-stable` only.
+- Перед деплоем VPS-дерево должно быть clean (`git status --porcelain` пусто).
+- Базовый поток: local commit/push -> VPS `git pull --ff-only` -> `docker compose ... up -d --build`.
+- Обязательные mounts:
+- `organizer-worker`: `./canon:/canon:ro`, `./migrations:/app/migrations:ro`
+- `telegram-bot`: `./canon:/canon:ro`
+- `GOOGLE_CALENDAR_ID` берётся только из `.env.prod`; хардкод `primary` запрещён для service account.
+- `GOOGLE_SERVICE_ACCOUNT_FILE=/data/google_sa.json`.
+- Подробный runbook и troubleshooting: `docs/HANDOFF.md`.
+
 ---
 
 ## 6) Минимальная модель данных (Runtime)
