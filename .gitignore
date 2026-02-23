@@ -58,3 +58,5 @@ secrets/
 !/scripts/diag_voice_bundle.sh
 !/scripts/diag_ml_bundle.sh
 !/scripts/diag_voice_bundle.ps1
+
+/_diag/

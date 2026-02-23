@@ -1,0 +1,10 @@
+﻿powershell.exe : error during connect: Get "http://%2F%2F.%2Fpipe%2FdockerDesktopLinuxEngine/v1.51/containers/json?filt
+ers=%7B%22label%22%3A%7B%22com.docker.compose.config-hash%22%3Atrue%2C%22com.docker.compose.project%3Ddeploy%22%3Atrue%
+2C%22com.docker.compose.service%3Dtelegram-bot%22%3Atrue%7D%7D": open //./pipe/dockerDesktopLinuxEngine: The system can
+not find the file specified.
+D:\My_AI_Prodgekt\MyTGTodoist\scripts\diag_voice_bundle.ps1:27 знак:19
++         $Output = & powershell -NoProfile -Command $Command 2>&1
++                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (error during co...file specified.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

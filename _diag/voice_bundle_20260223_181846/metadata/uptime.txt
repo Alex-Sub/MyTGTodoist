@@ -1,0 +1,15 @@
+﻿powershell.exe : uptime : Имя "uptime" не распознано как имя командлета, функции, файла сценария или выполняемой програ
+ммы. Проверьте пр
+D:\My_AI_Prodgekt\MyTGTodoist\scripts\diag_voice_bundle.ps1:27 знак:19
++         $Output = & powershell -NoProfile -Command $Command 2>&1
++                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (uptime : Имя "u...ы. Проверьте пр:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+авильность написания имени, а также наличие и правильность пути, после чего повторите попытку.
+строка:1 знак:1
++ uptime
++ ~~~~~~
+    + CategoryInfo          : ObjectNotFound: (uptime:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+ 

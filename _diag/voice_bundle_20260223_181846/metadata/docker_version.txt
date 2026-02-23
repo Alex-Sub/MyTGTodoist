@@ -1,0 +1,16 @@
+﻿Client:
+ Version:           28.4.0
+ API version:       1.51
+ Go version:        go1.24.7
+ Git commit:        d8eb465
+ Built:             Wed Sep  3 20:59:40 2025
+ OS/Arch:           windows/amd64
+ Context:           desktop-linux
+powershell.exe : error during connect: Get "http://%2F%2F.%2Fpipe%2FdockerDesktopLinuxEngine/v1.51/version": open //./p
+ipe/dockerDesktopLinuxEngine: The system cannot find the file specified.
+D:\My_AI_Prodgekt\MyTGTodoist\scripts\diag_voice_bundle.ps1:27 знак:19
++         $Output = & powershell -NoProfile -Command $Command 2>&1
++                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (error during co...file specified.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

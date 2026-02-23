@@ -1,0 +1,14 @@
+﻿powershell.exe : time="2026-02-23T18:18:49+03:00" level=warning msg="The \"GOOGLE_CALENDAR_ID\" variable is not set. De
+faulting to a blank string."
+D:\My_AI_Prodgekt\MyTGTodoist\scripts\diag_voice_bundle.ps1:27 знак:19
++         $Output = & powershell -NoProfile -Command $Command 2>&1
++                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (time="2026-02-2... blank string.":String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+time="2026-02-23T18:18:49+03:00" level=warning msg="The \"GOOGLE_CALENDAR_ID\" variable is not set. Defaulting to a bla
+nk string."
+error during connect: Get "http://%2F%2F.%2Fpipe%2FdockerDesktopLinuxEngine/v1.51/containers/json?filters=%7B%22label%2
+2%3A%7B%22com.docker.compose.config-hash%22%3Atrue%2C%22com.docker.compose.oneoff%3DFalse%22%3Atrue%2C%22com.docker.com
+pose.project%3Ddeploy%22%3Atrue%7D%7D": open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specifi
+ed.

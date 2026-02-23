@@ -1,0 +1,13 @@
+﻿powershell.exe : строка:1 знак:37
+D:\My_AI_Prodgekt\MyTGTodoist\scripts\diag_voice_bundle.ps1:27 знак:19
++         $Output = & powershell -NoProfile -Command $Command 2>&1
++                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (строка:1 знак:37:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
++ ss -tulpn | egrep ':(8101|19000)\b' || true
++                                     ~~
+Лексема "||" не является допустимым разделителем операторов в этой версии.
+    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : InvalidEndOfLine
+ 

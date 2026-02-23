@@ -98,6 +98,7 @@ curl -fsS http://127.0.0.1:19000/health
 - `создать цель <название> до <date>`
 
 ## G) Known Constraints
+- No `asr-service` on VPS; voice uses ML-Gateway via `ML_CORE_URL` (`/voice-command`).
 - Calendar may be `NOT_CONFIGURED` (accepted during current test stage).
 - For service account mode, do not use `GOOGLE_CALENDAR_ID=primary`; use the explicitly shared calendar ID (`...@group.calendar.google.com` or concrete calendar id visible in Calendar settings).
 - В проде нельзя хардкодить `GOOGLE_CALENDAR_ID=primary` при service account.

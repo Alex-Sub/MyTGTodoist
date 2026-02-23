@@ -105,6 +105,7 @@ services:
     env_file:
       - deploy/tenants/.env.alexey
     environment:
+      PYTHONUNBUFFERED: "1"
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       GOOGLE_CALENDAR_ID: ${GOOGLE_CALENDAR_ID}
       # ML gateway is external.

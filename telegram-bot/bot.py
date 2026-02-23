@@ -1,4 +1,7 @@
+import builtins
+import functools
 import json
+import logging
 import mimetypes
 import os
 import sqlite3
@@ -7,6 +10,7 @@ import time
 import re
 import urllib.parse
 import urllib.request
+import sys
 from collections import deque
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -21,6 +25,15 @@ try:
     import requests  # type: ignore
 except Exception:  # pragma: no cover - fallback for minimal runtime
     requests = None
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+print = functools.partial(builtins.print, flush=True)
 
 
 def _require_requests() -> Any:
