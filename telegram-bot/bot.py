@@ -29,10 +29,11 @@ except Exception:  # pragma: no cover - fallback for minimal runtime
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
     stream=sys.stdout,
     force=True,
 )
+log = logging.getLogger("telegram-bot")
 print = functools.partial(builtins.print, flush=True)
 
 
@@ -549,17 +550,17 @@ def _build_runtime_envelope_from_ml_response(
     if not transcript_norm:
         transcript_norm = transcript
     if not transcript_norm:
-        print("event=asr_empty source=voice")
+        log.warning("event=asr_empty source=voice")
         return None, "asr_empty"
 
     command = response_json.get("command")
     if not isinstance(command, dict):
-        print("event=llm_invalid_output source=voice reason=command_missing")
+        log.warning("event=llm_invalid_output source=voice reason=command_missing")
         return None, "llm_invalid_output"
 
     ml_intent = str(command.get("intent") or "").strip()
     if not ml_intent:
-        print("event=llm_invalid_output source=voice reason=intent_missing")
+        log.warning("event=llm_invalid_output source=voice reason=intent_missing")
         return None, "llm_invalid_output"
 
     runtime_intent = _runtime_intent_from_ml(ml_intent)
@@ -629,12 +630,14 @@ def _tg_download_file(file_path: str) -> tuple[bytes, str, str]:
 
 def _ml_gateway_voice_command(audio_bytes: bytes, *, filename: str, mime_type: str) -> tuple[dict | None, str | None]:
     if not ML_CORE_URL:
-        print("event=asr_unavailable source=voice reason=ml_core_url_empty")
+        log.warning("event=asr_unavailable source=voice reason=ml_core_url_empty")
         return None, "asr_unavailable"
+    req_url = f"{ML_CORE_URL.rstrip('/')}/voice-command"
+    log.info("event=gateway_call url=%s profile=%s tz=%s", req_url, "organizer", VOICE_X_TIMEZONE)
     try:
         req_mod = _require_requests()
         resp = req_mod.post(
-            f"{ML_CORE_URL.rstrip('/')}/voice-command",
+            req_url,
             params={"profile": "organizer"},
             headers={"X-Timezone": VOICE_X_TIMEZONE},
             files={"file": (filename, audio_bytes, mime_type)},
@@ -642,23 +645,27 @@ def _ml_gateway_voice_command(audio_bytes: bytes, *, filename: str, mime_type: s
         )
     except Exception as exc:
         if _is_timeout_exception(exc):
-            print(f"event=asr_timeout source=voice err={type(exc).__name__}")
+            log.warning("event=asr_timeout source=voice err=%s", type(exc).__name__)
             return None, "asr_timeout"
-        print(f"event=asr_unavailable source=voice err={type(exc).__name__}")
+        log.warning("event=asr_unavailable source=voice err=%s", type(exc).__name__)
         return None, "asr_unavailable"
 
     if int(resp.status_code) >= 300:
-        print(f"event=asr_unavailable source=voice status={int(resp.status_code)}")
+        log.warning("event=asr_unavailable source=voice status=%s", int(resp.status_code))
         return None, "asr_unavailable"
 
     try:
         data = resp.json()
     except Exception:
-        print("event=llm_invalid_output source=voice reason=json_decode")
+        log.warning("event=llm_invalid_output source=voice reason=json_decode")
         return None, "llm_invalid_output"
     if not isinstance(data, dict):
-        print("event=llm_invalid_output source=voice reason=json_not_object")
+        log.warning("event=llm_invalid_output source=voice reason=json_not_object")
         return None, "llm_invalid_output"
+    transcript = str(data.get("transcript_norm") or data.get("transcript") or "")
+    command = data.get("command")
+    intent = str(command.get("intent") or "") if isinstance(command, dict) else ""
+    log.info("event=gateway_resp status=%s transcript_len=%s intent=%s", int(resp.status_code), len(transcript), intent)
     return data, None
 
 
@@ -3510,6 +3517,8 @@ def _handle_voice_message(update_id: int, message: dict) -> None:
     chat_id = int(message["chat"]["id"])
     voice = message.get("voice") or {}
     file_id = str(voice.get("file_id") or "").strip()
+    duration = voice.get("duration")
+    log.info("event=voice_received file_id=%s duration=%s", file_id or "-", duration)
     if not file_id:
         _send_message(chat_id, VOICE_RETRY_TEXT)
         return
@@ -3517,6 +3526,7 @@ def _handle_voice_message(update_id: int, message: dict) -> None:
     try:
         file_path = _tg_get_file_path(file_id)
         audio_bytes, filename, mime_type = _tg_download_file(file_path)
+        log.info("event=voice_downloaded bytes=%s", len(audio_bytes))
         ml_response, ml_err = _ml_gateway_voice_command(audio_bytes, filename=filename, mime_type=mime_type)
         if ml_err:
             if ml_err in {"asr_unavailable", "asr_timeout", "asr_empty"}:
@@ -3540,19 +3550,25 @@ def _handle_voice_message(update_id: int, message: dict) -> None:
 
         ok, payload, status, err_text = _worker_post_ex("/runtime/command", envelope or {})
         if not ok or not isinstance(payload, dict):
-            print(f"event=voice_runtime_failed status={status} err={(err_text or '')[:200]}")
+            log.warning("event=voice_runtime_failed status=%s err=%s", status, (err_text or "")[:200])
             _send_message(chat_id, VOICE_LATER_TEXT)
             return
+        log.info(
+            "event=runtime_resp ok=%s has_clarifying_question=%s",
+            bool(payload.get("ok")),
+            bool(payload.get("clarifying_question")),
+        )
 
         _send_message(chat_id, _format_runtime_reply(payload))
     except Exception as exc:
-        print(f"event=asr_unavailable source=voice err={type(exc).__name__}")
+        log.warning("event=asr_unavailable source=voice err=%s", type(exc).__name__)
         _send_message(chat_id, VOICE_RETRY_TEXT)
 
 def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN is required")
 
+    log.info("bot_start")
     os.makedirs("/tmp", exist_ok=True)
     _init_queue_schema()
     _start_health_server()
