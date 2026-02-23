@@ -55,3 +55,6 @@ secrets/
 !/scripts/ops_status.sh
 !/scripts/ops_snapshot.sh
 !/scripts/prod_switch_to_runtime_stable.sh
+!/scripts/diag_voice_bundle.sh
+!/scripts/diag_ml_bundle.sh
+!/scripts/diag_voice_bundle.ps1
