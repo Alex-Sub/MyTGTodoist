@@ -24,6 +24,7 @@
 ## Production Branch Policy
 - Production always builds from branch: `runtime-stable`.
 - Never develop directly on `main` on VPS.
+- Any hotfix on VPS must go via a separate branch -> push -> merge (do not patch `main` directly on VPS).
 - Before any deploy, verify current branch on VPS and abort if branch is not `runtime-stable`.
 
 ## C) Services And Ports
@@ -79,11 +80,20 @@ curl -fsS http://127.0.0.1:19000/health
 ## G) Known Constraints
 - Calendar may be `NOT_CONFIGURED` (accepted during current test stage).
 - For service account mode, do not use `GOOGLE_CALENDAR_ID=primary`; use the explicitly shared calendar ID (`...@group.calendar.google.com` or concrete calendar id visible in Calendar settings).
+- В проде нельзя хардкодить `GOOGLE_CALENDAR_ID=primary` при service account.
 - `curl` is not installed in worker image; use Python `urllib` health check from inside container.
 - Open sync conflicts block normal command execution until resolved.
 - Conflict resolution goes via Telegram inline buttons:
 - `conflict:<conflict_id>:accept_remote`
 - `conflict:<conflict_id>:keep_local`
+
+## Calendar Env Smoke Check
+```bash
+dc="docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml"
+$dc exec -T telegram-bot sh -lc 'echo $GOOGLE_CALENDAR_ID'
+$dc exec -T organizer-worker sh -lc 'echo $GOOGLE_CALENDAR_ID'
+```
+- Значения должны совпадать.
 
 ## Known Production Constraints
 - Runtime DB один: SQLite файл `/data/organizer.db` в volume `deploy_db_data` (compose key `db_data`).

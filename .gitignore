@@ -51,4 +51,6 @@ secrets/
 /docs/бэкап.txt
 /вызов htop.md
 /deploy-kit/
-/scripts/
+/scripts/*
+!/scripts/ops_status.sh
+!/scripts/ops_snapshot.sh
