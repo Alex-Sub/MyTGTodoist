@@ -6,6 +6,7 @@ import time
 import re
 import urllib.parse
 import urllib.request
+from collections import deque
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta, timezone, date, tzinfo
@@ -47,7 +48,10 @@ HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8082"))
 STATE_PATH = os.getenv("STATE_PATH", "/data/bot.offset")
 TG_DRAIN_ON_START = os.getenv("TG_DRAIN_ON_START", "0") == "1"
 TG_LONGPOLL_SEC = int(os.getenv("TG_LONGPOLL_SEC", "25"))
-TG_HTTP_TIMEOUT = (3, int(os.getenv("TG_HTTP_READ_TIMEOUT", "90")))
+TG_HTTP_READ_TIMEOUT_RAW = int(os.getenv("TG_HTTP_READ_TIMEOUT", "90"))
+TG_HTTP_READ_TIMEOUT_MIN = TG_LONGPOLL_SEC + 10
+TG_HTTP_READ_TIMEOUT = max(TG_HTTP_READ_TIMEOUT_RAW, TG_HTTP_READ_TIMEOUT_MIN)
+TG_HTTP_TIMEOUT = (3, TG_HTTP_READ_TIMEOUT)
 DB_PATH = os.getenv("DB_PATH", "/data/organizer.db")
 B2_QUEUE_MAX_NEW = int(os.getenv("B2_QUEUE_MAX_NEW", "50"))
 B2_QUEUE_MAX_TOTAL = int(os.getenv("B2_QUEUE_MAX_TOTAL", "500"))
@@ -76,6 +80,10 @@ DAILY_DIGEST_TIME = os.getenv("DAILY_DIGEST_TIME", "09:00")
 DAILY_DIGEST_TIMEZONE = os.getenv("DAILY_DIGEST_TIMEZONE", "Europe/Berlin")
 _digest_chats_raw = os.getenv("DAILY_DIGEST_CHAT_IDS", "").strip()
 DAILY_DIGEST_CHAT_IDS = [int(x.strip()) for x in _digest_chats_raw.split(",") if x.strip().isdigit()]
+TG_DEDUP_STATE_PATH = os.getenv("TG_DEDUP_STATE_PATH", f"{STATE_PATH}.dedup.json")
+TG_DEDUP_MAX_IDS = int(os.getenv("TG_DEDUP_MAX_IDS", "5000"))
+_processed_update_ids_deque: deque[int] = deque()
+_processed_update_ids_set: set[int] = set()
 
 _p2_pending_state: dict[int, dict] = {}
 _daily_digest_sent_day: dict[int, str] = {}
@@ -1944,12 +1952,69 @@ def _load_offset() -> int:
         return 0
 
 
+def _load_processed_updates() -> None:
+    _processed_update_ids_deque.clear()
+    _processed_update_ids_set.clear()
+    if not os.path.exists(TG_DEDUP_STATE_PATH):
+        return
+    try:
+        with open(TG_DEDUP_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        raw = data.get("updates", []) if isinstance(data, dict) else data
+        if not isinstance(raw, list):
+            return
+        for value in raw:
+            try:
+                uid = int(value)
+            except Exception:
+                continue
+            if uid in _processed_update_ids_set:
+                continue
+            _processed_update_ids_deque.append(uid)
+            _processed_update_ids_set.add(uid)
+        while len(_processed_update_ids_deque) > TG_DEDUP_MAX_IDS:
+            old = _processed_update_ids_deque.popleft()
+            _processed_update_ids_set.discard(old)
+    except Exception as exc:
+        print(f"tg_dedup_load_error path={TG_DEDUP_STATE_PATH} err={str(exc)[:200]}")
+
+
+def _save_processed_updates() -> None:
+    tmp_path = f"{TG_DEDUP_STATE_PATH}.tmp"
+    parent = os.path.dirname(TG_DEDUP_STATE_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump({"updates": list(_processed_update_ids_deque)}, f, ensure_ascii=False)
+    os.replace(tmp_path, TG_DEDUP_STATE_PATH)
+
+
+def _is_processed_update(update_id: int) -> bool:
+    return int(update_id) in _processed_update_ids_set
+
+
+def _remember_processed_update(update_id: int) -> None:
+    uid = int(update_id)
+    if uid in _processed_update_ids_set:
+        return
+    _processed_update_ids_deque.append(uid)
+    _processed_update_ids_set.add(uid)
+    while len(_processed_update_ids_deque) > TG_DEDUP_MAX_IDS:
+        old = _processed_update_ids_deque.popleft()
+        _processed_update_ids_set.discard(old)
+    _save_processed_updates()
+
+
 def _save_offset(offset: int, update_id: int) -> None:
     tmp_path = f"{STATE_PATH}.tmp"
-    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    parent = os.path.dirname(STATE_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(tmp_path, "w", encoding="utf-8") as f:
         f.write(str(offset))
     os.replace(tmp_path, STATE_PATH)
+    if update_id >= 0:
+        _remember_processed_update(update_id)
     print(f"saved offset={offset} update_id={update_id}")
 
 
@@ -3246,7 +3311,14 @@ def main() -> None:
     clarify_state = _load_clarify_state()
     global _p2_pending_state
     _p2_pending_state = _load_p2_pending_state()
+    _load_processed_updates()
     print(f"loaded offset={offset}")
+    if TG_HTTP_READ_TIMEOUT > TG_HTTP_READ_TIMEOUT_RAW:
+        print(
+            "tg_timeout_adjusted "
+            f"read_timeout_raw={TG_HTTP_READ_TIMEOUT_RAW} "
+            f"longpoll={TG_LONGPOLL_SEC} read_timeout_effective={TG_HTTP_READ_TIMEOUT}"
+        )
     if TG_DRAIN_ON_START:
         try:
             drained = _drain_updates()
@@ -3267,7 +3339,15 @@ def main() -> None:
                 update_id = update.get("update_id")
                 if update_id is None:
                     continue
+                update_id = int(update_id)
                 if update_id < offset:
+                    continue
+                if _is_processed_update(update_id):
+                    handled_kind = "dedup_skip"
+                    print(f"processed update_id={update_id} kind={handled_kind}")
+                    if update_id >= offset:
+                        offset = update_id + 1
+                        _save_offset(offset, update_id)
                     continue
                 callback = update.get("callback_query") or {}
                 if callback:

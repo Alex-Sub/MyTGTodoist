@@ -76,13 +76,13 @@ def test_create_or_reuse_event_second_call_reuses_existing() -> None:
         "end": {"dateTime": "2026-03-01T10:30:00+00:00", "timeZone": "UTC"},
     }
 
-    first_id = create_or_reuse_event(
+    first_id, first_action = create_or_reuse_event(
         service,
         calendar_id="calendar-1",
         item_id=42,
         event=event,
     )
-    second_id = create_or_reuse_event(
+    second_id, second_action = create_or_reuse_event(
         service,
         calendar_id="calendar-1",
         item_id=42,
@@ -90,7 +90,9 @@ def test_create_or_reuse_event_second_call_reuses_existing() -> None:
     )
 
     assert first_id == "evt-1"
+    assert first_action == "insert"
     assert second_id == "evt-1"
+    assert second_action in {"reuse_icaluid", "reuse_private_prop"}
     assert service.events().insert_calls == 1
     saved = service.events()._rows[0]
     private = ((saved.get("extendedProperties") or {}).get("private") or {})

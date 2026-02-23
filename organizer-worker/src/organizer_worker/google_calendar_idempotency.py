@@ -49,15 +49,15 @@ def create_or_reuse_event(
     calendar_id: str,
     item_id: int | str,
     event: dict[str, Any],
-) -> str | None:
+) -> tuple[str | None, str]:
     ical_uid = build_item_ical_uid(item_id)
 
     existing_id = _list_by_ical_uid(service, calendar_id, ical_uid)
     if existing_id:
-        return existing_id
+        return existing_id, "reuse_icaluid"
     existing_id = _list_by_private_item_id(service, calendar_id, item_id)
     if existing_id:
-        return existing_id
+        return existing_id, "reuse_private_prop"
 
     body = dict(event)
     body["iCalUID"] = ical_uid
@@ -74,16 +74,19 @@ def create_or_reuse_event(
         if status in (409, 412):
             existing_id = _list_by_ical_uid(service, calendar_id, ical_uid)
             if existing_id:
-                return existing_id
+                return existing_id, "reuse_after_conflict_icaluid"
             existing_id = _list_by_private_item_id(service, calendar_id, item_id)
             if existing_id:
-                return existing_id
+                return existing_id, "reuse_after_conflict_private_prop"
         raise
 
     created_id = str((created or {}).get("id") or "").strip()
     if created_id:
-        return created_id
+        return created_id, "insert"
     existing_id = _list_by_ical_uid(service, calendar_id, ical_uid)
     if existing_id:
-        return existing_id
-    return _list_by_private_item_id(service, calendar_id, item_id)
+        return existing_id, "reuse_post_insert_icaluid"
+    existing_id = _list_by_private_item_id(service, calendar_id, item_id)
+    if existing_id:
+        return existing_id, "reuse_post_insert_private_prop"
+    return None, "none"

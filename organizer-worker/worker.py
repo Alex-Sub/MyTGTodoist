@@ -3663,11 +3663,24 @@ def _create_event(
     start: datetime,
     end: datetime,
     description: str | None = None,
+    existing_event_id: str | None = None,
 ) -> str | None:
     service = _get_calendar_service()
     if service is None:
         logging.warning("calendar service not configured; skipping")
         return None
+    if existing_event_id and existing_event_id not in {"PENDING", "FAILED"}:
+        patch_res = _patch_event(str(existing_event_id), start, end)
+        if patch_res == "ok":
+            logging.info(
+                "calendar_idempotent item_id=%s iCalUID=%s action=update google_event_id=%s",
+                item_id,
+                build_item_ical_uid(item_id),
+                existing_event_id,
+            )
+            return str(existing_event_id)
+        if patch_res in {"error", "no_service"}:
+            return None
 
     event = {
         "summary": title,
@@ -3677,14 +3690,20 @@ def _create_event(
     if description:
         event["description"] = description
     ical_uid = build_item_ical_uid(item_id)
-    event_id = create_or_reuse_event(
+    event_id, action = create_or_reuse_event(
         service,
         calendar_id=GOOGLE_CALENDAR_ID,
         item_id=item_id,
         event=event,
     )
     if event_id:
-        logging.info("calendar_idempotent_create item_id=%s iCalUID=%s event_id=%s", item_id, ical_uid, event_id)
+        logging.info(
+            "calendar_idempotent item_id=%s iCalUID=%s action=%s google_event_id=%s",
+            item_id,
+            ical_uid,
+            action,
+            event_id,
+        )
     return event_id
 
 
@@ -4582,10 +4601,7 @@ def _sync_calendar_for_item(item: dict) -> None:
 
     logging.info("[%s] calendar_state before=%s", item_id, cal_id)
 
-    # Idempotency guard
-    if cal_id and cal_id not in ("PENDING", "FAILED"):
-        logging.info("[%s] calendar_state after=%s (skip)", item_id, cal_id)
-        return
+    existing_event_id = str(cal_id).strip() if cal_id and cal_id not in ("PENDING", "FAILED") else None
 
     # Do not auto-retry FAILED
     if cal_id == "FAILED":
@@ -4602,7 +4618,14 @@ def _sync_calendar_for_item(item: dict) -> None:
 
     try:
         event_title, event_description = _calendar_title_description_from_item(item)
-        event_id = _create_event(item_id, event_title, start, end, description=event_description)  # must return str|None
+        event_id = _create_event(
+            item_id,
+            event_title,
+            start,
+            end,
+            description=event_description,
+            existing_event_id=existing_event_id,
+        )  # must return str|None
     except Exception as e:
         event_id = None
         err_text, err_transient = _calendar_error_info(e)
@@ -4645,6 +4668,26 @@ def _sync_calendar_for_item(item: dict) -> None:
         logging.info("[%s] calendar_state after=%s", item_id, new_state)
         if new_state == "FAILED":
             _tg_notify_calendar_dead(item_id)
+        return
+
+    if existing_event_id:
+        with _get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE items
+                SET last_error = NULL,
+                    updated_at = ?,
+                    calendar_ok_at = COALESCE(calendar_ok_at, ?)
+                WHERE id = ?
+                """,
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    datetime.now(timezone.utc).isoformat(),
+                    item_id,
+                ),
+            )
+            conn.commit()
+        logging.info("[%s] calendar_state after=%s (updated)", item_id, event_id)
         return
 
     # success: store event_id for NULL or PENDING

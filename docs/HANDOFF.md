@@ -88,6 +88,8 @@ curl -fsS http://127.0.0.1:19000/health
 - For service account mode, do not use `GOOGLE_CALENDAR_ID=primary`; use the explicitly shared calendar ID (`...@group.calendar.google.com` or concrete calendar id visible in Calendar settings).
 - В проде нельзя хардкодить `GOOGLE_CALENDAR_ID=primary` при service account.
 - `curl` is not installed in worker image; use Python `urllib` health check from inside container.
+- Telegram long-poll guard: runtime enforces `TG_HTTP_READ_TIMEOUT >= TG_LONGPOLL_SEC + 10`.
+- Telegram update dedup is enabled (in-memory LRU + persisted file near offset: `${STATE_PATH}.dedup.json`).
 - Open sync conflicts block normal command execution until resolved.
 - Conflict resolution goes via Telegram inline buttons:
 - `conflict:<conflict_id>:accept_remote`
@@ -100,6 +102,13 @@ $dc exec -T telegram-bot sh -lc 'echo $GOOGLE_CALENDAR_ID'
 $dc exec -T organizer-worker sh -lc 'echo $GOOGLE_CALENDAR_ID'
 ```
 - Значения должны совпадать.
+
+## Calendar Idempotency Smoke Check
+```bash
+dc="docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml"
+$dc logs --tail=200 organizer-worker | grep -E "calendar_idempotent|iCalUID|google_event_id"
+```
+- Повторная обработка одного `item_id` должна логироваться как `action=reuse_*` или `action=update`, без второго insert.
 
 ## Known Production Constraints
 - Runtime DB один: SQLite файл `/data/organizer.db` в volume `deploy_db_data` (compose key `db_data`).
