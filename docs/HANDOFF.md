@@ -130,6 +130,9 @@ nl -ba /opt/mytgtodoist/secrets/<user>/google_sa.json | sed -n '1,15p'
 - Важно:
 - `pip install` внутри уже запущенного контейнера — временно и теряется при recreate.
 - Зависимости должны быть зафиксированы в Dockerfile/образе и доставляться только через rebuild image.
+- Если worker рестартится сразу:
+- сначала смотреть `docker compose logs organizer-worker` на `ModuleNotFoundError`;
+- фикс: добавить зависимость в `pyproject.toml` + `poetry.lock`, затем rebuild образа.
 
 ## H) Next Steps
 - Run 3–7 days of daily checks: `ps`, API health, worker/bot logs, Telegram smoke commands.
