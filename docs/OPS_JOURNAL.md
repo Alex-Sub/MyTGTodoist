@@ -60,6 +60,12 @@
 - Result: prod contour documented as deterministic with explicit troubleshooting checklist.
 - Prevention: all prod updates go through local commit/push and VPS pull/rebuild from `runtime-stable` only.
 
+### 2026-02-23 00:00 UTC — Voice ASR 415 incident
+- Symptom: Telegram voice flow returns canonical message `Не получилось разобрать речь. Попробуй сказать ещё раз.`
+- Evidence: `telegram-bot` logs show `gateway_call` to `/voice-command` and then `event=asr_unavailable status=415`.
+- Interpretation: `415 Unsupported Media Type` on `/voice-command`; likely Telegram voice format (`ogg/opus`) is not accepted by current gateway contract (expects `audio.wav`).
+- Action taken: documentation update only (no code changes).
+
 ## PROD-V0 STABLE
 
 Дата фиксации: 2026-02-21

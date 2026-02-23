@@ -178,6 +178,7 @@ $dc logs --tail=200 organizer-worker | grep -E "calendar_idempotent|iCalUID|goog
 - verify ML-Gateway endpoints:
 - `curl -fsS $ML_CORE_URL/health`
 - `curl -fsS $ML_CORE_URL/diag/upstreams`
+- if logs show `asr_unavailable status=415`, check input audio format; ensure bot sends WAV as required by `/voice-command` contract
 - inspect `telegram-bot` logs
 - Quick green tests (local):
 - `pytest -q tests/test_telegram_voice_gateway.py tests/test_task_intents_v2.py`
