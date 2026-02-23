@@ -52,6 +52,11 @@
 - `./migrations:/app/migrations:ro`
 - `db_data:/data` (shared named volume for `organizer-worker`, `organizer-api`, `telegram-bot`)
 - Worker SA bind mount target: `/data/google_sa.json` from host path `${GOOGLE_SA_FILE_HOST:-./secrets/alexey/google_sa.json}`
+- Canon diagnostics:
+```bash
+dc="docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml"
+$dc exec organizer-worker ls -la /canon/intents_v2.yml
+```
 
 ## E) How To Operate (Copy-Paste)
 - From `/opt/mytgtodoist`

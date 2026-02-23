@@ -38,6 +38,7 @@ _ensure_local_no_proxy()
 _SRC_DIR = Path(__file__).resolve().parent / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
+from organizer_worker.startup_preflight import ensure_canon_mounted
 _P2_RUNTIME_PATH = _SRC_DIR / "p2_tasks_runtime.py"
 _P2_SPEC = importlib_util.spec_from_file_location("p2_tasks_runtime", _P2_RUNTIME_PATH)
 if _P2_SPEC is None or _P2_SPEC.loader is None:
@@ -45,6 +46,12 @@ if _P2_SPEC is None or _P2_SPEC.loader is None:
 p2: Any = importlib_util.module_from_spec(_P2_SPEC)
 sys.modules.setdefault("p2_tasks_runtime", p2)
 _P2_SPEC.loader.exec_module(p2)
+try:
+    ensure_canon_mounted("/canon/intents_v2.yml")
+except RuntimeError as exc:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+    logging.error("%s", str(exc))
+    raise SystemExit(1)
 from organizer_worker.handlers import dispatch_intent
 
 DB_PATH = os.getenv("DB_PATH", "/data/organizer.db")
