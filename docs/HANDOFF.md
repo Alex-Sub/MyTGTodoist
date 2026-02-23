@@ -25,6 +25,7 @@
 - Production always builds from branch: `runtime-stable`.
 - Never develop directly on `main` on VPS.
 - Any hotfix on VPS must go via a separate branch -> push -> merge (do not patch `main` directly on VPS).
+- VPS must be clean (no modified/untracked files) before switching branch.
 - Before any deploy, verify current branch on VPS and abort if branch is not `runtime-stable`.
 
 ## C) Services And Ports

@@ -54,3 +54,4 @@ secrets/
 /scripts/*
 !/scripts/ops_status.sh
 !/scripts/ops_snapshot.sh
+!/scripts/prod_switch_to_runtime_stable.sh
