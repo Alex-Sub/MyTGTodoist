@@ -39,6 +39,7 @@ _SRC_DIR = Path(__file__).resolve().parent / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 from organizer_worker.startup_preflight import ensure_canon_mounted
+from organizer_worker.google_calendar_idempotency import build_item_ical_uid, create_or_reuse_event
 _P2_RUNTIME_PATH = _SRC_DIR / "p2_tasks_runtime.py"
 _P2_SPEC = importlib_util.spec_from_file_location("p2_tasks_runtime", _P2_RUNTIME_PATH)
 if _P2_SPEC is None or _P2_SPEC.loader is None:
@@ -49,9 +50,14 @@ _P2_SPEC.loader.exec_module(p2)
 try:
     ensure_canon_mounted("/canon/intents_v2.yml")
 except RuntimeError as exc:
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-    logging.error("%s", str(exc))
-    raise SystemExit(1)
+    local_canon = Path(__file__).resolve().parents[1] / "canon" / "intents_v2.yml"
+    if not Path("/.dockerenv").exists() and local_canon.exists():
+        logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+        logging.warning("canon_local_fallback path=%s", local_canon)
+    else:
+        logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+        logging.error("%s", str(exc))
+        raise SystemExit(1)
 from organizer_worker.handlers import dispatch_intent
 
 DB_PATH = os.getenv("DB_PATH", "/data/organizer.db")
@@ -3651,7 +3657,13 @@ def _calendar_title_description_from_item(item: dict[str, Any]) -> tuple[str, st
     return event_title, description
 
 
-def _create_event(title: str, start: datetime, end: datetime, description: str | None = None) -> str | None:
+def _create_event(
+    item_id: int | str,
+    title: str,
+    start: datetime,
+    end: datetime,
+    description: str | None = None,
+) -> str | None:
     service = _get_calendar_service()
     if service is None:
         logging.warning("calendar service not configured; skipping")
@@ -3664,8 +3676,16 @@ def _create_event(title: str, start: datetime, end: datetime, description: str |
     }
     if description:
         event["description"] = description
-    created = service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
-    return created.get("id")
+    ical_uid = build_item_ical_uid(item_id)
+    event_id = create_or_reuse_event(
+        service,
+        calendar_id=GOOGLE_CALENDAR_ID,
+        item_id=item_id,
+        event=event,
+    )
+    if event_id:
+        logging.info("calendar_idempotent_create item_id=%s iCalUID=%s event_id=%s", item_id, ical_uid, event_id)
+    return event_id
 
 
 def _calendar_error_info(exc: Exception) -> tuple[str, bool]:
@@ -3789,10 +3809,16 @@ def _calendar_result(
     }
 
 
-def _calendar_create_event(title: str, start: datetime, end: datetime, description: str | None = None) -> dict:
+def _calendar_create_event(
+    item_id: int | str,
+    title: str,
+    start: datetime,
+    end: datetime,
+    description: str | None = None,
+) -> dict:
     # TODO(P4): store calendar_etag when schema allows.
     try:
-        event_id = _create_event(title, start, end, description=description)
+        event_id = _create_event(item_id, title, start, end, description=description)
     except Exception as exc:
         status = _calendar_http_status(exc)
         return _calendar_result(False, None, status, f"exception:{type(exc).__name__}", None)
@@ -3927,7 +3953,7 @@ def _p3_calendar_create_tick(limit: int = 10) -> None:
                 continue
 
             end = dt + timedelta(minutes=MEETING_DEFAULT_MINUTES)
-            res = _calendar_create_event(f"Task #{task_id}: {title}", dt, end)
+            res = _calendar_create_event(task_id, f"Task #{task_id}: {title}", dt, end)
             logging.info(
                 "%s action=create_attempt task_id=%s planned_at=%s calendar_event_id=%s "
                 "ok=%s http_status=%s err=%s",
@@ -4576,7 +4602,7 @@ def _sync_calendar_for_item(item: dict) -> None:
 
     try:
         event_title, event_description = _calendar_title_description_from_item(item)
-        event_id = _create_event(event_title, start, end, description=event_description)  # must return str|None
+        event_id = _create_event(item_id, event_title, start, end, description=event_description)  # must return str|None
     except Exception as e:
         event_id = None
         err_text, err_transient = _calendar_error_info(e)
@@ -4709,7 +4735,7 @@ def _process_items() -> None:
             continue
         try:
             event_title, event_description = _calendar_title_description_from_item(row)
-            event_id = _create_event(event_title, start, end, description=event_description)
+            event_id = _create_event(item_id, event_title, start, end, description=event_description)
         except Exception as exc:
             event_id = None
             err_text, err_transient = _calendar_error_info(exc)
@@ -4823,7 +4849,7 @@ def _retry_pending_events() -> None:
 
         try:
             event_title, event_description = _calendar_title_description_from_item(row)
-            event_id = _create_event(event_title, start, end, description=event_description)
+            event_id = _create_event(item_id, event_title, start, end, description=event_description)
         except Exception as exc:
             event_id = None
             err_text, err_transient = _calendar_error_info(exc)
