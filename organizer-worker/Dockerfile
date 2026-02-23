@@ -8,6 +8,7 @@ RUN apt-get update \
 
 RUN pip install --no-cache-dir \
     requests==2.32.3 \
+    pyyaml \
     google-auth \
     google-auth-oauthlib \
     google-api-python-client \
