@@ -104,6 +104,30 @@ def test_timeblock_create_empty_start_at_returns_clarification(runtime_db: Path)
     assert int(cnt[0]) == 0
 
 
+def test_voice_timeblock_create_with_duration_only_asks_time_not_inbox(runtime_db: Path) -> None:
+    t = handlers.dispatch_intent({"intent": "task.create", "entities": {"title": "Встреча"}})
+    assert t["ok"] is True
+    task_id = int(t["debug"]["task_id"])
+
+    # Voice flow:
+    # 1) "Создай встречу"
+    # 2) "60"
+    # Runtime command arrives as legacy alias timeblock_create with duration only.
+    res = handlers.dispatch_intent(
+        {
+            "intent": "timeblock_create",
+            "entities": {"task_id": task_id, "duration_min": 60},
+        }
+    )
+    assert res["ok"] is False
+    assert res.get("clarifying_question") == "На какое время поставить блок?"
+
+    with sqlite3.connect(str(runtime_db)) as conn:
+        cnt = conn.execute("SELECT COUNT(*) FROM time_blocks WHERE task_id = ?", (task_id,)).fetchone()
+    assert cnt is not None
+    assert int(cnt[0]) == 0
+
+
 def test_timeblock_move_empty_datetimes_returns_clarification_no_changes(runtime_db: Path) -> None:
     t = handlers.dispatch_intent({"intent": "task.create", "entities": {"title": "ТБ задача move пустой старт"}})
     assert t["ok"] is True

@@ -44,10 +44,17 @@ pytest -q
 
 ## Documentation
 
-- `docs/00_PHILOSOPHY.md`
-- `docs/01_SYSTEM_OVERVIEW.md`
-- `docs/02_RUNTIME_SPEC.md`
-- `docs/03_ML_CONTRACT.md`
+- Canonical docs root: `docs-templates/`
+- Entry point: `docs-templates/00_DOCS_MAP.md`
+- Philosophy: `docs-templates/00_PHILOSOPHY.md`
+- Canon/contract: `docs-templates/01_canon.MD`
+- Runtime spec: `docs-templates/02_RUNTIME_SPEC.md`
+- Adapters: `docs-templates/03_adapters.md`
+- System overview: `docs-templates/04_SYSTEM_OVERVIEW.md`
+- Operations and handoff: `docs-templates/05_docs.md`
+- Roadmap/progress: `docs-templates/05_ROADMAP_AND_PROGRESS.md`
+- Development backlog: `docs-templates/06_DEVELOPMENT_BACKLOG.md`
+- Quick canon: `docs-templates/ML_STACK_CANON.md`
 
 ## ASR (voice)
 

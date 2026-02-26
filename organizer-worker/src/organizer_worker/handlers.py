@@ -301,6 +301,24 @@ def _choices_if_any(entities: dict[str, Any]) -> list[dict[str, Any]] | None:
     return None
 
 
+def _normalize_intent_alias(intent: str) -> str:
+    raw = (intent or "").strip()
+    aliases = {
+        "task_create": "task.create",
+        "task_complete": "task.complete",
+        "task_update": "task.update",
+        "task_move": "task.move",
+        "task_set_status": "task.set_status",
+        "task_reschedule": "task.reschedule",
+        "timeblock_create": "timeblock.create",
+        "timeblock_move": "timeblock.move",
+        "timeblock_delete": "timeblock.delete",
+        "subtask_create": "subtask.create",
+        "subtask_complete": "subtask.complete",
+    }
+    return aliases.get(raw, raw)
+
+
 def task_create(payload: dict[str, Any]) -> HandlerResult:
     e = _entities(payload)
     title = (e.get("title") or "").strip()
@@ -475,11 +493,10 @@ def subtask_complete(payload: dict[str, Any]) -> HandlerResult:
 def timeblock_create(payload: dict[str, Any]) -> HandlerResult:
     e = _entities(payload)
     start_at = _normalized_datetime_value(e.get("start_at"))
-    end_at = _normalized_datetime_value(e.get("end_at"))
     duration_min = e.get("duration_min")
     if not start_at:
-        return _need("start_at", "Когда начать? Пришлите дату и время начала.")
-    if not end_at and duration_min is None:
+        return _need("start_at", "На какое время поставить блок?")
+    if duration_min is None:
         return _need("duration_min", "На сколько минут поставить блок?")
 
     try:
@@ -488,9 +505,7 @@ def timeblock_create(payload: dict[str, Any]) -> HandlerResult:
             if question is not None:
                 return question
             assert task_id is not None
-            end_value = end_at
-            if end_value is None:
-                end_value = _with_minutes_iso(str(start_at), int(duration_min))
+            end_value = _with_minutes_iso(str(start_at), int(duration_min))
             tb_id = db.create_time_block(conn, task_id=task_id, start_at=str(start_at), end_at=str(end_value))
         return _ok("Блок времени создан.", time_block_id=tb_id, task_id=task_id)
     except Exception as exc:
@@ -954,7 +969,7 @@ def dispatch_intent(cmd: dict[str, Any]) -> HandlerResult:
 
     if not isinstance(intent, str) or not intent.strip():
         return _fail("Я не понял команду. Сформулируйте иначе.", reason="missing_intent")
-    intent_norm = intent.strip()
+    intent_norm = _normalize_intent_alias(intent)
     entities = _entities(payload)
     confidence = _read_confidence(cmd, payload)
     rejected = _is_rejected(cmd, payload)
