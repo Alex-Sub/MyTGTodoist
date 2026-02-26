@@ -2092,6 +2092,23 @@ def _enqueue_text(update_id: int, chat_id: int, message_id: int | None, text: st
         ).fetchone()["cnt"]
     return inserted, int(depth_new)
 
+
+def _detect_list_intent_from_text(raw: str) -> str | None:
+    s = (raw or "").strip().lower()
+    if not s:
+        return None
+    if not (s.startswith("список") or s.startswith("покажи") or s.startswith("выведи")):
+        return None
+    if "завтр" in s:
+        return "tasks.list_tomorrow"
+    if "сегодн" in s:
+        return "tasks.list_today"
+    if "актив" in s:
+        return "tasks.list_active"
+    if "задач" in s:
+        return "tasks.list_active"
+    return None
+
 def _handle_text_message(update_id: int, message: dict, pending_state: dict[int, dict]) -> None:
     chat_id = int(message["chat"]["id"])
     user_id = int((message.get("from") or {}).get("id") or chat_id)
@@ -2104,6 +2121,15 @@ def _handle_text_message(update_id: int, message: dict, pending_state: dict[int,
         message_id=message.get("message_id"),
         text=text_msg,
     ):
+        return
+
+    list_intent = _detect_list_intent_from_text(text_msg)
+    if list_intent:
+        payload = _worker_runtime_command(list_intent, {})
+        if isinstance(payload, dict):
+            _send_message(chat_id, _format_runtime_reply(payload))
+        else:
+            _send_message(chat_id, "Не получилось получить список. Попробуйте ещё раз.")
         return
 
     depth_new, depth_total = _queue_depths()

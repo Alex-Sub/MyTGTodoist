@@ -268,6 +268,101 @@ def test_pending_unknown_text_replies_choose_one(monkeypatch, tmp_path) -> None:
     assert "55" in telegram_bot._pending_clarify_state
 
 
+def test_text_list_active_rule_routes_to_runtime_without_inbox_enqueue(monkeypatch) -> None:
+    sent: list[str] = []
+    runtime_calls: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        telegram_bot,
+        "_enqueue_text",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not enqueue list-intent text into inbox_queue")),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "_queue_depths",
+        lambda: (_ for _ in ()).throw(AssertionError("must not check queue depths for list-intent text")),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "_p2_handle_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("p2 flow must not run for list-intent text")),
+    )
+    monkeypatch.setattr(telegram_bot, "_handle_pending_clarification_text", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        telegram_bot,
+        "_worker_runtime_command",
+        lambda intent, entities: (runtime_calls.append((intent, entities)) or {"ok": True, "debug": {"tasks": []}}),
+    )
+    monkeypatch.setattr(telegram_bot, "_send_message", lambda _chat_id, text: sent.append(text))
+
+    message = {"chat": {"id": 77}, "from": {"id": 77}, "message_id": 12, "text": "список активных задач"}
+    telegram_bot._handle_text_message(update_id=3001, message=message, pending_state={})
+
+    assert runtime_calls
+    assert runtime_calls[0][0] == "tasks.list_active"
+    assert runtime_calls[0][1] == {}
+    assert sent == ["Список пуст."]
+
+
+def test_text_list_tomorrow_rule_routes_to_runtime_without_inbox_enqueue(monkeypatch) -> None:
+    sent: list[str] = []
+    runtime_calls: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        telegram_bot,
+        "_enqueue_text",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not enqueue list-intent text into inbox_queue")),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "_queue_depths",
+        lambda: (_ for _ in ()).throw(AssertionError("must not check queue depths for list-intent text")),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "_p2_handle_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("p2 flow must not run for list-intent text")),
+    )
+    monkeypatch.setattr(telegram_bot, "_handle_pending_clarification_text", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        telegram_bot,
+        "_worker_runtime_command",
+        lambda intent, entities: (runtime_calls.append((intent, entities)) or {"ok": True, "debug": {"tasks": []}}),
+    )
+    monkeypatch.setattr(telegram_bot, "_send_message", lambda _chat_id, text: sent.append(text))
+
+    message = {"chat": {"id": 78}, "from": {"id": 78}, "message_id": 13, "text": "выведи задачи на завтра"}
+    telegram_bot._handle_text_message(update_id=3002, message=message, pending_state={})
+
+    assert runtime_calls
+    assert runtime_calls[0][0] == "tasks.list_tomorrow"
+    assert runtime_calls[0][1] == {}
+    assert sent == ["Список пуст."]
+
+
+def test_text_regular_task_still_goes_to_inbox_queue(monkeypatch) -> None:
+    enq_calls: list[dict] = []
+    sent: list[str] = []
+    monkeypatch.setattr(telegram_bot, "_handle_pending_clarification_text", lambda **_kwargs: False)
+    monkeypatch.setattr(telegram_bot, "_queue_depths", lambda: (0, 0))
+    monkeypatch.setattr(
+        telegram_bot,
+        "_enqueue_text",
+        lambda **kwargs: (enq_calls.append(kwargs) or True, 1),
+    )
+    monkeypatch.setattr(telegram_bot, "_p2_handle_text", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(telegram_bot, "_send_message", lambda _chat_id, text: sent.append(text))
+    monkeypatch.setattr(
+        telegram_bot,
+        "_worker_runtime_command",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("runtime list command must not run for regular task text")),
+    )
+
+    message = {"chat": {"id": 79}, "from": {"id": 79}, "message_id": 14, "text": "купи молоко"}
+    telegram_bot._handle_text_message(update_id=3003, message=message, pending_state={})
+
+    assert enq_calls
+    assert sent == ["Принято. В очереди: 1."]
+
+
 def test_format_runtime_reply_renders_tasks_list() -> None:
     payload = {
         "ok": True,
