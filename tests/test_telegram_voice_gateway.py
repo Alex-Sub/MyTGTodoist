@@ -289,8 +289,13 @@ def test_text_list_active_rule_routes_to_runtime_without_inbox_enqueue(monkeypat
     monkeypatch.setattr(telegram_bot, "_handle_pending_clarification_text", lambda **_kwargs: False)
     monkeypatch.setattr(
         telegram_bot,
-        "_worker_runtime_command",
-        lambda intent, entities: (runtime_calls.append((intent, entities)) or {"ok": True, "debug": {"tasks": []}}),
+        "_worker_post_ex",
+        lambda path, payload: (
+            runtime_calls.append((path, payload)) or True,
+            {"ok": True, "debug": {"tasks": []}},
+            200,
+            None,
+        ),
     )
     monkeypatch.setattr(telegram_bot, "_send_message", lambda _chat_id, text: sent.append(text))
 
@@ -298,8 +303,10 @@ def test_text_list_active_rule_routes_to_runtime_without_inbox_enqueue(monkeypat
     telegram_bot._handle_text_message(update_id=3001, message=message, pending_state={})
 
     assert runtime_calls
-    assert runtime_calls[0][0] == "tasks.list_active"
-    assert runtime_calls[0][1] == {}
+    assert runtime_calls[0][0] == "/runtime/command"
+    assert runtime_calls[0][1]["command"]["intent"] == "tasks.list_active"
+    assert runtime_calls[0][1]["command"]["intent"] != "task.create"
+    assert runtime_calls[0][1]["command"]["entities"] == {}
     assert sent == ["Список пуст."]
 
 
@@ -324,8 +331,13 @@ def test_text_list_tomorrow_rule_routes_to_runtime_without_inbox_enqueue(monkeyp
     monkeypatch.setattr(telegram_bot, "_handle_pending_clarification_text", lambda **_kwargs: False)
     monkeypatch.setattr(
         telegram_bot,
-        "_worker_runtime_command",
-        lambda intent, entities: (runtime_calls.append((intent, entities)) or {"ok": True, "debug": {"tasks": []}}),
+        "_worker_post_ex",
+        lambda path, payload: (
+            runtime_calls.append((path, payload)) or True,
+            {"ok": True, "debug": {"tasks": []}},
+            200,
+            None,
+        ),
     )
     monkeypatch.setattr(telegram_bot, "_send_message", lambda _chat_id, text: sent.append(text))
 
@@ -333,8 +345,10 @@ def test_text_list_tomorrow_rule_routes_to_runtime_without_inbox_enqueue(monkeyp
     telegram_bot._handle_text_message(update_id=3002, message=message, pending_state={})
 
     assert runtime_calls
-    assert runtime_calls[0][0] == "tasks.list_tomorrow"
-    assert runtime_calls[0][1] == {}
+    assert runtime_calls[0][0] == "/runtime/command"
+    assert runtime_calls[0][1]["command"]["intent"] == "tasks.list_tomorrow"
+    assert runtime_calls[0][1]["command"]["intent"] != "task.create"
+    assert runtime_calls[0][1]["command"]["entities"] == {}
     assert sent == ["Список пуст."]
 
 

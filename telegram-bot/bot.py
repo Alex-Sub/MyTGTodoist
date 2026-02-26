@@ -2125,11 +2125,20 @@ def _handle_text_message(update_id: int, message: dict, pending_state: dict[int,
 
     list_intent = _detect_list_intent_from_text(text_msg)
     if list_intent:
-        payload = _worker_runtime_command(list_intent, {})
-        if isinstance(payload, dict):
-            _send_message(chat_id, _format_runtime_reply(payload))
+        runtime_payload = {
+            "trace_id": f"tg:{int(time.time() * 1000)}:{list_intent}",
+            "source": "telegram-bot",
+            "command": {
+                "intent": list_intent,
+                "entities": {},
+            },
+        }
+        ok, data, status, err_text = _worker_post_ex("/runtime/command", runtime_payload)
+        if ok and isinstance(data, dict):
+            _send_message(chat_id, _format_runtime_reply(data))
         else:
-            _send_message(chat_id, "Не получилось получить список. Попробуйте ещё раз.")
+            log.warning("event=list_intent_runtime_failed intent=%s status=%s err=%s", list_intent, status, (err_text or "")[:200])
+            _send_message(chat_id, "Ошибка выполнения команды.")
         return
 
     depth_new, depth_total = _queue_depths()
