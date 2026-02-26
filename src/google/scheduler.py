@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -9,10 +10,15 @@ from loguru import logger
 from sqlalchemy import func, select
 
 from src.config import settings
-from src.db.models import Conflict, Item
+from src.db.models import CalendarSyncState, Conflict, Item, SyncOutbox
 from src.db.session import get_session
 from src.exports.vitrina_tasks import build_vitrina
-from src.google.google_sync import pull_google_tasks_with_conflicts
+from src.google.google_sync import (
+    pull_google_tasks_with_conflicts,
+    sync_task_completed,
+    sync_task_created,
+    sync_task_updated,
+)
 from src.google.sheets_client import SheetsClient
 from src.google.sheet_pull import pull_google_sheet_apply_rows
 from src.google.sync_in import sync_in_calendar_window
@@ -20,6 +26,9 @@ from src.google.sync_out import sync_out_meeting
 
 _lock = asyncio.Lock()
 _tabs_ensured = False
+_SYNC_STATE_KEY = "__global_sync_policy__"
+_OUTBOX_BATCH_SIZE = 50
+_OUTBOX_BASE_BACKOFF_SEC = 30
 _last_calendar_pull_at: datetime | None = None
 _last_tasks_pull_at: datetime | None = None
 _last_sheets_pull_at: datetime | None = None
@@ -37,52 +46,62 @@ def _fmt_dt(value: datetime | None) -> str:
     return value.isoformat() if value is not None else ""
 
 
+def _get_sync_state(session) -> CalendarSyncState:
+    state = session.scalar(select(CalendarSyncState).where(CalendarSyncState.calendar_id == _SYNC_STATE_KEY))
+    if state is not None:
+        return state
+    state = CalendarSyncState(calendar_id=_SYNC_STATE_KEY)
+    session.add(state)
+    session.flush()
+    return state
+
+
+def _current_poll_interval() -> int:
+    now = _utc_now()
+    with get_session() as session:
+        state = _get_sync_state(session)
+        active_until = state.active_until
+        if active_until is not None:
+            if active_until.tzinfo is None:
+                active_until = active_until.replace(tzinfo=timezone.utc)
+            else:
+                active_until = active_until.astimezone(timezone.utc)
+        if active_until is not None and now < active_until:
+            return max(5, int(settings.sync_poll_active_sec))
+    return max(30, int(settings.sync_poll_idle_sec))
+
+
 async def run_calendar_scheduler() -> None:
-    in_interval = max(30, int(settings.sync_in_interval_sec))
-    out_interval = max(30, int(settings.sync_out_interval_sec))
-    tasks_pull_interval = max(30, int(settings.google_tasks_pull_interval_sec))
-    sheets_pull_interval = max(30, int(settings.google_sheets_pull_interval_sec))
     vitrina_interval = max(60, int(settings.google_vitrina_refresh_interval_sec))
     logger.info(
-        "calendar sync scheduler started (in={}s, out={}s, tasks_pull={}s, sheets_pull={}s, vitrina={}s)",
-        in_interval,
-        out_interval,
-        tasks_pull_interval,
-        sheets_pull_interval,
+        "calendar sync scheduler started (active_window_min={} active_poll={}s idle_poll={}s vitrina={}s)",
+        int(settings.sync_active_window_min),
+        int(settings.sync_poll_active_sec),
+        int(settings.sync_poll_idle_sec),
         vitrina_interval,
     )
 
     await _ensure_sheets_tabs_once()
-    next_in = 0.0
-    next_out = 0.0
-    next_tasks_pull = 0.0
-    next_sheets_pull = 0.0
     next_vitrina = 0.0
     loop = asyncio.get_running_loop()
 
     while True:
         now = loop.time()
-        if settings.sync_in_enabled and now >= next_in:
-            next_in = now + in_interval
+        # Poll tick always checks pull sources.
+        if settings.sync_in_enabled:
             await _run_pull()
-
-        if settings.sync_out_enabled and now >= next_out:
-            next_out = now + out_interval
-            await _run_push()
-
-        if now >= next_tasks_pull:
-            next_tasks_pull = now + tasks_pull_interval
-            await _run_tasks_pull()
-
-        if settings.google_sheets_spreadsheet_id and now >= next_sheets_pull:
-            next_sheets_pull = now + sheets_pull_interval
+        await _run_tasks_pull()
+        if settings.google_sheets_spreadsheet_id:
             await _run_sheets_pull()
+        if settings.sync_out_enabled:
+            await _run_outbox_processor()
 
         if settings.google_sheets_spreadsheet_id and now >= next_vitrina:
             next_vitrina = now + vitrina_interval
             await _run_vitrina_refresh()
-
-        await asyncio.sleep(1)
+        interval = _current_poll_interval()
+        logger.debug("sync_poll_sleep_sec={} mode={}", interval, "active" if interval == int(settings.sync_poll_active_sec) else "idle")
+        await asyncio.sleep(interval)
 
 
 async def _run_pull() -> None:
@@ -121,35 +140,70 @@ async def _run_pull() -> None:
         logger.error("auto pull error: {}", exc)
 
 
-async def _run_push() -> None:
-    stats = {"processed": 0, "created": 0, "updated": 0, "cancelled": 0, "errors": 0}
+def _outbox_backoff_sec(attempts: int) -> int:
+    tries = max(1, int(attempts))
+    value = int(_OUTBOX_BASE_BACKOFF_SEC * (2 ** (tries - 1)))
+    cap = max(int(settings.sync_poll_idle_sec), _OUTBOX_BASE_BACKOFF_SEC)
+    return min(value, cap)
+
+
+def _process_outbox_item(session, row: SyncOutbox) -> None:
+    item = session.get(Item, row.entity_id)
+    if item is None:
+        row.processed_at = _utc_now()
+        row.last_error = "item_not_found"
+        return
+    if item.type == "meeting":
+        sync_out_meeting(session, item.id)
+        return
+    if item.status == "done":
+        sync_task_completed(session, item.id)
+        return
+    if item.google_task_id:
+        sync_task_updated(session, item.id)
+        return
+    sync_task_created(session, item.id)
+
+
+async def _run_outbox_processor() -> None:
+    stats = {"processed": 0, "success": 0, "failed": 0}
     try:
         async with _lock:
-            logger.info("auto push start")
+            logger.info("outbox push start")
+            now = _utc_now()
             with get_session() as session:
-                items = list(
+                rows = list(
                     session.scalars(
-                        select(Item)
-                        .where(Item.type == "meeting", Item.sync_state == "dirty")
+                        select(SyncOutbox).where(
+                            SyncOutbox.processed_at.is_(None),
+                            ((SyncOutbox.next_retry_at.is_(None)) | (SyncOutbox.next_retry_at <= now)),
+                        ).order_by(SyncOutbox.created_at.asc()).limit(_OUTBOX_BATCH_SIZE)
                     ).all()
                 )
-                for item in items:
+                for row in rows:
                     stats["processed"] += 1
                     try:
-                        before_event = item.event_id
-                        before_status = item.status
-                        sync_out_meeting(session, item.id)
-                        if before_status == "canceled":
-                            stats["cancelled"] += 1
-                        elif before_event:
-                            stats["updated"] += 1
-                        else:
-                            stats["created"] += 1
-                    except Exception:
-                        stats["errors"] += 1
-            logger.info("auto push done stats={}", stats)
+                        _process_outbox_item(session, row)
+                        row.processed_at = _utc_now()
+                        row.last_error = None
+                        row.next_retry_at = None
+                        stats["success"] += 1
+                    except Exception as exc:
+                        row.attempts = int(row.attempts or 0) + 1
+                        row.last_error = str(exc)[:500]
+                        row.next_retry_at = _utc_now() + timedelta(seconds=_outbox_backoff_sec(int(row.attempts)))
+                        row.payload_json = json.dumps(
+                            {
+                                "entity_type": row.entity_type,
+                                "entity_id": row.entity_id,
+                                "operation": row.operation,
+                            },
+                            ensure_ascii=False,
+                        )
+                        stats["failed"] += 1
+            logger.info("outbox push done stats={}", stats)
     except Exception as exc:
-        logger.error("auto push error: {}", exc)
+        logger.error("outbox push error: {}", exc)
 
 
 async def _run_tasks_pull() -> None:

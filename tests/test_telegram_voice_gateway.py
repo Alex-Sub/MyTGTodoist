@@ -100,3 +100,205 @@ def test_handle_voice_invalid_json_returns_later_message(monkeypatch) -> None:
     message = {"chat": {"id": 42}, "voice": {"file_id": "f1"}, "message_id": 7}
     telegram_bot._handle_voice_message(update_id=1002, message=message)
     assert sent == ["Я сейчас не могу корректно обработать запрос. Давай попробуем позже."]
+
+
+def test_handle_voice_clarify_creates_pending_and_asks_question(monkeypatch) -> None:
+    sent: list[tuple[int, str, dict]] = []
+    stored: dict[str, object] = {}
+    monkeypatch.setattr(telegram_bot, "_tg_get_file_path", lambda _file_id: "voice/file.ogg")
+    monkeypatch.setattr(telegram_bot, "_tg_download_file", lambda _path: (b"abc", "voice.ogg", "audio/ogg"))
+    monkeypatch.setattr(
+        telegram_bot,
+        "_ml_gateway_voice_command",
+        lambda _audio, **_kwargs: (
+            {
+                "type": "clarify",
+                "clarifying_question": "Что выбрать: создать блок времени или создать задачу?",
+                "choices": [
+                    {
+                        "id": "timeblock_create",
+                        "title": "Поставить блок времени",
+                        "patch": {"command": {"intent": "timeblock.create"}},
+                    },
+                    {
+                        "id": "task_create",
+                        "title": "Создать задачу",
+                        "patch": {"command": {"intent": "task.create"}},
+                    },
+                ],
+                "draft_envelope": {
+                    "trace_id": "tr-1",
+                    "source": {"channel": "telegram_voice"},
+                    "command": {"intent": "task.create", "entities": {"title": "Созвон завтра"}},
+                },
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(telegram_bot, "_pending_clarify_put", lambda uid, payload: stored.update({"uid": uid, "payload": payload}))
+    monkeypatch.setattr(
+        telegram_bot,
+        "_send_message_with_keyboard",
+        lambda chat_id, text, reply_markup: sent.append((chat_id, text, reply_markup)),
+    )
+    monkeypatch.setattr(telegram_bot, "_worker_post_ex", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("runtime must not be called")))
+
+    message = {"chat": {"id": 42}, "from": {"id": 4242}, "voice": {"file_id": "f1"}, "message_id": 7}
+    telegram_bot._handle_voice_message(update_id=1101, message=message)
+
+    assert stored.get("uid") == 4242
+    pending = stored.get("payload")
+    assert isinstance(pending, dict)
+    assert pending.get("clarifying_question") == "Что выбрать: создать блок времени или создать задачу?"
+    assert sent
+    assert sent[0][0] == 42
+    assert sent[0][1] == "Что выбрать: создать блок времени или создать задачу?"
+
+
+def test_pending_text_choice_applies_patch_and_routes_to_runtime(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(telegram_bot, "PENDING_CLARIFY_PATH", str(tmp_path / "pending.json"))
+    telegram_bot._pending_clarify_state = {
+        "99": {
+            "pending_id": "p-1",
+            "trace_id": "tr-99",
+            "channel": "telegram_voice",
+            "user_id": "99",
+            "created_at": "2026-02-26T00:00:00Z",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "clarifying_question": "Что выбрать?",
+            "choices": [
+                {"id": "timeblock_create", "title": "Поставить блок времени", "patch": {"command": {"intent": "timeblock.create"}}},
+                {"id": "task_create", "title": "Создать задачу", "patch": {"command": {"intent": "task.create"}}},
+            ],
+            "draft_envelope": {
+                "trace_id": "tr-99",
+                "source": {"channel": "telegram_voice"},
+                "command": {"intent": "task.create", "entities": {"title": "Созвон завтра"}},
+            },
+            "stage": "llm_disambiguation",
+        }
+    }
+    posted: list[dict] = []
+    sent: list[str] = []
+    monkeypatch.setattr(telegram_bot, "_queue_depths", lambda: (0, 0))
+    monkeypatch.setattr(telegram_bot, "_enqueue_text", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not enqueue while pending exists")))
+    monkeypatch.setattr(telegram_bot, "_p2_handle_text", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("p2 flow must not run while pending exists")))
+    monkeypatch.setattr(
+        telegram_bot,
+        "_worker_post_ex",
+        lambda path, payload: (posted.append({"path": path, "payload": payload}) or True, {"ok": True, "user_message": "OK"}, 200, None),
+    )
+    monkeypatch.setattr(telegram_bot, "_send_message", lambda _chat_id, text: sent.append(text))
+
+    message = {"chat": {"id": 99}, "from": {"id": 99}, "message_id": 5, "text": "блок"}
+    telegram_bot._handle_text_message(update_id=2001, message=message, pending_state={})
+
+    assert posted
+    assert posted[0]["path"] == "/runtime/command"
+    assert posted[0]["payload"]["command"]["intent"] == "timeblock.create"
+    assert "source_msg_id" in posted[0]["payload"]["command"]["entities"]
+    assert "99" not in telegram_bot._pending_clarify_state
+    assert sent == ["OK"]
+
+
+def test_expired_pending_is_pruned_and_message_goes_to_normal_flow(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(telegram_bot, "PENDING_CLARIFY_PATH", str(tmp_path / "pending.json"))
+    telegram_bot._pending_clarify_state = {
+        "77": {
+            "pending_id": "p-expired",
+            "trace_id": "tr-77",
+            "channel": "telegram_text",
+            "user_id": "77",
+            "created_at": "2020-01-01T00:00:00Z",
+            "expires_at": "2020-01-01T00:00:01Z",
+            "clarifying_question": "Выбор?",
+            "choices": [{"id": "task_create", "title": "Создать задачу", "patch": {"command": {"intent": "task.create"}}}],
+            "draft_envelope": None,
+            "stage": "llm_disambiguation",
+        }
+    }
+    enq_calls: list[dict] = []
+    sent: list[str] = []
+    monkeypatch.setattr(telegram_bot, "_queue_depths", lambda: (0, 0))
+    monkeypatch.setattr(
+        telegram_bot,
+        "_enqueue_text",
+        lambda **kwargs: (enq_calls.append(kwargs) or True, 1),
+    )
+    monkeypatch.setattr(telegram_bot, "_p2_handle_text", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(telegram_bot, "_send_message", lambda _chat_id, text: sent.append(text))
+
+    message = {"chat": {"id": 77}, "from": {"id": 77}, "message_id": 11, "text": "купи молоко"}
+    telegram_bot._handle_text_message(update_id=2002, message=message, pending_state={})
+
+    assert enq_calls
+    assert sent == ["Принято. В очереди: 1."]
+    assert "77" not in telegram_bot._pending_clarify_state
+
+
+def test_pending_unknown_text_replies_choose_one(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(telegram_bot, "PENDING_CLARIFY_PATH", str(tmp_path / "pending.json"))
+    telegram_bot._pending_clarify_state = {
+        "55": {
+            "pending_id": "p-55",
+            "trace_id": "tr-55",
+            "channel": "telegram_text",
+            "user_id": "55",
+            "created_at": "2026-02-26T00:00:00Z",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "clarifying_question": "Что выбрать?",
+            "choices": [
+                {"id": "task_create", "title": "Создать задачу", "patch": {"command": {"intent": "task.create"}}},
+                {"id": "timeblock_create", "title": "Поставить блок времени", "patch": {"command": {"intent": "timeblock.create"}}},
+            ],
+            "draft_envelope": None,
+            "stage": "llm_disambiguation",
+        }
+    }
+    sent_kb: list[tuple[int, str, dict]] = []
+    monkeypatch.setattr(telegram_bot, "_send_message_with_keyboard", lambda chat_id, text, reply_markup: sent_kb.append((chat_id, text, reply_markup)))
+    monkeypatch.setattr(telegram_bot, "_queue_depths", lambda: (_ for _ in ()).throw(AssertionError("must not enqueue")))
+    monkeypatch.setattr(telegram_bot, "_worker_post_ex", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("runtime must not be called")))
+
+    message = {"chat": {"id": 55}, "from": {"id": 55}, "message_id": 9, "text": "что?"}
+    telegram_bot._handle_text_message(update_id=2003, message=message, pending_state={})
+
+    assert sent_kb
+    assert sent_kb[0][1] == "Не понял выбор. Пожалуйста, выберите один из вариантов:"
+    assert "55" in telegram_bot._pending_clarify_state
+
+
+def test_format_runtime_reply_renders_tasks_list() -> None:
+    payload = {
+        "ok": True,
+        "user_message": "Список задач на завтра готов.",
+        "debug": {
+            "tasks": [
+                {
+                    "id": 10,
+                    "title": "Подготовить встречу",
+                    "planned_at": "2026-02-27T09:00:00+03:00",
+                    "status": "IN_PROGRESS",
+                    "parent_id": None,
+                    "level": 0,
+                },
+                {
+                    "id": 11,
+                    "title": "Сделать отчёт",
+                    "planned_at": None,
+                    "status": "NEW",
+                    "parent_id": 10,
+                    "level": 1,
+                },
+            ]
+        },
+    }
+    text = telegram_bot._format_runtime_reply(payload)
+    assert "1. #10 Подготовить встречу" in text
+    assert "2. #11 Сделать отчёт" in text
+
+
+def test_format_runtime_reply_empty_tasks_returns_list_empty() -> None:
+    payload = {"ok": True, "user_message": "Список активных задач готов.", "debug": {"tasks": []}}
+    text = telegram_bot._format_runtime_reply(payload)
+    assert text == "Список пуст."

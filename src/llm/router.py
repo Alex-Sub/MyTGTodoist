@@ -6,9 +6,11 @@ import os
 import sys
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
+import yaml
 
 try:
     import jsonschema
@@ -72,6 +74,12 @@ ASSISTANT_STRICT_JSON_PROMPT = (
     "Отвечай ТОЛЬКО на русском языке."
 )
 
+SUPPORTED_INTENTS = {"task_create", "timeblock_create"}
+INTENT_CHOICE_LABELS = {
+    "timeblock_create": "создать блок времени",
+    "task_create": "создать задачу",
+}
+
 
 @dataclass(slots=True)
 class LLMRequest:
@@ -89,6 +97,16 @@ class LLMResult:
     raw_text: str
     validation_ok: bool
     error: Optional[str]
+
+
+@dataclass(slots=True)
+class InterpretationResult:
+    type: str  # "command" | "clarify"
+    command: Optional[dict[str, Any]] = None
+    question: Optional[str] = None
+    choices: Optional[list[dict[str, str]]] = None
+    expected_answer: Optional[str] = None
+    debug: Optional[dict[str, Any]] = None
 
 
 class OpenRouterProvider:
@@ -130,10 +148,36 @@ def _examples_path() -> str:
     return os.path.abspath(os.path.join(here, "..", "..", "prompts", "command_examples.json"))
 
 
+def _canon_path() -> Path:
+    here = Path(__file__).resolve()
+    return here.parents[2] / "canon" / "intents_v2.yml"
+
+
 def _load_schema() -> dict[str, Any]:
     path = _schema_path()
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+@lru_cache(maxsize=1)
+def _load_intent_registry() -> dict[str, str]:
+    with _canon_path().open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    intents = data.get("intents") if isinstance(data, dict) else {}
+    if not isinstance(intents, dict):
+        return {}
+    out: dict[str, str] = {}
+    for raw_name, spec in intents.items():
+        if not isinstance(raw_name, str):
+            continue
+        name = raw_name.strip().replace(".", "_")
+        if name not in SUPPORTED_INTENTS:
+            continue
+        meaning = ""
+        if isinstance(spec, dict):
+            meaning = str(spec.get("meaning") or "").strip()
+        out[name] = meaning or INTENT_CHOICE_LABELS.get(name, name)
+    return out
 
 
 @lru_cache(maxsize=1)
@@ -151,6 +195,20 @@ def _build_user_text(text: str, now_iso: Optional[str]) -> str:
     if now_iso:
         return f"CURRENT_DATETIME (now_iso): {now_iso}\n\nASR_TEXT:\n{text}"
     return text
+
+
+def _build_command_system_prompt() -> str:
+    registry = _load_intent_registry()
+    lines = []
+    for name in sorted(registry.keys()):
+        lines.append(f"- {name}: {registry[name]}")
+    registry_block = "\n".join(lines) if lines else "- task_create\n- timeblock_create"
+    return (
+        COMMAND_SYSTEM_PROMPT
+        + "\nAllowed intents (must use only these):\n"
+        + registry_block
+        + "\nIf request is ambiguous between task and timeblock, set intent=unknown and needs_clarification=true."
+    )
 
 
 def _validate_payload(payload: dict[str, Any]) -> tuple[bool, Optional[str]]:
@@ -175,10 +233,99 @@ def _parse_json(text: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
         return None, str(exc)
 
 
+def _normalize_command_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    # Canonical intent unification for runtime-supported names.
+    intent_raw = str(payload.get("intent") or "").strip().lower()
+    if intent_raw == "create_event":
+        payload["intent"] = "timeblock_create"
+    if intent_raw == "meeting_create":
+        payload["intent"] = "timeblock_create"
+    return payload
+
+
+def _canonical_intent_name(intent: str) -> str:
+    raw = (intent or "").strip().lower()
+    aliases = {
+        "create_task": "task_create",
+        "task_create": "task_create",
+        "create_event": "timeblock_create",
+        "meeting_create": "timeblock_create",
+        "timeblock_create": "timeblock_create",
+    }
+    return aliases.get(raw, raw)
+
+
+def _is_ambiguous_task_or_timeblock(text: str) -> bool:
+    s = (text or "").lower()
+    has_meeting = any(k in s for k in ("созвон", "встреч", "собран", "appointment"))
+    has_duration = any(k in s for k in ("мин", "час", "minutes", "hours"))
+    return has_meeting and not has_duration
+
+
+def _clarify_task_or_timeblock(question: str, reason: str) -> InterpretationResult:
+    return InterpretationResult(
+        type="clarify",
+        question=question,
+        choices=[
+            {"id": "timeblock_create", "label": INTENT_CHOICE_LABELS["timeblock_create"]},
+            {"id": "task_create", "label": INTENT_CHOICE_LABELS["task_create"]},
+        ],
+        expected_answer="choice_id",
+        debug={"reason": reason},
+    )
+
+
+def _extract_args(intent: str, entities: dict[str, Any]) -> dict[str, Any]:
+    if intent == "task_create":
+        title = (
+            entities.get("title")
+            or entities.get("task_title")
+            or entities.get("root_title")
+            or entities.get("text")
+        )
+        planned_at = entities.get("planned_at") or entities.get("when") or entities.get("due_iso")
+        out = {"title": title}
+        if planned_at is not None:
+            out["planned_at"] = planned_at
+        return out
+    if intent == "timeblock_create":
+        title = entities.get("title") or entities.get("task_title")
+        start_at = entities.get("start_at") or entities.get("start_iso") or entities.get("when")
+        duration = entities.get("duration_minutes")
+        if duration is None:
+            duration = entities.get("duration_min")
+        out = {"title": title, "start_at": start_at, "duration_minutes": duration}
+        end_at = entities.get("end_at") or entities.get("end_iso")
+        if end_at is not None:
+            out["end_at"] = end_at
+        return out
+    return {}
+
+
+def interpret(text: str, *, now_iso: Optional[str] = None) -> InterpretationResult:
+    req = LLMRequest(kind="text_command", text=text, now_iso=now_iso)
+    llm_result = route_llm(req)
+    if not llm_result.validation_ok or not isinstance(llm_result.payload, dict):
+        return _clarify_task_or_timeblock("Уточните, что нужно сделать?", "invalid_llm_payload")
+    payload = llm_result.payload
+    intent = _canonical_intent_name(str(payload.get("intent") or ""))
+    entities = payload.get("entities")
+    entities = entities if isinstance(entities, dict) else {}
+    if _is_ambiguous_task_or_timeblock(text):
+        return _clarify_task_or_timeblock("Что выбрать: создать блок времени или создать задачу?", "ambiguous_intent")
+    if intent not in _load_intent_registry():
+        return _clarify_task_or_timeblock("Что выбрать: создать блок времени или создать задачу?", "unsupported_intent")
+    return InterpretationResult(
+        type="command",
+        command={"intent": intent, "args": _extract_args(intent, entities)},
+        debug={"source_intent": intent},
+    )
+
+
 def route_llm(request: LLMRequest) -> LLMResult:
     if request.kind in COMMAND_KINDS:
         agent = "command_parser"
-        system_prompt = COMMAND_SYSTEM_PROMPT
+        system_prompt = _build_command_system_prompt()
         model = os.getenv("OPENROUTER_MODEL_COMMANDS", "openrouter/free")
     elif request.kind == ASSISTANT_KIND:
         agent = "assistant_planner"
@@ -210,6 +357,7 @@ def route_llm(request: LLMRequest) -> LLMResult:
     if agent == "command_parser":
         payload, error = _parse_json(raw_text)
         if payload is not None:
+            payload = _normalize_command_payload(payload)
             validation_ok, error = _validate_payload(payload)
         else:
             validation_ok = False
@@ -222,6 +370,7 @@ def route_llm(request: LLMRequest) -> LLMResult:
             raw_text = provider.chat(retry_messages, model)
             payload, error = _parse_json(raw_text)
             if payload is not None:
+                payload = _normalize_command_payload(payload)
                 validation_ok, error = _validate_payload(payload)
             else:
                 validation_ok = False

@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.config import settings
-from src.db.models import CalendarSyncState, Item, ItemEvent, Project
+from src.db.models import CalendarSyncState, Conflict, Item, ItemEvent, Project
 from src.db.repositories.items_repo import create_item
 from src.google.calendar_client import CalendarClient
 
@@ -275,6 +275,26 @@ def _process_event(session: Session, calendar_id: str, event: dict, stats: dict,
     if item:
         if item.sync_state == "dirty" and item.g_updated and updated and updated > item.g_updated:
             item.sync_state = "conflict"
+            session.add(
+                Conflict(
+                    item_id=item.id,
+                    source="google_calendar_pull",
+                    field_name="event",
+                    local_value=item.title,
+                    remote_value=summary,
+                    remote_patch_json=json.dumps(
+                        {
+                            "title": summary,
+                            "description": description,
+                            "scheduled_at": start_dt.isoformat(),
+                            "duration_min": duration_min,
+                            "event_id": event_id,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    status="open",
+                )
+            )
             _log_event(
                 session,
                 item.id,

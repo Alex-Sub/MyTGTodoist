@@ -8,6 +8,7 @@
 - M2: Устойчивый voice pipeline через ML Gateway без format-related инцидентов.
 - M3: Прозрачная управленческая аналитика по cycles/goals/tasks (digest + витрины).
 - M4: Операционная зрелость: repeatable deploy/runbook без ручных отклонений.
+- M5: Runtime stabilization & unknown-intent hardening.
 
 ## 3) Текущий спринт
 - [ ] Закрыть период наблюдения 7 дней без критических рестартов.
@@ -31,3 +32,6 @@
 - Product analytics по эффективности cycle/goals.
 - Web UX адаптер поверх текущего runtime API.
 - Автоматический weekly management report из digest и goal metrics.
+
+## 7) Completed
+- [x] Intent alignment: `create_event` removed from canonical ML output; meeting/sobranie mapped to `timeblock_create`.

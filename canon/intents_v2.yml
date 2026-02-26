@@ -159,14 +159,14 @@ intents:
     required_any:
       - "entities.task_id"
       - "entities.task_ref"
-    required: ["entities.start_at", "entities.duration_min"]
+    required: ["entities.start_at", "entities.duration_minutes|entities.duration_min"]
     question_priority:
       - if_missing: "entities.task_id|entities.task_ref"
         ask: "Для какой задачи создать блок времени?"
+      - if_missing: "entities.duration_minutes|entities.duration_min"
+        ask: "На сколько минут поставить блок?"
       - if_missing: "entities.start_at"
         ask: "На какое время поставить блок?"
-      - if_missing: "entities.duration_min"
-        ask: "На сколько минут поставить блок?"
     disambiguation:
       ref: "entities.task_ref"
       question_fallback: "Для какой именно задачи создать блок времени?"

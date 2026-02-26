@@ -27,7 +27,18 @@
   - `POST ${ML_CORE_URL}/voice-command?profile=organizer`
 - Формат отправки: `multipart/form-data`, поле `file`.
 - Временной контекст передаётся заголовком `X-Timezone`.
+- `X-Timezone` берётся из env `APP_TIMEZONE` (fallback: `TIMEZONE`, default: `Europe/Moscow`).
+- Для production canonical значение: `Europe/Moscow`.
 - Relative date/time resolution выполняется в ML Gateway (не в Telegram adapter).
+
+## Reverse Tunnel Contract (VPS <-> VM)
+- ML-Gateway запущен на VM (порт `9000`).
+- Reverse SSH tunnel поднимается из VM в VPS:
+  - `ssh -R 127.0.0.1:19000:127.0.0.1:9000 ...`
+- На VPS контейнеры обращаются к ML через:
+  - `ML_CORE_URL=http://host.docker.internal:19000`
+- Проверка канала:
+  - `GET http://127.0.0.1:19000/health` на VPS должен возвращать `ok=true`.
 
 ## API Adapter Canon
 - `organizer-api` только read-only, state-mutation запрещён.

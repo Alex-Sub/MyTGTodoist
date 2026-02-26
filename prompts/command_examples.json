@@ -32,7 +32,7 @@
   },
   {
     "role": "assistant",
-    "content": "{\"intent\":\"create_event\",\"confidence\":0.85,\"text_original\":\"поставь встречу с Петром завтра в 11 на час\",\"text_normalized\":\"создать событие: встреча с Петром; завтра 11:00–12:00\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"title\":\"Встреча с Петром\",\"start_iso\":\"2026-02-09T11:00:00+03:00\",\"end_iso\":\"2026-02-09T12:00:00+03:00\",\"location\":null,\"attendees\":[\"Пётр\"],\"notes\":null},\"needs_clarification\":false,\"clarifying_question\":null,\"notes\":null}"
+    "content": "{\"intent\":\"timeblock_create\",\"confidence\":0.85,\"text_original\":\"поставь встречу с Петром завтра в 11 на час\",\"text_normalized\":\"создать блок времени: встреча с Петром; завтра 11:00; 60 минут\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"title\":\"Встреча с Петром\",\"start_at\":\"2026-02-09T11:00:00+03:00\",\"duration_minutes\":60,\"location\":null,\"attendees\":[\"Пётр\"],\"notes\":null},\"needs_clarification\":false,\"clarifying_question\":null,\"notes\":null}"
   },
 
   {
@@ -41,7 +41,7 @@
   },
   {
     "role": "assistant",
-    "content": "{\"intent\":\"create_event\",\"confidence\":0.8,\"text_original\":\"встреча с клиентом в четверг в 15:30 в офисе\",\"text_normalized\":\"создать событие: встреча с клиентом; четверг 15:30; место: офис\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"title\":\"Встреча с клиентом\",\"start_iso\":\"2026-02-12T15:30:00+03:00\",\"end_iso\":null,\"location\":\"Офис\",\"attendees\":[],\"notes\":null},\"needs_clarification\":false,\"clarifying_question\":null,\"notes\":\"Длительность не указана\"}"
+    "content": "{\"intent\":\"timeblock_create\",\"confidence\":0.8,\"text_original\":\"встреча с клиентом в четверг в 15:30 в офисе\",\"text_normalized\":\"создать блок времени: встреча с клиентом; четверг 15:30; место: офис\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"title\":\"Встреча с клиентом\",\"start_at\":\"2026-02-12T15:30:00+03:00\",\"duration_minutes\":null,\"location\":\"Офис\",\"attendees\":[],\"notes\":null},\"needs_clarification\":true,\"clarifying_question\":\"На сколько минут поставить блок?\",\"notes\":\"Длительность не указана\"}"
   },
 
   {
@@ -122,7 +122,7 @@
   },
   {
     "role": "assistant",
-    "content": "{\"intent\":\"create_event\",\"confidence\":0.45,\"text_original\":\"запланируй встречу завтра\",\"text_normalized\":\"создать событие: встреча; завтра\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"title\":\"Встреча\",\"start_iso\":\"2026-02-09T09:00:00+03:00\",\"end_iso\":null,\"location\":null,\"attendees\":[],\"notes\":null},\"needs_clarification\":true,\"clarifying_question\":\"Во сколько завтра и какая длительность встречи?\",\"notes\":\"Время не указано\"}"
+    "content": "{\"intent\":\"timeblock_create\",\"confidence\":0.45,\"text_original\":\"запланируй встречу завтра\",\"text_normalized\":\"создать блок времени: встреча; завтра\",\"datetime_context\":{\"now_iso\":\"2026-02-08T12:00:00+03:00\",\"timezone\":\"Europe/Moscow\"},\"entities\":{\"title\":\"Встреча\",\"start_at\":\"2026-02-09T09:00:00+03:00\",\"duration_minutes\":null,\"location\":null,\"attendees\":[],\"notes\":null},\"needs_clarification\":true,\"clarifying_question\":\"На сколько минут поставить блок?\",\"notes\":\"Длительность не указана\"}"
   },
 
   {

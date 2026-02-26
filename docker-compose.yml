@@ -6,6 +6,8 @@ services:
       - deploy/tenants/.env.alexey
     environment:
       DB_PATH: ${DB_PATH:-/data/organizer.db}
+      TZ: ${TZ:-Europe/Moscow}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
       LOCAL_TZ_OFFSET_MIN: ${LOCAL_TZ_OFFSET_MIN:-180}
       DT_MARKER_HOUR: ${DT_MARKER_HOUR:-6}
       DT_MARKER_MINUTE: ${DT_MARKER_MINUTE:-0}
@@ -32,6 +34,8 @@ services:
       - deploy/tenants/.env.alexey
     environment:
       DB_PATH: ${DB_PATH:-/data/organizer.db}
+      TZ: ${TZ:-Europe/Moscow}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
       GOOGLE_CALENDAR_ID: ${GOOGLE_CALENDAR_ID}
       GOOGLE_SERVICE_ACCOUNT_FILE: /data/google_sa.json
       TIMEZONE_NAME: ${TIMEZONE_NAME:-Europe/Moscow}
@@ -106,6 +110,8 @@ services:
       - deploy/tenants/.env.alexey
     environment:
       PYTHONUNBUFFERED: "1"
+      TZ: ${TZ:-Europe/Moscow}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       GOOGLE_CALENDAR_ID: ${GOOGLE_CALENDAR_ID}
       # ML gateway is external.

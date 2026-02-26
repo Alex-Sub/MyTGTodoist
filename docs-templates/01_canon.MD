@@ -1,84 +1,153 @@
-ML CONTRACT
+ML CONTRACT (ML -> Runtime)
 
-Версия: согласовано с ML-core v1.4
+Version: v2.2
 
-## 1) Главный принцип
+## 1) Core Principle
 
-ML понимает, Runtime исполняет.
+ML interprets natural language.
+Runtime validates and mutates state.
+Runtime does not guess missing business data.
 
-- ML-core отвечает за интерпретацию естественного языка.
-- Runtime отвечает за валидацию и изменение состояния.
-- Runtime не "додумывает" смысл, ML не выполняет команды.
+## 2) Inbox Semantics
 
-## 2) Формат входа в Runtime (CommandEnvelope)
+- Inbox is ONLY for generic task-like items when BOTH date and time are missing.
+- Inbox must not be used for explicit time-related intents.
+- Explicit time-related intent is: `timeblock_create`.
+- If a time-related intent has missing temporal fields, Runtime must return one `clarifying_question` and must not create an entity.
+
+## 2.1) Timezone Canon
+
+- Canonical system timezone: `Europe/Moscow`.
+- Telegram adapter sends `X-Timezone: Europe/Moscow` (via `APP_TIMEZONE`).
+- ML-Gateway resolves relative date/time using `now_iso` + `X-Timezone`.
+
+## 3) Input Contract (CommandEnvelope)
 
 ```json
 {
   "trace_id": "...",
-  "source": {...},
-  "text": {...},
+  "source": {"channel": "telegram_voice"},
   "command": {
-    "intent": "...",
+    "intent": "task_create|timeblock_create",
     "confidence": 0.0,
-    "entities": {...}
+    "entities": {
+      "title": "...",
+      "planned_at": "2026-02-26T10:00:00+03:00",
+      "start_at": "2026-02-26T10:00:00+03:00",
+      "end_at": "2026-02-26T11:00:00+03:00",
+      "duration_minutes": 60
+    }
   }
 }
 ```
 
-## 3) Обязанности ML-core
+## 4) Field Normalization Rules
 
-- Определить один intent.
-- Извлечь entities.
-- При неоднозначности передать candidates.
-- Не выбирать сам при низкой уверенности.
+- All entity fields use `snake_case`.
+- Empty strings (`""`, `"   "`) are treated as `null`.
+- Missing field and empty-string field are equivalent for validation.
+- Canonical temporal fields in this contract:
+  - `planned_at`
+  - `start_at`
+  - `end_at`
+  - `duration_minutes`
 
-Пример `task_ref`:
+## 5) One-Question Clarification Rule
 
-```json
-{
-  "query": "...",
-  "candidates": [...],
-  "chosen_id": null,
-  "ask": "..."
-}
-```
+- Runtime asks exactly one clarifying question per step.
+- Clarification follows intent-specific precedence.
+- Runtime must not execute an intent until required fields are present.
 
-Если `chosen_id` отсутствует, Runtime задаёт уточняющий вопрос.
+## 6) Intent: task_create
 
-## 4) Обязанности Runtime
+- Required:
+  - `title`
+- Optional:
+  - `planned_at` (or `due_date` if adapter uses due-date model)
+  - `duration_minutes`
+  - `tags`
+  - `priority`
+- Clarifying question:
+  - if `title` missing -> `"Как назвать задачу?"`
+  - if user provided partial temporal data -> ask one concrete missing part
+- Inbox behavior:
+  - allowed only when item is generic task and both date/time are missing
 
-- Проверить обязательные поля по `canon/intents_v2.yml`.
-- При нехватке данных вернуть один уточняющий вопрос.
-- При достаточных данных выполнить intent детерминированно.
-- Вернуть структурированный результат выполнения.
+### Examples (task_create)
 
-### Специальное правило для `timeblock.create`
+- User phrase: `"Создай задачу купить молоко"`
+  - expected_intent: `task_create`
+  - entities: `{ "title": "купить молоко" }`
+  - clarifying_question: `null`
 
-- Обязательные поля: `duration_min` + `start_at`.
-- Если `duration_min` есть, но `start_at` отсутствует, Runtime задаёт вопрос:
-  `"На какое время поставить блок?"`.
-- До получения `start_at` Runtime не создаёт сущность.
+- User phrase: `"Добавь задачу позвонить маме завтра"`
+  - expected_intent: `task_create`
+  - entities: `{ "title": "позвонить маме", "planned_at": "<resolved_datetime_or_date>" }`
+  - clarifying_question: `null`
 
-## 5) Поведение при неуверенности/отказе ML
+- User phrase: `"Создай задачу"`
+  - expected_intent: `task_create`
+  - entities: `{}`
+  - clarifying_question: `"Как назвать задачу?"`
 
-Пороги Runtime:
-- `CLARIFY_CONFIDENCE = 0.40`
-- `EXECUTE_CONFIDENCE = 0.75`
+- User phrase: `"Задача: подготовить отчет, в пятницу"`
+  - expected_intent: `task_create`
+  - entities: `{ "title": "подготовить отчет", "planned_at": "<resolved_datetime_or_date>" }`
+  - clarifying_question: `null`
 
-Decision rule:
-- Если `rejected=true` или `confidence < 0.40` -> safe-fail (без исполнения).
-- Если есть `candidates` и не передан `chosen_id` -> всегда clarification (с `choices`).
-- Если `0.40 <= confidence < 0.75` -> clarification (предпочесть уточнение, не исполнять).
-- Если `confidence >= 0.75` -> проверить required поля; при missing вернуть clarification.
-- Исполнение только при `confidence >= 0.75` и полном наборе required полей.
+## 7) Intent: timeblock_create
 
-При safe-fail Runtime не выполняет действие и возвращает безопасный ответ:
+- Required:
+  - `duration_minutes`
+  - `start_at`
+- Optional:
+  - `title`
+  - `end_at` (derived from `start_at + duration_minutes` if not provided)
+  - `calendar_id`
+- Clarifying question precedence (exactly one):
+  - if `duration_minutes` missing -> `"На сколько минут поставить блок?"`
+  - else if `start_at` missing -> `"На какое время поставить блок?"`
+- Execution rule:
+  - do not create anything until BOTH `duration_minutes` and `start_at` are present
+- Inbox behavior:
+  - never create in Inbox
 
-`"Не могу выполнить. Уточните запрос."`
+### Examples (timeblock_create)
 
-## 6) Формат ответа Runtime
+- User phrase: `"Поставь блок на завтра в 14:00 на 60 минут"`
+  - expected_intent: `timeblock_create`
+  - entities: `{ "start_at": "<resolved_datetime>", "duration_minutes": 60 }`
+  - clarifying_question: `null`
 
-Успех:
+- User phrase: `"Поставь блок"`
+  - expected_intent: `timeblock_create`
+  - entities: `{}`
+  - clarifying_question: `"На сколько минут поставить блок?"`
+
+- User phrase: `"Поставь блок на 60"`
+  - expected_intent: `timeblock_create`
+  - entities: `{ "duration_minutes": 60 }`
+  - clarifying_question: `"На какое время поставить блок?"`
+
+- User phrase: `"Поставь блок завтра в 9"`
+  - expected_intent: `timeblock_create`
+  - entities: `{ "start_at": "<resolved_datetime>" }`
+  - clarifying_question: `"На сколько минут поставить блок?"`
+
+- User phrase: `"Поставь блок на 60, время потом"`
+  - expected_intent: `timeblock_create`
+  - entities: `{ "duration_minutes": 60 }`
+  - clarifying_question: `"На какое время поставить блок?"`
+
+## 8) Meeting Phrase Mapping
+
+- Meeting-related phrases (`встреча`, `собрание`, `созвон`, `appointment`) must map to `timeblock_create`.
+- `create_event` is deprecated in ML output and must not be returned by ML-Gateway.
+- If an upstream LLM returns `create_event`, gateway normalization converts it to `timeblock_create` before response.
+
+## 9) Runtime Output Contract
+
+- Success:
 
 ```json
 {
@@ -87,29 +156,15 @@ Decision rule:
 }
 ```
 
-Уточнение:
+- Clarification:
 
 ```json
 {
   "ok": false,
   "clarifying_question": "...",
-  "choices": [...]
+  "choices": []
 }
 ```
 
-## VPS Production Routing
-
-- Голосовой endpoint ML: `/voice-command`.
-- VPS не обращается напрямую к ASR/LLM/REC сервисам.
-- Весь ML-трафик с VPS идёт только через ML-Gateway.
-- Для production обязателен reverse tunnel:
-- VPS `127.0.0.1:19000` -> local `127.0.0.1:9000`.
-- В контейнерах используется:
-- `ML_CORE_URL=http://host.docker.internal:19000`.
-- Reverse tunnel является обязательной runtime-зависимостью для ML-функций в production.
-
-## Clarification Contract (Runtime UX)
-
-- Runtime возвращает ровно один `clarifying_question` на шаг.
-- Если есть ambiguity candidates без `chosen_id`, Runtime всегда возвращает clarification (не execution).
-- Если есть варианты, Runtime добавляет `choices` (`id`, `label`) и не делает авто-выбор.
+- For `timeblock_create`, clarification is mandatory if required temporal fields are missing.
+- For `timeblock_create`, fallback-to-Inbox behavior is forbidden.

@@ -30,6 +30,12 @@
 - Не хранит бизнес-правила исполнения.
 - Для изменений состояния всегда обращается к Runtime.
 
+## Timezone (system-wide)
+
+- Системная таймзона во всех сервисах: `Europe/Moscow`.
+- Контейнеры получают `TZ=Europe/Moscow`.
+- Telegram adapter передаёт `X-Timezone` в ML Gateway из `APP_TIMEZONE` (fallback `TIMEZONE`), по умолчанию `Europe/Moscow`.
+
 ## 3) Обязательная ежедневная сводка (Daily Digest)
 
 Daily digest обязателен как ежедневный управленческий ритуал.
@@ -49,3 +55,26 @@ Daily digest обязателен как ежедневный управленч
 Пользователь -> Telegram UX -> ML-core -> Runtime -> БД -> API/ответ пользователю.
 
 Для handoff в новом чате используйте `HANDOFF.md` как единый источник операционного контекста.
+
+## 5) Подтверждённая прод-топология (final)
+
+```text
+VPS
+  - telegram-bot
+  - organizer-worker
+  - organizer-api
+  - reverse endpoint: 127.0.0.1:19000
+        ||
+        || reverse SSH tunnel (VM -> VPS)
+        \/
+VM
+  - ML-Gateway: 127.0.0.1:9000
+        ||
+        || local processing
+        \/
+  - ASR + ffmpeg normalization
+```
+
+Порты:
+- VM: `9000` (ML-Gateway)
+- VPS: `19000` (tunnel endpoint for ML traffic)

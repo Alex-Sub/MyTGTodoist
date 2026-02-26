@@ -272,3 +272,28 @@ def test_confidence_02_returns_safe_fail(runtime_db: Path) -> None:
     )
     assert res["ok"] is False
     assert res.get("debug", {}).get("reason") == "safe_fail"
+
+
+def test_unknown_intent_returns_clarify_and_never_writes_db(runtime_db: Path) -> None:
+    with sqlite3.connect(str(runtime_db)) as conn:
+        before_tasks = int(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
+        before_blocks = int(conn.execute("SELECT COUNT(*) FROM time_blocks").fetchone()[0])
+
+    res = handlers.dispatch_intent(
+        {
+            "intent": "meeting_create_unknown",
+            "entities": {"title": "Встреча", "start_at": "2026-02-18T10:00:00Z", "duration_minutes": 30},
+        }
+    )
+    assert res["ok"] is False
+    assert bool(res.get("clarifying_question"))
+    choices = res.get("choices")
+    assert isinstance(choices, list)
+    assert len(choices) >= 1
+
+    with sqlite3.connect(str(runtime_db)) as conn:
+        after_tasks = int(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
+        after_blocks = int(conn.execute("SELECT COUNT(*) FROM time_blocks").fetchone()[0])
+
+    assert after_tasks == before_tasks
+    assert after_blocks == before_blocks

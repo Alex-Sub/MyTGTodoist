@@ -829,7 +829,7 @@ def list_goals_at_risk(conn: sqlite3.Connection, *, today: str, limit: int = 20)
 def list_tasks_today(conn: sqlite3.Connection, *, today: str, limit: int = 50) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT id, title, planned_at, status, state, goal_id
+        SELECT id, title, planned_at, status, state, goal_id, parent_id, parent_type
         FROM tasks
         WHERE substr(COALESCE(planned_at,''), 1, 10) = ?
         ORDER BY planned_at ASC, id ASC
@@ -837,13 +837,13 @@ def list_tasks_today(conn: sqlite3.Connection, *, today: str, limit: int = 50) -
         """,
         (today, int(limit)),
     ).fetchall()
-    return [dict(r) for r in rows]
+    return _with_task_levels(conn, [dict(r) for r in rows])
 
 
 def list_tasks_tomorrow(conn: sqlite3.Connection, *, tomorrow: str, limit: int = 50) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT id, title, planned_at, status, state, goal_id
+        SELECT id, title, planned_at, status, state, goal_id, parent_id, parent_type
         FROM tasks
         WHERE substr(COALESCE(planned_at,''), 1, 10) = ?
         ORDER BY planned_at ASC, id ASC
@@ -851,13 +851,13 @@ def list_tasks_tomorrow(conn: sqlite3.Connection, *, tomorrow: str, limit: int =
         """,
         (tomorrow, int(limit)),
     ).fetchall()
-    return [dict(r) for r in rows]
+    return _with_task_levels(conn, [dict(r) for r in rows])
 
 
 def list_tasks_active(conn: sqlite3.Connection, *, limit: int = 100) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT id, title, planned_at, status, state, goal_id
+        SELECT id, title, planned_at, status, state, goal_id, parent_id, parent_type
         FROM tasks
         WHERE UPPER(COALESCE(status, '')) NOT IN ('DONE', 'ARCHIVED', 'CANCELED', 'CANCELLED')
         ORDER BY
@@ -868,7 +868,56 @@ def list_tasks_active(conn: sqlite3.Connection, *, limit: int = 100) -> list[dic
         """,
         (int(limit),),
     ).fetchall()
-    return [dict(r) for r in rows]
+    return _with_task_levels(conn, [dict(r) for r in rows])
+
+
+def _with_task_levels(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _safe_int(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    cache: dict[int, tuple[str | None, int | None]] = {}
+
+    def _task_parent(task_id: int) -> tuple[str | None, int | None]:
+        if task_id in cache:
+            return cache[task_id]
+        row = conn.execute(
+            "SELECT parent_type, parent_id FROM tasks WHERE id = ?",
+            (int(task_id),),
+        ).fetchone()
+        if row is None:
+            cache[task_id] = (None, None)
+            return cache[task_id]
+        ptype = str(row["parent_type"]).strip().lower() if row["parent_type"] is not None else None
+        pid = _safe_int(row["parent_id"])
+        cache[task_id] = (ptype, pid)
+        return cache[task_id]
+
+    out: list[dict[str, Any]] = []
+    for item in rows:
+        row = dict(item)
+        task_id = _safe_int(row.get("id"))
+        level = 0
+        seen: set[int] = set()
+        cur_id = task_id
+        for _ in range(4):
+            if cur_id is None or cur_id in seen:
+                break
+            seen.add(cur_id)
+            ptype, pid = _task_parent(cur_id)
+            if ptype != "task" or pid is None:
+                break
+            level += 1
+            cur_id = pid
+        row["parent_id"] = _safe_int(row.get("parent_id"))
+        row["level"] = min(level, 3)
+        row.pop("parent_type", None)
+        out.append(row)
+    return out
 
 
 def compute_daily_digest(conn: sqlite3.Connection, *, today: str, tomorrow: str, user_id: str) -> dict[str, int]:

@@ -21,7 +21,7 @@
         "update_task",
         "complete_task",
         "delete_task",
-        "create_event",
+        "timeblock_create",
         "update_event",
         "delete_event",
         "list_tasks",

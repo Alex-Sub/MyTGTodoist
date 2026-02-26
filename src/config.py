@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     sync_out_interval_sec: int = 60
     sync_window_days: int = 7
     sync_timezone: str | None = None
+    sync_active_window_min: int = 30
+    sync_poll_active_sec: int = 30
+    sync_poll_idle_sec: int = 21600
     google_task_sync_retry_enabled: bool = True
     google_task_sync_retry_interval_sec: int = 60
     google_tasks_pull_interval_sec: int = 120

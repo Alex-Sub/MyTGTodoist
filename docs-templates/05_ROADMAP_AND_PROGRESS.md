@@ -13,6 +13,7 @@
 - Calendar idempotency (`iCalUID`, reuse/update path).
 - Canon/migrations mounts нормализованы для prod.
 - Startup preflight и fail-fast проверки для Google SA JSON и calendar env.
+- Milestone: **ASR End-to-End Stable via Reverse Tunnel** (VM ML-Gateway -> VPS thin-runtime).
 
 ## 3) Открытые риски и ограничения
 - ML-функции зависят от активного reverse tunnel `127.0.0.1:19000 -> 127.0.0.1:9000`.
@@ -29,6 +30,11 @@
 - Проведена calendar/canon stabilization.
 - Зафиксирован production deploy baseline на `runtime-stable`.
 - Зафиксирован voice incident (`asr_unavailable status=415`) как документированный риск формата.
+
+### 2026-02-26
+- Decision: canonical timezone зафиксирована как `Europe/Moscow` (system-wide, включая `X-Timezone`).
+- Decision: `create_event` удалён из канонического ML intent output; temporal meetings мапятся в `timeblock_create`.
+- Decision: Inbox semantics закреплена: temporal intents не имеют fallback в Inbox, только clarification.
 
 ## 5) Ближайшие шаги
 - 3-7 дней ежедневных health/log/smoke проверок прод-контура.

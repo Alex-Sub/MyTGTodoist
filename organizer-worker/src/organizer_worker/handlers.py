@@ -319,6 +319,16 @@ def _normalize_intent_alias(intent: str) -> str:
     return aliases.get(raw, raw)
 
 
+def _intent_allowlist_choices() -> list[dict[str, Any]]:
+    choices: list[dict[str, Any]] = []
+    for name in sorted(INTENT_HANDLERS.keys()):
+        spec = canon.get_intent_spec(name) or {}
+        meaning = str(spec.get("meaning") or "").strip()
+        label = meaning if meaning else name
+        choices.append({"id": name, "label": label})
+    return choices
+
+
 def task_create(payload: dict[str, Any]) -> HandlerResult:
     e = _entities(payload)
     title = (e.get("title") or "").strip()
@@ -493,11 +503,14 @@ def subtask_complete(payload: dict[str, Any]) -> HandlerResult:
 def timeblock_create(payload: dict[str, Any]) -> HandlerResult:
     e = _entities(payload)
     start_at = _normalized_datetime_value(e.get("start_at"))
-    duration_min = e.get("duration_min")
+    duration_min = e.get("duration_minutes")
+    if duration_min is None:
+        duration_min = e.get("duration_min")
+    # Deterministic question order: duration first, then start_at.
+    if duration_min is None:
+        return _need("duration_minutes", "На сколько минут поставить блок?")
     if not start_at:
         return _need("start_at", "На какое время поставить блок?")
-    if duration_min is None:
-        return _need("duration_min", "На сколько минут поставить блок?")
 
     try:
         with db.connect() as conn:
@@ -968,8 +981,18 @@ def dispatch_intent(cmd: dict[str, Any]) -> HandlerResult:
             payload = command
 
     if not isinstance(intent, str) or not intent.strip():
-        return _fail("Я не понял команду. Сформулируйте иначе.", reason="missing_intent")
+        return build_clarification(
+            question="Уточните, какую команду выполнить.",
+            choices=_intent_allowlist_choices(),
+            debug={"reason": "missing_intent"},
+        )
     intent_norm = _normalize_intent_alias(intent)
+    if intent_norm not in INTENT_HANDLERS:
+        return build_clarification(
+            question="Уточните, какую команду выполнить.",
+            choices=_intent_allowlist_choices(),
+            debug={"reason": "unknown_intent", "intent": intent_norm},
+        )
     entities = _entities(payload)
     confidence = _read_confidence(cmd, payload)
     rejected = _is_rejected(cmd, payload)

@@ -11,6 +11,7 @@ import re
 import urllib.parse
 import urllib.request
 import sys
+import uuid
 from collections import deque
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -60,7 +61,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ORGANIZER_API_URL = os.getenv("ORGANIZER_API_URL", "http://organizer-api:8000")
 WORKER_COMMAND_URL = os.getenv("WORKER_COMMAND_URL", "http://organizer-worker:8002")
 ML_CORE_URL = (os.getenv("ML_CORE_URL", "") or "").strip()
-VOICE_X_TIMEZONE = "Europe/Amsterdam"
+APP_TIMEZONE = (os.getenv("APP_TIMEZONE", "") or os.getenv("TIMEZONE", "Europe/Moscow")).strip() or "Europe/Moscow"
+VOICE_X_TIMEZONE = APP_TIMEZONE
 ML_HTTP_CONNECT_TIMEOUT = float(os.getenv("ML_HTTP_CONNECT_TIMEOUT", "10"))
 ML_HTTP_READ_TIMEOUT = float(os.getenv("ML_HTTP_READ_TIMEOUT", "90"))
 ML_HTTP_TIMEOUT = (ML_HTTP_CONNECT_TIMEOUT, ML_HTTP_READ_TIMEOUT)
@@ -91,6 +93,13 @@ else:
     _pending_dir = "/data" if os.path.isdir("/data") else "./data"
     P2_PENDING_PATH = os.path.join(_pending_dir, "bot.p2_pending.json")
 P2_PENDING_TTL_SEC = int(os.getenv("P2_PENDING_TTL_SEC", "300"))
+_PENDING_CLARIFY_PATH_ENV = os.getenv("LLM_PENDING_CLARIFY_PATH")
+if _PENDING_CLARIFY_PATH_ENV:
+    PENDING_CLARIFY_PATH = _PENDING_CLARIFY_PATH_ENV
+else:
+    _pending_clarify_dir = "/data" if os.path.isdir("/data") else "./data"
+    PENDING_CLARIFY_PATH = os.path.join(_pending_clarify_dir, "bot.pending_clarify.json")
+PENDING_CLARIFY_TTL_SEC = int(os.getenv("LLM_PENDING_CLARIFY_TTL_SEC", "300"))
 DRIFT_MODE = (os.getenv("DRIFT_MODE", "off") or "off").strip().lower()
 OVERLOAD_MODE = (os.getenv("OVERLOAD_MODE", "off") or "off").strip().lower()
 P5_NUDGES_MODE = (os.getenv("P5_NUDGES_MODE", "off") or "off").strip().lower()
@@ -106,6 +115,7 @@ _processed_update_ids_deque: deque[int] = deque()
 _processed_update_ids_set: set[int] = set()
 
 _p2_pending_state: dict[int, dict] = {}
+_pending_clarify_state: dict[str, dict] = {}
 _daily_digest_sent_day: dict[int, str] = {}
 
 def _p7_enabled() -> bool:
@@ -479,6 +489,7 @@ def _runtime_intent_from_ml(ml_intent: str) -> str:
         "update_task": "task.update",
         "complete_task": "task.complete",
         "delete_task": "task.complete",
+        "timeblock_create": "timeblock.create",
         "create_event": "timeblock.create",
         "update_event": "timeblock.move",
         "delete_event": "timeblock.delete",
@@ -545,6 +556,18 @@ def _build_runtime_envelope_from_ml_response(
     message_id: int | None,
     response_json: dict,
 ) -> tuple[dict | None, str | None]:
+    if str(response_json.get("type") or "").strip() == "command":
+        envelope = response_json.get("envelope")
+        if not isinstance(envelope, dict):
+            log.warning("event=llm_invalid_output source=voice reason=envelope_missing")
+            return None, "llm_invalid_output"
+        _ensure_envelope_source_msg_id(envelope, chat_id, message_id)
+        command = envelope.get("command")
+        if not isinstance(command, dict) or not str(command.get("intent") or "").strip():
+            log.warning("event=llm_invalid_output source=voice reason=command_missing")
+            return None, "llm_invalid_output"
+        return envelope, None
+
     transcript = str(response_json.get("transcript") or "").strip()
     transcript_norm = str(response_json.get("transcript_norm") or "").strip()
     if not transcript_norm:
@@ -582,6 +605,25 @@ def _build_runtime_envelope_from_ml_response(
 
 
 def _format_runtime_reply(payload: dict) -> str:
+    debug = payload.get("debug")
+    tasks = (debug.get("tasks") if isinstance(debug, dict) else None)
+    if isinstance(tasks, list):
+        if not tasks:
+            return "Список пуст."
+        lines: list[str] = []
+        for idx, raw in enumerate(tasks[:50], start=1):
+            if not isinstance(raw, dict):
+                continue
+            task_id = raw.get("id")
+            title = str(raw.get("title") or "").strip() or "(без названия)"
+            planned_at = str(raw.get("planned_at") or "").strip()
+            state = str(raw.get("state") or raw.get("status") or "").strip()
+            planned_local = _planned_at_local(planned_at) if planned_at else ""
+            when = f" @ {planned_local}" if planned_local else ""
+            st = f" [{state}]" if state else ""
+            lines.append(f"{idx}. #{task_id} {title}{when}{st}")
+        return "\n".join(lines) if lines else "Список пуст."
+
     if bool(payload.get("ok")):
         return str(payload.get("user_message") or "Команда выполнена.")
     question = str(payload.get("clarifying_question") or "").strip()
@@ -2052,8 +2094,16 @@ def _enqueue_text(update_id: int, chat_id: int, message_id: int | None, text: st
 
 def _handle_text_message(update_id: int, message: dict, pending_state: dict[int, dict]) -> None:
     chat_id = int(message["chat"]["id"])
+    user_id = int((message.get("from") or {}).get("id") or chat_id)
     text_msg = (message.get("text") or "").strip()
     if not text_msg:
+        return
+    if _handle_pending_clarification_text(
+        chat_id=chat_id,
+        user_id=user_id,
+        message_id=message.get("message_id"),
+        text=text_msg,
+    ):
         return
 
     depth_new, depth_total = _queue_depths()
@@ -2331,6 +2381,364 @@ def _prune_p2_pending_state(state: dict[int, dict], now_ts: float) -> None:
         state.pop(cid, None)
     if expired:
         _save_p2_pending_state(state)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_iso(value: str) -> str:
+    raw = str(value).strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _iso_after_seconds(seconds: int) -> str:
+    dt = datetime.now(timezone.utc) + timedelta(seconds=max(1, int(seconds)))
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for key, value in patch.items():
+        cur = out.get(key)
+        if isinstance(cur, dict) and isinstance(value, dict):
+            out[key] = _deep_merge(cur, value)
+        else:
+            out[key] = value
+    return out
+
+
+def _load_pending_clarify_state() -> dict[str, dict]:
+    if not os.path.exists(PENDING_CLARIFY_PATH):
+        return {}
+    try:
+        with open(PENDING_CLARIFY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            out: dict[str, dict] = {}
+            for k, v in data.items():
+                if isinstance(k, str) and isinstance(v, dict):
+                    out[k] = v
+            return out
+    except Exception as exc:
+        print(f"pending_clarify_load_error path={PENDING_CLARIFY_PATH} err={str(exc)[:200]}")
+        return {}
+    return {}
+
+
+def _save_pending_clarify_state(state: dict[str, dict]) -> None:
+    tmp_path = f"{PENDING_CLARIFY_PATH}.tmp"
+    parent = os.path.dirname(PENDING_CLARIFY_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False)
+    os.replace(tmp_path, PENDING_CLARIFY_PATH)
+
+
+def _prune_pending_clarify_state(state: dict[str, dict]) -> None:
+    now = _utc_now_iso()
+    expired: list[str] = []
+    for uid, pending in state.items():
+        if not isinstance(pending, dict):
+            expired.append(uid)
+            continue
+        expires_at = str(pending.get("expires_at") or "").strip()
+        if not expires_at:
+            expired.append(uid)
+            continue
+        try:
+            if _normalize_iso(expires_at) <= now:
+                expired.append(uid)
+        except Exception:
+            expired.append(uid)
+    for uid in expired:
+        state.pop(uid, None)
+    if expired:
+        _save_pending_clarify_state(state)
+
+
+def _pending_clarify_get(user_id: str | int) -> dict | None:
+    key = str(user_id).strip()
+    _prune_pending_clarify_state(_pending_clarify_state)
+    pending = _pending_clarify_state.get(key)
+    if isinstance(pending, dict):
+        return pending
+    return None
+
+
+def _pending_clarify_put(user_id: str | int, payload: dict) -> None:
+    _pending_clarify_state[str(user_id).strip()] = payload
+    _save_pending_clarify_state(_pending_clarify_state)
+
+
+def _pending_clarify_clear(user_id: str | int) -> None:
+    _pending_clarify_state.pop(str(user_id).strip(), None)
+    _save_pending_clarify_state(_pending_clarify_state)
+
+
+def _pending_choice_keyboard(pending_id: str, choices: list[dict]) -> dict | None:
+    rows: list[list[dict]] = []
+    for ch in choices[:5]:
+        if not isinstance(ch, dict):
+            continue
+        choice_id = str(ch.get("id") or "").strip()
+        title = str(ch.get("title") or ch.get("label") or choice_id).strip()
+        if not choice_id or not title:
+            continue
+        rows.append(
+            [
+                {
+                    "text": title,
+                    "callback_data": f"choice:{pending_id}:{choice_id}",
+                }
+            ]
+        )
+    if not rows:
+        return None
+    return {"inline_keyboard": rows}
+
+
+def _extract_choice_id_from_text(raw_text: str, pending: dict) -> str | None:
+    text = (raw_text or "").strip().lower()
+    if not text:
+        return None
+    choices_raw = pending.get("choices")
+    if not isinstance(choices_raw, list) or not choices_raw:
+        return None
+    choices: list[dict] = [c for c in choices_raw if isinstance(c, dict)]
+    if not choices:
+        return None
+
+    if text in {"1", "2", "3", "4", "5"}:
+        idx = int(text) - 1
+        if 0 <= idx < len(choices):
+            cid = str(choices[idx].get("id") or "").strip()
+            if cid:
+                return cid
+
+    for ch in choices:
+        cid = str(ch.get("id") or "").strip().lower()
+        title = str(ch.get("title") or ch.get("label") or "").strip().lower()
+        if text == cid or text == title:
+            return str(ch.get("id") or "").strip()
+
+    if any(token in text for token in ("задач", "task")):
+        for ch in choices:
+            cid = str(ch.get("id") or "").strip().lower()
+            if "task" in cid:
+                return str(ch.get("id") or "").strip()
+    if any(token in text for token in ("блок", "встреч", "созвон", "timeblock", "meeting")):
+        for ch in choices:
+            cid = str(ch.get("id") or "").strip().lower()
+            if "timeblock" in cid:
+                return str(ch.get("id") or "").strip()
+    return None
+
+
+def _resolve_pending_answer(user_text: str, pending: dict) -> dict | None:
+    text = (user_text or "").strip().lower()
+    if not text:
+        return None
+    choices_raw = pending.get("choices")
+    if not isinstance(choices_raw, list) or not choices_raw:
+        return None
+    choices: list[dict] = [c for c in choices_raw if isinstance(c, dict)]
+    if not choices:
+        return None
+
+    selected: dict | None = None
+    if text in {"1", "2"}:
+        idx = int(text) - 1
+        if 0 <= idx < len(choices):
+            selected = choices[idx]
+    if selected is None:
+        for ch in choices:
+            cid = str(ch.get("id") or "").strip().lower()
+            if cid and text == cid:
+                selected = ch
+                break
+    if selected is None:
+        for ch in choices:
+            title = str(ch.get("title") or ch.get("label") or "").strip().lower()
+            if title and text in title:
+                selected = ch
+                break
+    if selected is None:
+        return None
+    choice_id = str(selected.get("id") or "").strip()
+    if not choice_id:
+        return None
+    return _apply_pending_choice(pending, choice_id)
+
+
+def _build_pending_clarification_from_ml_response(
+    *,
+    channel: str,
+    user_id: str | int,
+    response_json: dict,
+) -> dict | None:
+    if str(response_json.get("type") or "").strip() != "clarify":
+        return None
+    question = str(response_json.get("clarifying_question") or "").strip()
+    if not question:
+        return None
+    choices_raw = response_json.get("choices")
+    if not isinstance(choices_raw, list) or not choices_raw:
+        return None
+    choices: list[dict[str, Any]] = []
+    for ch in choices_raw:
+        if not isinstance(ch, dict):
+            continue
+        cid = str(ch.get("id") or "").strip()
+        title = str(ch.get("title") or ch.get("label") or cid).strip()
+        patch = ch.get("patch") if isinstance(ch.get("patch"), dict) else {}
+        if not cid or not title:
+            continue
+        choices.append({"id": cid, "title": title, "patch": patch})
+    if not choices:
+        return None
+
+    draft = response_json.get("draft_envelope")
+    draft_envelope = draft if isinstance(draft, dict) else None
+    trace_id = ""
+    if isinstance(draft_envelope, dict):
+        trace_id = str(draft_envelope.get("trace_id") or "").strip()
+    if not trace_id:
+        trace_id = f"tgclarify:{uuid.uuid4().hex}"
+
+    return {
+        "pending_id": uuid.uuid4().hex,
+        "trace_id": trace_id,
+        "channel": channel,
+        "user_id": str(user_id),
+        "created_at": _utc_now_iso(),
+        "expires_at": _iso_after_seconds(PENDING_CLARIFY_TTL_SEC),
+        "clarifying_question": question,
+        "choices": choices,
+        "draft_envelope": draft_envelope,
+        "stage": "llm_disambiguation",
+    }
+
+
+def _apply_pending_choice(pending: dict, choice_id: str) -> dict | None:
+    cid = str(choice_id or "").strip()
+    if not cid:
+        return None
+    choices = pending.get("choices")
+    if not isinstance(choices, list):
+        return None
+    selected: dict | None = None
+    for ch in choices:
+        if not isinstance(ch, dict):
+            continue
+        if str(ch.get("id") or "").strip() == cid:
+            selected = ch
+            break
+    if selected is None:
+        return None
+
+    base = pending.get("draft_envelope")
+    envelope: dict[str, Any]
+    if isinstance(base, dict):
+        envelope = dict(base)
+    else:
+        envelope = {
+            "trace_id": str(pending.get("trace_id") or f"tgclarify:{uuid.uuid4().hex}"),
+            "source": {"channel": str(pending.get("channel") or "telegram_text")},
+            "command": {"intent": cid, "confidence": 1.0, "entities": {}},
+        }
+
+    patch = selected.get("patch")
+    if isinstance(patch, dict):
+        envelope = _deep_merge(envelope, patch)
+    return envelope
+
+
+def _ensure_envelope_source_msg_id(envelope: dict, chat_id: int, message_id: int | None) -> None:
+    if not isinstance(envelope, dict):
+        return
+    command = envelope.get("command")
+    if not isinstance(command, dict):
+        return
+    entities = command.get("entities")
+    if not isinstance(entities, dict):
+        entities = {}
+        command["entities"] = entities
+    src = _source_msg_id(chat_id, message_id)
+    if src:
+        entities.setdefault("source_msg_id", src)
+
+
+def _run_envelope_and_send_reply(chat_id: int, envelope: dict) -> bool:
+    ok, payload, status, err_text = _worker_post_ex("/runtime/command", envelope)
+    if not ok or not isinstance(payload, dict):
+        log.warning("event=runtime_failed status=%s err=%s", status, (err_text or "")[:200])
+        _send_message(chat_id, VOICE_LATER_TEXT)
+        return False
+    _send_message(chat_id, _format_runtime_reply(payload))
+    return True
+
+
+def _handle_pending_clarification_text(
+    *,
+    chat_id: int,
+    user_id: str | int,
+    message_id: int | None,
+    text: str,
+) -> bool:
+    pending = _pending_clarify_get(user_id)
+    if pending is None:
+        return False
+    envelope = _resolve_pending_answer(text, pending)
+    if not isinstance(envelope, dict):
+        choices = pending.get("choices")
+        kb = _pending_choice_keyboard(str(pending.get("pending_id") or ""), choices if isinstance(choices, list) else [])
+        hint = "Не понял выбор. Пожалуйста, выберите один из вариантов:"
+        if kb:
+            _send_message_with_keyboard(chat_id, hint, kb)
+        else:
+            _send_message(chat_id, hint)
+        return True
+
+    _ensure_envelope_source_msg_id(envelope, chat_id, message_id)
+    _pending_clarify_clear(user_id)
+    _run_envelope_and_send_reply(chat_id, envelope)
+    return True
+
+
+def _handle_pending_clarification_callback(
+    *,
+    chat_id: int | None,
+    user_id: str | int | None,
+    callback_data: str,
+) -> str:
+    if user_id is None:
+        return "Недоступно"
+    parts = callback_data.split(":", 2)
+    if len(parts) != 3:
+        return "Некорректный выбор"
+    _, pending_id, choice_id = parts
+    pending = _pending_clarify_get(user_id)
+    if pending is None:
+        return "Уточнение устарело"
+    if str(pending.get("pending_id") or "").strip() != str(pending_id).strip():
+        return "Уточнение устарело"
+
+    envelope = _apply_pending_choice(pending, choice_id)
+    if not isinstance(envelope, dict):
+        return "Некорректный выбор"
+    if chat_id is not None:
+        _ensure_envelope_source_msg_id(envelope, int(chat_id), None)
+    _pending_clarify_clear(user_id)
+    if chat_id is not None:
+        _run_envelope_and_send_reply(int(chat_id), envelope)
+    return "Ок"
 
 
 def _drain_updates() -> int:
@@ -3515,6 +3923,7 @@ def _handle_today_callback(data: str, chat_id: int | None, message_id: int | Non
 
 def _handle_voice_message(update_id: int, message: dict) -> None:
     chat_id = int(message["chat"]["id"])
+    user_id = int((message.get("from") or {}).get("id") or chat_id)
     voice = message.get("voice") or {}
     file_id = str(voice.get("file_id") or "").strip()
     duration = voice.get("duration")
@@ -3533,6 +3942,24 @@ def _handle_voice_message(update_id: int, message: dict) -> None:
                 _send_message(chat_id, VOICE_RETRY_TEXT)
             else:
                 _send_message(chat_id, VOICE_LATER_TEXT)
+            return
+        pending = _build_pending_clarification_from_ml_response(
+            channel="telegram_voice",
+            user_id=user_id,
+            response_json=ml_response or {},
+        )
+        if isinstance(pending, dict):
+            _pending_clarify_put(user_id, pending)
+            question = str(pending.get("clarifying_question") or "Нужны уточнения.")
+            choices = pending.get("choices")
+            kb = _pending_choice_keyboard(
+                str(pending.get("pending_id") or ""),
+                choices if isinstance(choices, list) else [],
+            )
+            if kb:
+                _send_message_with_keyboard(chat_id, question, kb)
+            else:
+                _send_message(chat_id, question)
             return
 
         envelope, env_err = _build_runtime_envelope_from_ml_response(
@@ -3579,7 +4006,10 @@ def main() -> None:
     offset = _load_offset()
     clarify_state = _load_clarify_state()
     global _p2_pending_state
+    global _pending_clarify_state
     _p2_pending_state = _load_p2_pending_state()
+    _pending_clarify_state = _load_pending_clarify_state()
+    _prune_pending_clarify_state(_pending_clarify_state)
     _load_processed_updates()
     print(f"loaded offset={offset}")
     if TG_HTTP_READ_TIMEOUT > TG_HTTP_READ_TIMEOUT_RAW:
@@ -3625,7 +4055,17 @@ def main() -> None:
                     from_user = callback.get("from") or {}
                     chat = (callback.get("message") or {}).get("chat") or {}
                     chat_id_cb = chat.get("id") or from_user.get("id")
-                    if data.startswith("clarify:"):
+                    if data.startswith("choice:"):
+                        try:
+                            resp_text = _handle_pending_clarification_callback(
+                                chat_id=(int(chat_id_cb) if chat_id_cb is not None else None),
+                                user_id=(from_user.get("id") if isinstance(from_user, dict) else None),
+                                callback_data=data,
+                            )
+                            _api_answer_callback(cb_id, resp_text or "Ок")
+                        except Exception:
+                            _api_answer_callback(cb_id, "Ошибка")
+                    elif data.startswith("clarify:"):
                         try:
                             parts = data.split(":")
                             # clarify:<chat_id>:<item_id>:<YYYY-MM-DD>:<hh>:<mm>:<dur>:am|pm|cancel

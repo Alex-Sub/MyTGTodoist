@@ -2,14 +2,20 @@ services:
   organizer-api:
     environment:
       DB_PATH: ${DB_PATH:-/data/organizer.db}
+      TZ: ${TZ:-Europe/Moscow}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
 
   organizer-worker:
     environment:
       DB_PATH: ${DB_PATH:-/data/organizer.db}
+      TZ: ${TZ:-Europe/Moscow}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
 
   telegram-bot:
     environment:
       DB_PATH: ${DB_PATH:-/data/organizer.db}
+      TZ: ${TZ:-Europe/Moscow}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
 
 volumes:
   db_data:
