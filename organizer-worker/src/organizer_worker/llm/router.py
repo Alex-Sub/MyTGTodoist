@@ -44,11 +44,26 @@ STRICT_JSON_PROMPT = (
     "top-level keys (no asr_text, no now_iso, etc.). Do not include any extra text."
 )
 
-SUPPORTED_INTENTS = {"task_create", "timeblock_create"}
-DEFAULT_ALLOWED_INTENTS = ("task_create", "timeblock_create")
+SUPPORTED_INTENTS = {
+    "task_create",
+    "timeblock_create",
+    "tasks.list_active",
+    "tasks.list_today",
+    "tasks.list_tomorrow",
+}
+DEFAULT_ALLOWED_INTENTS = (
+    "task_create",
+    "timeblock_create",
+    "tasks.list_active",
+    "tasks.list_today",
+    "tasks.list_tomorrow",
+)
 INTENT_CHOICE_LABELS = {
     "timeblock_create": "создать блок времени",
     "task_create": "создать задачу",
+    "tasks.list_active": "показать активные задачи",
+    "tasks.list_today": "показать задачи на сегодня",
+    "tasks.list_tomorrow": "показать задачи на завтра",
 }
 INTERPRET_FALLBACK_QUESTION = "Не понял команду. Это задача или блок времени?"
 INTERPRET_STRICT_JSON_PROMPT = "Верни СТРОГО JSON без комментариев и лишнего текста."
@@ -62,6 +77,10 @@ INTERPRET_SYSTEM_PROMPT = """Ты — интерпретатор команд д
 - Относительные даты/время (сегодня/завтра/в пятницу/после обеда) РАЗРЕШАЙ в ISO datetime, используя now_iso и timezone.
 - Не выдумывай поля. Используй только snake_case.
 - Вариант "встреча/созвон/собрание" = timeblock_create.
+- Если пользователь просит список активных задач (например: "список активных задач", "покажи активные задачи", "выведи список активных"), верни intent=tasks.list_active.
+- Если пользователь просит задачи на сегодня, верни intent=tasks.list_today.
+- Если пользователь просит задачи на завтра, верни intent=tasks.list_tomorrow.
+- Не используй task_create для фраз, начинающихся на "список", "покажи", "выведи", если это запрос на просмотр списка.
 
 Жёсткие примеры:
 1) "купи молоко" -> {"type":"command","command":{"command":{"intent":"task_create","entities":{"title":"Купить молоко"}}}}
@@ -152,7 +171,7 @@ def _load_intent_registry() -> dict[str, str]:
     for raw_name, spec in intents.items():
         if not isinstance(raw_name, str):
             continue
-        name = raw_name.strip().replace(".", "_")
+        name = _canonical_intent_name(raw_name)
         if name not in SUPPORTED_INTENTS:
             continue
         meaning = ""
@@ -222,7 +241,7 @@ def build_prompt(
                 "trace_id": "string",
                 "source": {"channel": "string"},
                 "command": {
-                    "intent": "task_create|timeblock_create",
+                    "intent": "task_create|timeblock_create|tasks.list_active|tasks.list_today|tasks.list_tomorrow",
                     "confidence": 0.0,
                     "entities": {
                         "title": "string|null",
@@ -281,8 +300,34 @@ def _canonical_intent_name(intent: str) -> str:
         "create_event": "timeblock_create",
         "meeting_create": "timeblock_create",
         "timeblock_create": "timeblock_create",
+        "tasks_list_active": "tasks.list_active",
+        "tasks.list_active": "tasks.list_active",
+        "tasks_list_today": "tasks.list_today",
+        "tasks.list_today": "tasks.list_today",
+        "tasks_list_tomorrow": "tasks.list_tomorrow",
+        "tasks.list_tomorrow": "tasks.list_tomorrow",
     }
     return aliases.get(raw, raw)
+
+
+def _starts_with_list_prefix(text: str) -> bool:
+    s = (text or "").strip().lower()
+    return s.startswith("список") or s.startswith("покажи") or s.startswith("выведи")
+
+
+def _detect_list_intent(text: str, allowed_intents: list[str]) -> str | None:
+    s = (text or "").strip().lower()
+    if not _starts_with_list_prefix(s):
+        return None
+    if "завтра" in s and "tasks.list_tomorrow" in allowed_intents:
+        return "tasks.list_tomorrow"
+    if "сегодня" in s and "tasks.list_today" in allowed_intents:
+        return "tasks.list_today"
+    if "актив" in s and "tasks.list_active" in allowed_intents:
+        return "tasks.list_active"
+    if ("задач" in s or "спис" in s) and "tasks.list_active" in allowed_intents:
+        return "tasks.list_active"
+    return None
 
 
 def _is_ambiguous_task_or_timeblock(text: str) -> bool:
@@ -385,7 +430,15 @@ def _clarify_result(
 
 
 def _build_draft_from_text(text: str, allowed_intents: list[str]) -> CommandEnvelope | None:
-    intent = "timeblock_create" if _is_ambiguous_task_or_timeblock(text) else (allowed_intents[0] if allowed_intents else "task_create")
+    list_intent = _detect_list_intent(text, allowed_intents)
+    if list_intent:
+        intent = list_intent
+    elif _is_ambiguous_task_or_timeblock(text):
+        intent = "timeblock_create"
+    elif _starts_with_list_prefix(text):
+        intent = "tasks.list_active" if "tasks.list_active" in allowed_intents else (allowed_intents[0] if allowed_intents else "task_create")
+    else:
+        intent = allowed_intents[0] if allowed_intents else "task_create"
     try:
         return CommandEnvelope.new(intent=intent, entities={"title": text.strip() or None}, source={"channel": "llm_gateway"})
     except Exception:
@@ -497,6 +550,16 @@ def interpret(
     allowed_intents: list[str] | None = None,
 ) -> InterpretationResult:
     intents = _normalize_allowed_intents(allowed_intents)
+    list_intent = _detect_list_intent(text, intents)
+    if list_intent:
+        return InterpretationResult.command_result(
+            envelope=CommandEnvelope.new(
+                intent=list_intent,
+                entities={},
+                source={"channel": "llm_gateway"},
+            ),
+            debug={"source": "rule:list_intent_prefix"},
+        )
     payload, parse_err = _llm_interpret_raw(
         text,
         now_iso=now_iso,

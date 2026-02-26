@@ -256,7 +256,13 @@ def test_interpret_unknown_intent_forced_to_clarify(monkeypatch):
     assert res.type == "clarify"
     assert res.clarifying_question == "Не понял команду. Это задача или блок времени?"
     ids = {c.id for c in res.choices}
-    assert ids == {"task_create", "timeblock_create"}
+    assert ids == {
+        "task_create",
+        "timeblock_create",
+        "tasks.list_active",
+        "tasks.list_today",
+        "tasks.list_tomorrow",
+    }
 
 
 def test_interpret_invalid_json_fallback_to_clarify(monkeypatch):
@@ -277,6 +283,30 @@ def test_build_prompt_contains_timezone_and_allowed_intents():
     payload = json.loads(user_prompt)
     assert payload["timezone"] == "Europe/Moscow"
     assert payload["allowed_intents"] == ["task_create", "timeblock_create"]
+
+
+def test_interpret_list_active_prefix_maps_to_tasks_list_active(monkeypatch):
+    def should_not_call_llm(*args, **kwargs):
+        raise AssertionError("LLM call should be skipped by list fast-path")
+
+    monkeypatch.setattr(router, "_llm_interpret_raw", should_not_call_llm)
+    res = router.interpret("список активных задач", now_iso="2026-02-08T12:00:00+03:00")
+    assert res.type == "command"
+    assert res.envelope is not None
+    assert res.envelope.command.intent == "tasks.list_active"
+    assert res.envelope.command.intent != "task_create"
+
+
+def test_interpret_list_tomorrow_prefix_maps_to_tasks_list_tomorrow(monkeypatch):
+    def should_not_call_llm(*args, **kwargs):
+        raise AssertionError("LLM call should be skipped by list fast-path")
+
+    monkeypatch.setattr(router, "_llm_interpret_raw", should_not_call_llm)
+    res = router.interpret("выведи задачи на завтра", now_iso="2026-02-08T12:00:00+03:00")
+    assert res.type == "command"
+    assert res.envelope is not None
+    assert res.envelope.command.intent == "tasks.list_tomorrow"
+    assert res.envelope.command.intent != "task_create"
 
 
 # Schema contract tests

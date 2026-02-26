@@ -30,11 +30,32 @@ Runtime-only репозиторий: бизнес-логика (worker + Telegra
 Требуется Docker Desktop (или docker engine) запущенный.
 
 ```bash
-docker compose up --build -d
-docker compose ps
+docker compose -p deploy up --build -d
+docker compose -p deploy ps
 ```
 
 API health: `http://127.0.0.1:8101/health`
+
+## VPS deploy (single project lock)
+
+Всегда запускайте только с `-p deploy`, чтобы не поднимать дублирующие compose-стеки.
+
+```bash
+docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml up -d --build
+docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml ps
+```
+
+Health check (должен быть ровно один `organizer-worker`, и он должен использовать volume `deploy_db_data`):
+
+```bash
+./run.sh health
+```
+
+Safe runner (опционально):
+
+```bash
+./run.sh up
+```
 
 ## Тесты
 

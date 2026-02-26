@@ -30,6 +30,25 @@
 - Compose file set: `docker-compose.yml` + `docker-compose.vps.override.yml`
 - Required SA file on VPS: `/opt/mytgtodoist/secrets/alexey/google_sa.json` (regular file, not directory)
 
+## B.1) Compose Project Lock (mandatory)
+- Запускать только с project name `deploy`.
+- Команды без `-p deploy` запрещены (риск параллельных стеков).
+- Каноничная команда:
+```bash
+docker compose -p deploy --env-file .env.prod -f docker-compose.yml -f docker-compose.vps.override.yml up -d --build
+```
+- Safe wrapper:
+```bash
+./run.sh up
+```
+- Health check:
+```bash
+./run.sh health
+```
+- Ожидаемый результат health check:
+  - запущен ровно один `organizer-worker`
+  - его `/data` смонтирован на volume `deploy_db_data`
+
 ## Production Branch Policy
 - Production always builds from branch: `runtime-stable`.
 - Never develop directly on `main` on VPS.
