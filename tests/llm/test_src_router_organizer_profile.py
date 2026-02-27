@@ -50,3 +50,30 @@ def test_organizer_profile_meeting_with_time_maps_to_timeblock_create(monkeypatc
     assert res.type == "command"
     assert isinstance(res.command, dict)
     assert res.command["intent"] == "timeblock.create"
+
+
+def test_action_text_without_list_prefix_maps_to_task_create_with_planned_at(monkeypatch) -> None:
+    def _should_not_call_llm(_req):
+        raise AssertionError("LLM must not be called for rule-based action text")
+
+    monkeypatch.setattr(ml_router, "route_llm", _should_not_call_llm)
+
+    res = ml_router.interpret("купить молоко завтра", now_iso="2026-02-27T12:00:00+03:00")
+    assert res.type == "command"
+    assert isinstance(res.command, dict)
+    assert res.command["intent"] == "task.create"
+    assert res.command["args"]["title"] == "молоко завтра"
+    assert str(res.command["args"].get("planned_at") or "") != ""
+
+
+def test_list_prefix_maps_to_tasks_list_active_and_not_task_create(monkeypatch) -> None:
+    def _should_not_call_llm(_req):
+        raise AssertionError("LLM must not be called for list prefix")
+
+    monkeypatch.setattr(ml_router, "route_llm", _should_not_call_llm)
+
+    res = ml_router.interpret("список активных задач", now_iso="2026-02-27T12:00:00+03:00")
+    assert res.type == "command"
+    assert isinstance(res.command, dict)
+    assert res.command["intent"] == "tasks.list_active"
+    assert res.command["intent"] != "task.create"

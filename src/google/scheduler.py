@@ -38,7 +38,12 @@ _last_tasks_pull_error: str | None = None
 _last_sheets_pull_error: str | None = None
 _last_vitrina_error: str | None = None
 _last_sheets_push_sig: str | None = None
-_SHEETS_PUSH_HEADER = ["id", "parent_id", "level", "title", "planned_at", "status", "updated_at"]
+_SHEETS_TASKS_TAB = "Tasks"
+_SHEETS_INBOX_TAB = "Inbox"
+_SHEETS_CALENDAR_TAB = "Calendar"
+_SHEETS_TASKS_INBOX_HEADER = ["id", "parent_id", "level", "title", "planned_at", "status", "updated_at"]
+_SHEETS_CALENDAR_HEADER = ["id", "title", "start_at", "end_at", "calendar_event_id", "updated_at"]
+_GARBAGE_LIST_PREFIXES = ("список ", "покажи ", "выведи ", "дай мне список")
 
 
 def _utc_now() -> datetime:
@@ -60,77 +65,230 @@ def _dt_to_iso_utc(value: datetime | None) -> str:
     return dt.isoformat()
 
 
-def _build_sheets_push_rows(session) -> list[list[Any]]:
-    cols_rows = session.execute(text("PRAGMA table_info(items)")).fetchall()
-    cols = {str(row[1]) for row in cols_rows if len(row) > 1}
-    if not cols:
-        return []
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(raw)
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
-    level_expr = "0"
-    if "level" in cols:
-        level_expr = "COALESCE(level, 0)"
-    elif "depth" in cols:
-        level_expr = "COALESCE(depth, 0)"
 
-    planned_expr = "NULL"
-    for name in ("planned_at", "scheduled_at", "due_at", "start_at"):
-        if name in cols:
-            planned_expr = name
-            break
+def _value_to_iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return _dt_to_iso_utc(value)
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    parsed = _parse_iso_datetime(raw)
+    if parsed is not None:
+        return parsed.isoformat()
+    return raw
 
-    updated_expr = "NULL"
-    for name in ("updated_at", "created_at"):
-        if name in cols:
-            updated_expr = name
-            break
 
-    where_parts: list[str] = []
-    if "type" in cols:
-        where_parts.append("type = 'task'")
-    if "status" in cols:
-        where_parts.append("COALESCE(status, '') <> 'archived'")
-    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+def planned_at_from_item(row: dict[str, Any]) -> str | None:
+    return _value_to_iso(row.get("start_at"))
 
-    order_expr = updated_expr if updated_expr != "NULL" else "id"
-    q = f"""
-        SELECT
-            id,
-            parent_id,
-            {level_expr} AS level,
-            title,
-            {planned_expr} AS planned_at,
-            COALESCE(status, '') AS status,
-            {updated_expr} AS updated_at
-        FROM items
-        {where_sql}
-        ORDER BY {order_expr} DESC, id DESC
-    """
-    rows = session.execute(text(q)).mappings().all()
 
-    out: list[list[Any]] = []
-    for row in rows:
-        out.append(
+def _start_at_from_item(row: dict[str, Any]) -> str | None:
+    return _value_to_iso(row.get("start_at"))
+
+
+def _calendar_event_id_from_item(row: dict[str, Any]) -> str:
+    return str(row.get("calendar_event_id") or row.get("event_id") or "").strip()
+
+
+def _end_at_from_item(row: dict[str, Any], start_at: str | None) -> str | None:
+    explicit = _value_to_iso(row.get("end_at"))
+    if explicit:
+        return explicit
+    start_dt = _parse_iso_datetime(start_at)
+    if start_dt is None:
+        return None
+    duration_raw = row.get("duration_minutes")
+    if duration_raw is None:
+        duration_raw = row.get("duration_min")
+    try:
+        duration = int(duration_raw or 0)
+    except Exception:
+        duration = 0
+    if duration <= 0:
+        return None
+    return (start_dt + timedelta(minutes=duration)).isoformat()
+
+
+def _updated_at_from_item(row: dict[str, Any]) -> str:
+    updated = _value_to_iso(row.get("updated_at"))
+    if updated:
+        return updated
+    created = _value_to_iso(row.get("created_at"))
+    return created or ""
+
+
+def _is_garbage_list_title(title: str) -> bool:
+    normalized = " ".join(str(title or "").strip().lower().split())
+    return any(normalized.startswith(prefix) for prefix in _GARBAGE_LIST_PREFIXES)
+
+
+def _load_items_rows(session) -> list[dict[str, Any]]:
+    rows = session.execute(text("SELECT * FROM items")).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _partition_sheets_rows(items_rows: list[dict[str, Any]]) -> tuple[list[list[Any]], list[list[Any]], list[list[Any]]]:
+    tasks_raw: list[dict[str, Any]] = []
+    inbox_raw: list[dict[str, Any]] = []
+    calendar_raw: list[dict[str, Any]] = []
+
+    for row in items_rows:
+        item_id = str(row.get("id") or "").strip()
+        if not item_id:
+            continue
+        item_type = str(row.get("type") or "").strip().lower()
+        status = str(row.get("status") or "").strip().lower()
+        title = str(row.get("title") or "").strip()
+        if _is_garbage_list_title(title):
+            continue
+        parent_id = str(row.get("parent_id") or "").strip()
+        level_raw = row.get("level")
+        if level_raw is None:
+            level_raw = row.get("depth")
+        try:
+            level = int(level_raw or 0)
+        except Exception:
+            level = 0
+        updated_at = _updated_at_from_item(row)
+        start_at = _start_at_from_item(row) or ""
+        calendar_event_id = _calendar_event_id_from_item(row)
+
+        if item_type == "task":
+            planned = planned_at_from_item(row) or ""
+            entry = {
+                "id": item_id,
+                "parent_id": parent_id,
+                "level": level,
+                "title": title,
+                "start_at": start_at,
+                "planned_at": planned,
+                "status": status,
+                "updated_at": updated_at,
+            }
+            if status == "inbox":
+                inbox_raw.append(entry)
+            elif status != "archived":
+                tasks_raw.append(entry)
+
+        if item_type in {"timeblock", "meeting", "event"} or calendar_event_id:
+            end_at = _end_at_from_item(row, start_at)
+            calendar_raw.append(
+                {
+                    "id": item_id,
+                    "title": title,
+                    "start_at": start_at or "",
+                    "end_at": end_at or "",
+                    "calendar_event_id": calendar_event_id,
+                    "updated_at": updated_at,
+                }
+            )
+
+    def _task_sort_key(entry: dict[str, Any]) -> tuple[float, float, str]:
+        start_dt = _parse_iso_datetime(entry.get("start_at"))
+        updated_dt = _parse_iso_datetime(entry.get("updated_at"))
+        start_ord = start_dt.timestamp() if start_dt is not None else float("inf")
+        updated_ord = -(updated_dt.timestamp() if updated_dt is not None else 0.0)
+        return (start_ord, updated_ord, str(entry.get("id") or ""))
+
+    def _inbox_sort_key(entry: dict[str, Any]) -> tuple[float, str]:
+        updated_dt = _parse_iso_datetime(entry.get("updated_at"))
+        updated_ord = -(updated_dt.timestamp() if updated_dt is not None else 0.0)
+        return (updated_ord, str(entry.get("id") or ""))
+
+    def _calendar_sort_key(entry: dict[str, Any]) -> tuple[float, str]:
+        start_dt = _parse_iso_datetime(entry.get("start_at"))
+        start_ord = start_dt.timestamp() if start_dt is not None else float("inf")
+        return (start_ord, str(entry.get("id") or ""))
+
+    tasks_sorted = sorted(tasks_raw, key=_task_sort_key)
+    inbox_sorted = sorted(inbox_raw, key=_inbox_sort_key)
+    calendar_sorted = sorted(calendar_raw, key=_calendar_sort_key)
+
+    tasks_rows: list[list[Any]] = []
+    for entry in tasks_sorted:
+        tasks_rows.append(
             [
-                str(row.get("id") or ""),
-                str(row.get("parent_id") or ""),
-                int(row.get("level") or 0),
-                str(row.get("title") or ""),
-                str(row.get("planned_at") or ""),
-                str(row.get("status") or ""),
-                str(row.get("updated_at") or ""),
+                str(entry.get("id") or ""),
+                str(entry.get("parent_id") or ""),
+                int(entry.get("level") or 0),
+                str(entry.get("title") or ""),
+                str(entry.get("planned_at") or ""),
+                str(entry.get("status") or ""),
+                str(entry.get("updated_at") or ""),
             ]
         )
-    return out
+
+    inbox_rows: list[list[Any]] = []
+    for entry in inbox_sorted:
+        inbox_rows.append(
+            [
+                str(entry.get("id") or ""),
+                str(entry.get("parent_id") or ""),
+                int(entry.get("level") or 0),
+                str(entry.get("title") or ""),
+                str(entry.get("planned_at") or ""),
+                str(entry.get("status") or ""),
+                str(entry.get("updated_at") or ""),
+            ]
+        )
+
+    calendar_rows: list[list[Any]] = []
+    for entry in calendar_sorted:
+        calendar_rows.append(
+            [
+                str(entry.get("id") or ""),
+                str(entry.get("title") or ""),
+                str(entry.get("start_at") or ""),
+                str(entry.get("end_at") or ""),
+                str(entry.get("calendar_event_id") or ""),
+                str(entry.get("updated_at") or ""),
+            ]
+        )
+    return tasks_rows, inbox_rows, calendar_rows
 
 
-def _sheets_push_signature(rows: list[list[Any]]) -> str:
-    if not rows:
-        return "rows=0"
+def _build_sheets_push_rows(session) -> tuple[list[list[Any]], list[list[Any]], list[list[Any]]]:
+    return _partition_sheets_rows(_load_items_rows(session))
+
+
+def _sheets_push_signature(tasks_rows: list[list[Any]], inbox_rows: list[list[Any]], calendar_rows: list[list[Any]]) -> str:
     latest = ""
-    for row in rows:
+    for row in tasks_rows:
         if len(row) > 6 and str(row[6] or "") > latest:
             latest = str(row[6] or "")
-    return f"rows={len(rows)};latest={latest}"
+    for row in inbox_rows:
+        if len(row) > 6 and str(row[6] or "") > latest:
+            latest = str(row[6] or "")
+    for row in calendar_rows:
+        if len(row) > 5 and str(row[5] or "") > latest:
+            latest = str(row[5] or "")
+    return (
+        f"tasks={len(tasks_rows)};"
+        f"inbox={len(inbox_rows)};"
+        f"calendar={len(calendar_rows)};"
+        f"latest={latest}"
+    )
 
 
 def _ensure_expected_db_has_items() -> None:
@@ -169,26 +327,47 @@ async def _run_sheets_push_once(*, force: bool = False) -> int:
 
     try:
         client = SheetsClient()
-        await asyncio.to_thread(client.ensure_tabs, spreadsheet_id, [settings.google_vitrina_sheet_name])
+        await asyncio.to_thread(
+            client.ensure_tabs,
+            spreadsheet_id,
+            [_SHEETS_TASKS_TAB, _SHEETS_INBOX_TAB, _SHEETS_CALENDAR_TAB],
+        )
 
         with get_session() as session:
-            rows = _build_sheets_push_rows(session)
+            tasks_rows, inbox_rows, calendar_rows = _build_sheets_push_rows(session)
 
-        sig = _sheets_push_signature(rows)
+        sig = _sheets_push_signature(tasks_rows, inbox_rows, calendar_rows)
         if not force and sig == _last_sheets_push_sig:
-            return len(rows)
+            return len(tasks_rows) + len(inbox_rows) + len(calendar_rows)
 
-        await asyncio.to_thread(client.clear_sheet, spreadsheet_id, settings.google_vitrina_sheet_name)
+        await asyncio.to_thread(client.clear_sheet, spreadsheet_id, _SHEETS_TASKS_TAB)
         await asyncio.to_thread(
             client.write_table,
             spreadsheet_id,
-            settings.google_vitrina_sheet_name,
-            list(_SHEETS_PUSH_HEADER),
-            rows,
+            _SHEETS_TASKS_TAB,
+            list(_SHEETS_TASKS_INBOX_HEADER),
+            tasks_rows,
+        )
+        await asyncio.to_thread(client.clear_sheet, spreadsheet_id, _SHEETS_INBOX_TAB)
+        await asyncio.to_thread(
+            client.write_table,
+            spreadsheet_id,
+            _SHEETS_INBOX_TAB,
+            list(_SHEETS_TASKS_INBOX_HEADER),
+            inbox_rows,
+        )
+        await asyncio.to_thread(client.clear_sheet, spreadsheet_id, _SHEETS_CALENDAR_TAB)
+        await asyncio.to_thread(
+            client.write_table,
+            spreadsheet_id,
+            _SHEETS_CALENDAR_TAB,
+            list(_SHEETS_CALENDAR_HEADER),
+            calendar_rows,
         )
         _last_sheets_push_sig = sig
-        logger.info("SHEETS push ok rows={}", len(rows))
-        return len(rows)
+        logger.info("SHEETS export tasks={} inbox={} calendar={}", len(tasks_rows), len(inbox_rows), len(calendar_rows))
+        logger.info("SHEETS push ok")
+        return len(tasks_rows) + len(inbox_rows) + len(calendar_rows)
     except Exception as exc:
         logger.error("SHEETS push failed err={}", str(exc)[:300])
         return 0

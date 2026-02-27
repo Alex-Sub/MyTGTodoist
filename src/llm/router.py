@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
@@ -252,6 +253,26 @@ def _parse_json(text: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
         return None, str(exc)
 
 
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(raw)
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _normalize_command_payload(payload: dict[str, Any]) -> dict[str, Any]:
     # Canonical intent unification for runtime-supported names.
     intent_raw = str(payload.get("intent") or "").strip().lower()
@@ -307,6 +328,136 @@ def _is_ambiguous_task_or_timeblock(text: str) -> bool:
     return has_meeting and not has_duration and not has_explicit_time
 
 
+def _normalize_text(text: str) -> str:
+    return " ".join(str(text or "").strip().lower().split())
+
+
+def _detect_list_intent_from_text(text: str) -> str | None:
+    s = _normalize_text(text)
+    if not s:
+        return None
+    if not (s.startswith("список") or s.startswith("покажи") or s.startswith("выведи")):
+        return None
+    if "завтр" in s:
+        return "tasks.list_tomorrow"
+    if "сегодн" in s:
+        return "tasks.list_today"
+    if "актив" in s:
+        return "tasks.list_active"
+    if "задач" in s:
+        return "tasks.list_active"
+    return "tasks.list_active"
+
+
+def _contains_meeting_hint(text: str) -> bool:
+    s = _normalize_text(text)
+    return any(k in s for k in ("встреч", "созвон", "собран", "митинг", "appointment"))
+
+
+def _extract_task_title_from_action(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    s = _normalize_text(raw)
+    verbs = (
+        "купить",
+        "купи",
+        "позвонить",
+        "позвони",
+        "сделать",
+        "сделай",
+        "написать",
+        "напиши",
+        "подготовить",
+        "подготовь",
+        "отправить",
+        "отправь",
+        "прочитать",
+        "прочитай",
+        "проверить",
+        "проверь",
+        "напомнить",
+        "напомни",
+        "запланировать",
+        "запланируй",
+    )
+    for verb in verbs:
+        prefix = f"{verb} "
+        if s == verb:
+            return raw
+        if s.startswith(prefix):
+            return raw[len(prefix) :].strip() or raw
+    return raw
+
+
+def _planned_at_from_text(text: str, now_iso: Optional[str]) -> str | None:
+    s = _normalize_text(text)
+    if "завтр" not in s and "сегодн" not in s:
+        return None
+    now_dt = _parse_iso_datetime(now_iso) if now_iso else None
+    if now_dt is None:
+        now_dt = datetime.now(timezone.utc)
+    if "завтр" in s:
+        target = (now_dt + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
+    else:
+        target = now_dt.replace(hour=10, minute=0, second=0, microsecond=0)
+    return target.isoformat()
+
+
+def _is_action_task_text(text: str) -> bool:
+    s = _normalize_text(text)
+    if not s:
+        return False
+    if _detect_list_intent_from_text(s):
+        return False
+    if _contains_meeting_hint(s):
+        return False
+    action_prefixes = (
+        "купить ",
+        "купи ",
+        "позвонить ",
+        "позвони ",
+        "сделать ",
+        "сделай ",
+        "написать ",
+        "напиши ",
+        "подготовить ",
+        "подготовь ",
+        "отправить ",
+        "отправь ",
+        "прочитать ",
+        "прочитай ",
+        "проверить ",
+        "проверь ",
+        "напомнить ",
+        "напомни ",
+    )
+    return any(s.startswith(prefix) for prefix in action_prefixes)
+
+
+def _rule_based_interpret(text: str, now_iso: Optional[str]) -> InterpretationResult | None:
+    list_intent = _detect_list_intent_from_text(text)
+    if list_intent is not None:
+        return InterpretationResult(
+            type="command",
+            command={"intent": list_intent, "args": {}},
+            debug={"source_intent": list_intent, "source": "rule_list_prefix"},
+        )
+
+    if _is_action_task_text(text):
+        title = _extract_task_title_from_action(text)
+        args: dict[str, Any] = {"title": title}
+        planned_at = _planned_at_from_text(text, now_iso)
+        if planned_at is not None:
+            args["planned_at"] = planned_at
+        return InterpretationResult(
+            type="command",
+            command={"intent": "task.create", "args": args},
+            debug={"source_intent": "task.create", "source": "rule_action_text"},
+        )
+    return None
+
+
 def _clarify_task_or_timeblock(question: str, reason: str) -> InterpretationResult:
     return InterpretationResult(
         type="clarify",
@@ -350,6 +501,10 @@ def _extract_args(intent: str, entities: dict[str, Any]) -> dict[str, Any]:
 
 
 def interpret(text: str, *, now_iso: Optional[str] = None) -> InterpretationResult:
+    fast_path = _rule_based_interpret(text, now_iso)
+    if fast_path is not None:
+        return fast_path
+
     req = LLMRequest(kind="text_command", text=text, now_iso=now_iso)
     llm_result = route_llm(req)
     if not llm_result.validation_ok or not isinstance(llm_result.payload, dict):
