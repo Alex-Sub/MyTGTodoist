@@ -8,7 +8,7 @@ services:
     environment:
       TZ: ${TZ:-Europe/Moscow}
       APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
-      SQLITE_PATH: ${SQLITE_PATH:-${DB_PATH:-/data/organizer_alexey.db}}
+      SQLITE_PATH: ${SQLITE_PATH:-${DB_PATH:-/data/organizer.db}}
       GOOGLE_SYNC_MODE: ${GOOGLE_SYNC_MODE:-sheets_push}
       GOOGLE_SERVICE_ACCOUNT_FILE: /data/google_sa.json
       SYNC_POLL_ACTIVE_SEC: ${SYNC_POLL_ACTIVE_SEC:-30}

@@ -133,6 +133,32 @@ def _sheets_push_signature(rows: list[list[Any]]) -> str:
     return f"rows={len(rows)};latest={latest}"
 
 
+def _ensure_expected_db_has_items() -> None:
+    db_path = os.getenv("SQLITE_PATH", "").strip() or settings.sqlite_path
+    try:
+        with get_session() as session:
+            items_table_exists = bool(
+                session.execute(
+                    text(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='items' LIMIT 1"
+                    )
+                ).scalar()
+            )
+            if not items_table_exists:
+                logger.error("wrong db file: table items is missing sqlite_path={}", db_path)
+                raise SystemExit(1)
+
+            has_items = int(session.execute(text("SELECT COUNT(1) FROM items")).scalar() or 0)
+            if has_items <= 0:
+                logger.error("wrong db file: has_items=0 sqlite_path={}", db_path)
+                raise SystemExit(1)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        logger.error("wrong db file: sanity_check_failed sqlite_path={} err={}", db_path, type(exc).__name__)
+        raise SystemExit(1)
+
+
 async def _run_sheets_push_once(*, force: bool = False) -> int:
     global _last_sheets_push_sig
 
@@ -569,6 +595,8 @@ async def _run_vitrina_refresh() -> None:
 
 
 def main() -> None:
+    _ensure_expected_db_has_items()
+
     mode = (os.getenv("GOOGLE_SYNC_MODE", "full") or "full").strip().lower()
     if mode in {"sheets", "sheets_push", "sheets-only"}:
         asyncio.run(run_sheets_push_scheduler())

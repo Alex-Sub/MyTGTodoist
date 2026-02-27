@@ -74,11 +74,30 @@ ASSISTANT_STRICT_JSON_PROMPT = (
     "Отвечай ТОЛЬКО на русском языке."
 )
 
-SUPPORTED_INTENTS = {"task_create", "timeblock_create"}
-INTENT_CHOICE_LABELS = {
-    "timeblock_create": "создать блок времени",
-    "task_create": "создать задачу",
+ORGANIZER_ALLOWED_INTENTS = {
+    "task.create",
+    "task.update",
+    "task.complete",
+    "tasks.list_active",
+    "tasks.list_today",
+    "tasks.list_tomorrow",
+    "timeblock.create",
+    "timeblock.move",
+    "timeblock.delete",
 }
+SUPPORTED_INTENTS = set(ORGANIZER_ALLOWED_INTENTS)
+INTENT_CHOICE_LABELS = {
+    "timeblock.create": "встреча",
+    "task.create": "задача",
+    "task.update": "обновить задачу",
+    "task.complete": "завершить задачу",
+    "tasks.list_active": "список активных задач",
+    "tasks.list_today": "задачи на сегодня",
+    "tasks.list_tomorrow": "задачи на завтра",
+    "timeblock.move": "перенести встречу",
+    "timeblock.delete": "удалить встречу",
+}
+ORGANIZER_FALLBACK_QUESTION = "Не понял команду. Это задача или встреча?"
 
 
 @dataclass(slots=True)
@@ -170,7 +189,7 @@ def _load_intent_registry() -> dict[str, str]:
     for raw_name, spec in intents.items():
         if not isinstance(raw_name, str):
             continue
-        name = raw_name.strip().replace(".", "_")
+        name = _canonical_intent_name(raw_name)
         if name not in SUPPORTED_INTENTS:
             continue
         meaning = ""
@@ -202,7 +221,7 @@ def _build_command_system_prompt() -> str:
     lines = []
     for name in sorted(registry.keys()):
         lines.append(f"- {name}: {registry[name]}")
-    registry_block = "\n".join(lines) if lines else "- task_create\n- timeblock_create"
+    registry_block = "\n".join(lines) if lines else "- task.create\n- timeblock.create"
     return (
         COMMAND_SYSTEM_PROMPT
         + "\nAllowed intents (must use only these):\n"
@@ -237,20 +256,42 @@ def _normalize_command_payload(payload: dict[str, Any]) -> dict[str, Any]:
     # Canonical intent unification for runtime-supported names.
     intent_raw = str(payload.get("intent") or "").strip().lower()
     if intent_raw == "create_event":
-        payload["intent"] = "timeblock_create"
+        payload["intent"] = "timeblock.create"
     if intent_raw == "meeting_create":
-        payload["intent"] = "timeblock_create"
+        payload["intent"] = "timeblock.create"
     return payload
 
 
 def _canonical_intent_name(intent: str) -> str:
     raw = (intent or "").strip().lower()
     aliases = {
-        "create_task": "task_create",
-        "task_create": "task_create",
-        "create_event": "timeblock_create",
-        "meeting_create": "timeblock_create",
-        "timeblock_create": "timeblock_create",
+        "create_task": "task.create",
+        "task_create": "task.create",
+        "task.create": "task.create",
+        "update_task": "task.update",
+        "task_update": "task.update",
+        "task.update": "task.update",
+        "complete_task": "task.complete",
+        "delete_task": "task.complete",
+        "task_complete": "task.complete",
+        "task.complete": "task.complete",
+        "create_event": "timeblock.create",
+        "meeting_create": "timeblock.create",
+        "timeblock_create": "timeblock.create",
+        "timeblock.create": "timeblock.create",
+        "update_event": "timeblock.move",
+        "timeblock_move": "timeblock.move",
+        "timeblock.move": "timeblock.move",
+        "delete_event": "timeblock.delete",
+        "timeblock_delete": "timeblock.delete",
+        "timeblock.delete": "timeblock.delete",
+        "list_tasks": "tasks.list_active",
+        "tasks_list_active": "tasks.list_active",
+        "tasks.list_active": "tasks.list_active",
+        "tasks_list_today": "tasks.list_today",
+        "tasks.list_today": "tasks.list_today",
+        "tasks_list_tomorrow": "tasks.list_tomorrow",
+        "tasks.list_tomorrow": "tasks.list_tomorrow",
     }
     return aliases.get(raw, raw)
 
@@ -258,8 +299,12 @@ def _canonical_intent_name(intent: str) -> str:
 def _is_ambiguous_task_or_timeblock(text: str) -> bool:
     s = (text or "").lower()
     has_meeting = any(k in s for k in ("созвон", "встреч", "собран", "appointment"))
+    has_explicit_time = bool(
+        any(k in s for k in (" в ", "утра", "вечера", "am", "pm", "завтра", "сегодня"))
+        or any(ch.isdigit() for ch in s)
+    )
     has_duration = any(k in s for k in ("мин", "час", "minutes", "hours"))
-    return has_meeting and not has_duration
+    return has_meeting and not has_duration and not has_explicit_time
 
 
 def _clarify_task_or_timeblock(question: str, reason: str) -> InterpretationResult:
@@ -267,8 +312,8 @@ def _clarify_task_or_timeblock(question: str, reason: str) -> InterpretationResu
         type="clarify",
         question=question,
         choices=[
-            {"id": "timeblock_create", "label": INTENT_CHOICE_LABELS["timeblock_create"]},
-            {"id": "task_create", "label": INTENT_CHOICE_LABELS["task_create"]},
+            {"id": "timeblock.create", "label": INTENT_CHOICE_LABELS["timeblock.create"]},
+            {"id": "task.create", "label": INTENT_CHOICE_LABELS["task.create"]},
         ],
         expected_answer="choice_id",
         debug={"reason": reason},
@@ -276,7 +321,7 @@ def _clarify_task_or_timeblock(question: str, reason: str) -> InterpretationResu
 
 
 def _extract_args(intent: str, entities: dict[str, Any]) -> dict[str, Any]:
-    if intent == "task_create":
+    if intent == "task.create":
         title = (
             entities.get("title")
             or entities.get("task_title")
@@ -288,7 +333,7 @@ def _extract_args(intent: str, entities: dict[str, Any]) -> dict[str, Any]:
         if planned_at is not None:
             out["planned_at"] = planned_at
         return out
-    if intent == "timeblock_create":
+    if intent == "timeblock.create":
         title = entities.get("title") or entities.get("task_title")
         start_at = entities.get("start_at") or entities.get("start_iso") or entities.get("when")
         duration = entities.get("duration_minutes")
@@ -299,6 +344,8 @@ def _extract_args(intent: str, entities: dict[str, Any]) -> dict[str, Any]:
         if end_at is not None:
             out["end_at"] = end_at
         return out
+    if intent in {"tasks.list_active", "tasks.list_today", "tasks.list_tomorrow"}:
+        return {}
     return {}
 
 
@@ -306,15 +353,15 @@ def interpret(text: str, *, now_iso: Optional[str] = None) -> InterpretationResu
     req = LLMRequest(kind="text_command", text=text, now_iso=now_iso)
     llm_result = route_llm(req)
     if not llm_result.validation_ok or not isinstance(llm_result.payload, dict):
-        return _clarify_task_or_timeblock("Уточните, что нужно сделать?", "invalid_llm_payload")
+        return _clarify_task_or_timeblock(ORGANIZER_FALLBACK_QUESTION, "invalid_llm_payload")
     payload = llm_result.payload
     intent = _canonical_intent_name(str(payload.get("intent") or ""))
     entities = payload.get("entities")
     entities = entities if isinstance(entities, dict) else {}
     if _is_ambiguous_task_or_timeblock(text):
-        return _clarify_task_or_timeblock("Что выбрать: создать блок времени или создать задачу?", "ambiguous_intent")
-    if intent not in _load_intent_registry():
-        return _clarify_task_or_timeblock("Что выбрать: создать блок времени или создать задачу?", "unsupported_intent")
+        return _clarify_task_or_timeblock(ORGANIZER_FALLBACK_QUESTION, "ambiguous_intent")
+    if intent not in ORGANIZER_ALLOWED_INTENTS:
+        return _clarify_task_or_timeblock(ORGANIZER_FALLBACK_QUESTION, "unsupported_intent")
     return InterpretationResult(
         type="command",
         command={"intent": intent, "args": _extract_args(intent, entities)},
