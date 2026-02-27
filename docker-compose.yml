@@ -8,14 +8,21 @@ services:
     environment:
       TZ: ${TZ:-Europe/Moscow}
       APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
-      SQLITE_PATH: ${DB_PATH:-/data/organizer.db}
+      SQLITE_PATH: ${SQLITE_PATH:-${DB_PATH:-/data/organizer_alexey.db}}
       GOOGLE_SYNC_MODE: ${GOOGLE_SYNC_MODE:-sheets_push}
+      GOOGLE_SERVICE_ACCOUNT_FILE: /data/google_sa.json
       SYNC_POLL_ACTIVE_SEC: ${SYNC_POLL_ACTIVE_SEC:-30}
       SYNC_POLL_IDLE_SEC: ${SYNC_POLL_IDLE_SEC:-21600}
       SYNC_ACTIVE_WINDOW_MIN: ${SYNC_ACTIVE_WINDOW_MIN:-30}
     volumes:
       - db_data:/data
       - ./secrets:/secrets:ro
+      - type: bind
+        source: ${GOOGLE_SA_FILE_HOST:-./secrets/alexey/google_sa.json}
+        target: /data/google_sa.json
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       organizer-api:
         condition: service_healthy
@@ -137,6 +144,7 @@ services:
       APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       GOOGLE_CALENDAR_ID: ${GOOGLE_CALENDAR_ID}
+      ML_GATEWAY_URL: ${ML_GATEWAY_URL:-http://host.docker.internal:19000}
       # ML gateway is external.
       ML_CORE_URL: ${ML_CORE_URL:-http://host.docker.internal:19000}
       # Legacy (unused): ASR_SERVICE_URL

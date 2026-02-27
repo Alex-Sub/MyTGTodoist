@@ -60,7 +60,10 @@ _RETRY_EXCEPTIONS = _build_retry_exceptions()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ORGANIZER_API_URL = os.getenv("ORGANIZER_API_URL", "http://organizer-api:8000")
 WORKER_COMMAND_URL = os.getenv("WORKER_COMMAND_URL", "http://organizer-worker:8002")
+ML_GATEWAY_URL = (os.getenv("ML_GATEWAY_URL", "") or "").strip()
 ML_CORE_URL = (os.getenv("ML_CORE_URL", "") or "").strip()
+if not ML_GATEWAY_URL:
+    ML_GATEWAY_URL = ML_CORE_URL
 APP_TIMEZONE = (os.getenv("APP_TIMEZONE", "") or os.getenv("TIMEZONE", "Europe/Moscow")).strip() or "Europe/Moscow"
 VOICE_X_TIMEZONE = APP_TIMEZONE
 ML_HTTP_CONNECT_TIMEOUT = float(os.getenv("ML_HTTP_CONNECT_TIMEOUT", "10"))
@@ -117,6 +120,16 @@ _processed_update_ids_set: set[int] = set()
 _p2_pending_state: dict[int, dict] = {}
 _pending_clarify_state: dict[str, dict] = {}
 _daily_digest_sent_day: dict[int, str] = {}
+
+
+def _ml_gateway_target() -> tuple[str, str]:
+    gateway = str(ML_GATEWAY_URL or "").strip()
+    if gateway:
+        return gateway, "ML_GATEWAY_URL"
+    legacy = str(ML_CORE_URL or "").strip()
+    if legacy:
+        return legacy, "ML_CORE_URL"
+    return "", "empty"
 
 def _p7_enabled() -> bool:
     return P7_MODE == "on"
@@ -671,11 +684,18 @@ def _tg_download_file(file_path: str) -> tuple[bytes, str, str]:
 
 
 def _ml_gateway_voice_command(audio_bytes: bytes, *, filename: str, mime_type: str) -> tuple[dict | None, str | None]:
-    if not ML_CORE_URL:
-        log.warning("event=asr_unavailable source=voice reason=ml_core_url_empty")
+    gateway_url, gateway_source = _ml_gateway_target()
+    if not gateway_url:
+        log.warning("event=asr_unavailable source=voice reason=ml_gateway_url_empty")
         return None, "asr_unavailable"
-    req_url = f"{ML_CORE_URL.rstrip('/')}/voice-command"
-    log.info("event=gateway_call url=%s profile=%s tz=%s", req_url, "organizer", VOICE_X_TIMEZONE)
+    req_url = f"{gateway_url.rstrip('/')}/voice-command"
+    log.info(
+        "event=gateway_call url=%s profile=%s tz=%s ml_gateway_source=%s",
+        req_url,
+        "organizer",
+        VOICE_X_TIMEZONE,
+        gateway_source,
+    )
     try:
         req_mod = _require_requests()
         resp = req_mod.post(
@@ -712,11 +732,12 @@ def _ml_gateway_voice_command(audio_bytes: bytes, *, filename: str, mime_type: s
 
 
 def _ml_health_status() -> tuple[bool, str]:
-    if not ML_CORE_URL:
-        return False, "ML_CORE_URL не задан."
+    gateway_url, _gateway_source = _ml_gateway_target()
+    if not gateway_url:
+        return False, "ML_GATEWAY_URL не задан."
     try:
         req_mod = _require_requests()
-        resp = req_mod.get(f"{ML_CORE_URL.rstrip('/')}/health", timeout=ML_HTTP_TIMEOUT)
+        resp = req_mod.get(f"{gateway_url.rstrip('/')}/health", timeout=ML_HTTP_TIMEOUT)
         status = int(resp.status_code)
         if status >= 300:
             return False, f"ML health: status={status}"
@@ -725,6 +746,20 @@ def _ml_health_status() -> tuple[bool, str]:
         return ok, f"ML health: status={status} ok={ok}"
     except Exception as exc:
         return False, f"ML health error: {type(exc).__name__}"
+
+
+def _probe_ml_gateway_on_startup() -> None:
+    gateway_url, gateway_source = _ml_gateway_target()
+    ok, info = _ml_health_status()
+    if ok:
+        log.info("event=ml_gateway_health status=ok source=%s url=%s details=%s", gateway_source, gateway_url or "-", info)
+        return
+    log.warning(
+        "event=asr_unavailable source=voice reason=%s ml_gateway_source=%s url=%s",
+        info,
+        gateway_source,
+        gateway_url or "-",
+    )
 
 
 def _normalize_ws(text: str) -> str:
@@ -4030,7 +4065,13 @@ def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN is required")
 
-    log.info("bot_start")
+    gateway_url, gateway_source = _ml_gateway_target()
+    log.info(
+        "bot_start ml_gateway_url=%s ml_gateway_source=%s",
+        gateway_url or "-",
+        gateway_source,
+    )
+    _probe_ml_gateway_on_startup()
     os.makedirs("/tmp", exist_ok=True)
     _init_queue_schema()
     _start_health_server()

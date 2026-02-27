@@ -8,7 +8,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from loguru import logger
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from src.config import settings
 from src.db.models import CalendarSyncState, Conflict, Item, SyncOutbox
@@ -61,27 +61,63 @@ def _dt_to_iso_utc(value: datetime | None) -> str:
 
 
 def _build_sheets_push_rows(session) -> list[list[Any]]:
-    rows = list(
-        session.scalars(
-            select(Item).where(
-                Item.type == "task",
-                Item.status != "archived",
-            )
-        ).all()
-    )
+    cols_rows = session.execute(text("PRAGMA table_info(items)")).fetchall()
+    cols = {str(row[1]) for row in cols_rows if len(row) > 1}
+    if not cols:
+        return []
+
+    level_expr = "0"
+    if "level" in cols:
+        level_expr = "COALESCE(level, 0)"
+    elif "depth" in cols:
+        level_expr = "COALESCE(depth, 0)"
+
+    planned_expr = "NULL"
+    for name in ("planned_at", "scheduled_at", "due_at", "start_at"):
+        if name in cols:
+            planned_expr = name
+            break
+
+    updated_expr = "NULL"
+    for name in ("updated_at", "created_at"):
+        if name in cols:
+            updated_expr = name
+            break
+
+    where_parts: list[str] = []
+    if "type" in cols:
+        where_parts.append("type = 'task'")
+    if "status" in cols:
+        where_parts.append("COALESCE(status, '') <> 'archived'")
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    order_expr = updated_expr if updated_expr != "NULL" else "id"
+    q = f"""
+        SELECT
+            id,
+            parent_id,
+            {level_expr} AS level,
+            title,
+            {planned_expr} AS planned_at,
+            COALESCE(status, '') AS status,
+            {updated_expr} AS updated_at
+        FROM items
+        {where_sql}
+        ORDER BY {order_expr} DESC, id DESC
+    """
+    rows = session.execute(text(q)).mappings().all()
 
     out: list[list[Any]] = []
-    for item in sorted(rows, key=lambda x: (_dt_to_iso_utc(x.updated_at), str(x.id)), reverse=True):
-        planned_at = item.scheduled_at or item.due_at
+    for row in rows:
         out.append(
             [
-                str(item.id or ""),
-                str(item.parent_id or ""),
-                int(item.depth or 0),
-                str(item.title or ""),
-                _dt_to_iso_utc(planned_at),
-                str(item.status or ""),
-                _dt_to_iso_utc(item.updated_at),
+                str(row.get("id") or ""),
+                str(row.get("parent_id") or ""),
+                int(row.get("level") or 0),
+                str(row.get("title") or ""),
+                str(row.get("planned_at") or ""),
+                str(row.get("status") or ""),
+                str(row.get("updated_at") or ""),
             ]
         )
     return out
@@ -144,16 +180,20 @@ def _get_sync_state(session) -> CalendarSyncState:
 
 def _current_poll_interval() -> int:
     now = _utc_now()
-    with get_session() as session:
-        state = _get_sync_state(session)
-        active_until = state.active_until
-        if active_until is not None:
-            if active_until.tzinfo is None:
-                active_until = active_until.replace(tzinfo=timezone.utc)
-            else:
-                active_until = active_until.astimezone(timezone.utc)
-        if active_until is not None and now < active_until:
-            return max(5, int(settings.sync_poll_active_sec))
+    try:
+        with get_session() as session:
+            state = _get_sync_state(session)
+            active_until = state.active_until
+            if active_until is not None:
+                if active_until.tzinfo is None:
+                    active_until = active_until.replace(tzinfo=timezone.utc)
+                else:
+                    active_until = active_until.astimezone(timezone.utc)
+            if active_until is not None and now < active_until:
+                return max(5, int(settings.sync_poll_active_sec))
+    except Exception as exc:
+        logger.warning("sync poll state unavailable, fallback active interval err={}", type(exc).__name__)
+        return max(5, int(settings.sync_poll_active_sec))
     return max(30, int(settings.sync_poll_idle_sec))
 
 

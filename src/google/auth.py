@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 import secrets
 import time
 from typing import Optional
 from urllib.parse import urlencode
 
 import httpx
+from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -109,33 +112,59 @@ def exchange_code_for_tokens(code: str) -> dict:
         return response.json()
 
 
+def _get_service_account_access_token() -> str | None:
+    sa_path = str(os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "") or "").strip()
+    if not sa_path:
+        return None
+    if not os.path.exists(sa_path):
+        logger.warning("GOOGLE_SERVICE_ACCOUNT_FILE does not exist: {}", sa_path)
+        return None
+
+    scopes = list(settings.google_scopes or [])
+    sheets_scope = "https://www.googleapis.com/auth/spreadsheets"
+    if sheets_scope not in scopes:
+        scopes.append(sheets_scope)
+    try:
+        credentials = service_account.Credentials.from_service_account_file(sa_path, scopes=scopes)
+        credentials.refresh(Request())
+        token = str(credentials.token or "").strip()
+        if token:
+            return token
+    except Exception as exc:
+        logger.warning("service account token refresh failed err={}", type(exc).__name__)
+    return None
+
+
 def get_access_token() -> str:
-    with get_session() as session:
-        token = session.scalar(select(OAuthToken).where(OAuthToken.provider == "google"))
-        if not token:
-            raise RuntimeError("Google OAuth token not found")
+    try:
+        with get_session() as session:
+            token = session.scalar(select(OAuthToken).where(OAuthToken.provider == "google"))
+            if token:
+                if token.expiry_ts > _now_ts() + 30:
+                    return token.access_token
 
-        if token.expiry_ts > _now_ts() + 30:
-            return token.access_token
+                refresh_token = token.refresh_token
+                if refresh_token:
+                    payload = {
+                        "client_id": settings.google_client_id,
+                        "client_secret": settings.google_client_secret,
+                        "refresh_token": refresh_token,
+                        "grant_type": "refresh_token",
+                    }
+                    with httpx.Client(timeout=10.0) as client:
+                        response = client.post(GOOGLE_TOKEN_URL, data=payload)
+                        response.raise_for_status()
+                        data = response.json()
+                    logger.info("Refreshed Google access token (expiry in {}s)", data.get("expires_in"))
+                    _save_tokens(session, data)
+                    return data["access_token"]
+    except Exception as exc:
+        logger.warning("oauth token from db unavailable err={}", type(exc).__name__)
 
-        refresh_token = token.refresh_token
-        if not refresh_token:
-            raise RuntimeError("Google OAuth refresh token not found")
-
-        payload = {
-            "client_id": settings.google_client_id,
-            "client_secret": settings.google_client_secret,
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token",
-        }
-        with httpx.Client(timeout=10.0) as client:
-            response = client.post(GOOGLE_TOKEN_URL, data=payload)
-            response.raise_for_status()
-            data = response.json()
-
-        logger.info("Refreshed Google access token (expiry in {}s)", data.get("expires_in"))
-        _save_tokens(session, data)
-        return data["access_token"]
+    sa_token = _get_service_account_access_token()
+    if sa_token:
+        return sa_token
+    raise RuntimeError("Google OAuth token not found and service account token unavailable")
 
 
 def store_tokens(tokens: dict) -> OAuthToken:

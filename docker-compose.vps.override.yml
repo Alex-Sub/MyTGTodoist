@@ -1,7 +1,6 @@
 services:
   google-sync:
     environment:
-      SQLITE_PATH: ${DB_PATH:-/data/organizer.db}
       TZ: ${TZ:-Europe/Moscow}
       APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
 
@@ -22,6 +21,9 @@ services:
       DB_PATH: ${DB_PATH:-/data/organizer.db}
       TZ: ${TZ:-Europe/Moscow}
       APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
+      ML_GATEWAY_URL: ${ML_GATEWAY_URL:-http://host.docker.internal:19000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   db_data:
