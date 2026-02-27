@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from httpx import HTTPStatusError
 from loguru import logger
 from sqlalchemy import func, select, text
 
@@ -14,6 +15,7 @@ from src.config import settings
 from src.db.models import CalendarSyncState, Conflict, Item, SyncOutbox
 from src.db.session import get_session
 from src.exports.vitrina_tasks import build_vitrina
+from src.google.calendar_client import CalendarClient
 from src.google.google_sync import (
     pull_google_tasks_with_conflicts,
     sync_task_completed,
@@ -41,9 +43,11 @@ _last_sheets_push_sig: str | None = None
 _SHEETS_TASKS_TAB = "Tasks"
 _SHEETS_INBOX_TAB = "Inbox"
 _SHEETS_CALENDAR_TAB = "Calendar"
-_SHEETS_TASKS_INBOX_HEADER = ["id", "parent_id", "level", "title", "planned_at", "status", "updated_at"]
-_SHEETS_CALENDAR_HEADER = ["id", "title", "start_at", "end_at", "calendar_event_id", "updated_at"]
+_SHEETS_TASKS_INBOX_HEADER = ["id", "parent_id", "level", "title", "Дата", "Время", "status", "updated_at"]
+_SHEETS_CALENDAR_HEADER = ["id", "title", "Дата", "Время начала", "Время окончания", "updated_at"]
 _GARBAGE_LIST_PREFIXES = ("список ", "покажи ", "выведи ", "дай мне список")
+_SHEETS_TIMEZONE = ZoneInfo("Europe/Moscow")
+_CALENDAR_PULL_STATE_KEY = "__calendar_pull_sync__"
 
 
 def _utc_now() -> datetime:
@@ -99,6 +103,28 @@ def _value_to_iso(value: Any) -> str | None:
     return raw
 
 
+def _as_local_datetime(value: Any) -> datetime | None:
+    dt = _parse_iso_datetime(value)
+    if dt is None:
+        return None
+    return dt.astimezone(_SHEETS_TIMEZONE)
+
+
+def _local_date_from_iso(value: Any) -> str:
+    dt = _as_local_datetime(value)
+    return dt.strftime("%Y-%m-%d") if dt is not None else ""
+
+
+def _local_time_from_iso(value: Any) -> str:
+    dt = _as_local_datetime(value)
+    return dt.strftime("%H:%M") if dt is not None else ""
+
+
+def _local_datetime_label(value: Any) -> str:
+    dt = _as_local_datetime(value)
+    return dt.strftime("%Y-%m-%d %H:%M") if dt is not None else ""
+
+
 def planned_at_from_item(row: dict[str, Any]) -> str | None:
     return _value_to_iso(row.get("start_at"))
 
@@ -131,10 +157,10 @@ def _end_at_from_item(row: dict[str, Any], start_at: str | None) -> str | None:
 
 
 def _updated_at_from_item(row: dict[str, Any]) -> str:
-    updated = _value_to_iso(row.get("updated_at"))
+    updated = _local_datetime_label(row.get("updated_at"))
     if updated:
         return updated
-    created = _value_to_iso(row.get("created_at"))
+    created = _local_datetime_label(row.get("created_at"))
     return created or ""
 
 
@@ -183,6 +209,8 @@ def _partition_sheets_rows(items_rows: list[dict[str, Any]]) -> tuple[list[list[
                 "title": title,
                 "start_at": start_at,
                 "planned_at": planned,
+                "date": _local_date_from_iso(planned),
+                "time": _local_time_from_iso(planned),
                 "status": status,
                 "updated_at": updated_at,
             }
@@ -200,6 +228,9 @@ def _partition_sheets_rows(items_rows: list[dict[str, Any]]) -> tuple[list[list[
                     "start_at": start_at or "",
                     "end_at": end_at or "",
                     "calendar_event_id": calendar_event_id,
+                    "date": _local_date_from_iso(start_at),
+                    "start_time": _local_time_from_iso(start_at),
+                    "end_time": _local_time_from_iso(end_at),
                     "updated_at": updated_at,
                 }
             )
@@ -233,7 +264,8 @@ def _partition_sheets_rows(items_rows: list[dict[str, Any]]) -> tuple[list[list[
                 str(entry.get("parent_id") or ""),
                 int(entry.get("level") or 0),
                 str(entry.get("title") or ""),
-                str(entry.get("planned_at") or ""),
+                str(entry.get("date") or ""),
+                str(entry.get("time") or ""),
                 str(entry.get("status") or ""),
                 str(entry.get("updated_at") or ""),
             ]
@@ -247,7 +279,8 @@ def _partition_sheets_rows(items_rows: list[dict[str, Any]]) -> tuple[list[list[
                 str(entry.get("parent_id") or ""),
                 int(entry.get("level") or 0),
                 str(entry.get("title") or ""),
-                str(entry.get("planned_at") or ""),
+                str(entry.get("date") or ""),
+                str(entry.get("time") or ""),
                 str(entry.get("status") or ""),
                 str(entry.get("updated_at") or ""),
             ]
@@ -259,9 +292,9 @@ def _partition_sheets_rows(items_rows: list[dict[str, Any]]) -> tuple[list[list[
             [
                 str(entry.get("id") or ""),
                 str(entry.get("title") or ""),
-                str(entry.get("start_at") or ""),
-                str(entry.get("end_at") or ""),
-                str(entry.get("calendar_event_id") or ""),
+                str(entry.get("date") or ""),
+                str(entry.get("start_time") or ""),
+                str(entry.get("end_time") or ""),
                 str(entry.get("updated_at") or ""),
             ]
         )
@@ -275,11 +308,11 @@ def _build_sheets_push_rows(session) -> tuple[list[list[Any]], list[list[Any]], 
 def _sheets_push_signature(tasks_rows: list[list[Any]], inbox_rows: list[list[Any]], calendar_rows: list[list[Any]]) -> str:
     latest = ""
     for row in tasks_rows:
-        if len(row) > 6 and str(row[6] or "") > latest:
-            latest = str(row[6] or "")
+        if len(row) > 7 and str(row[7] or "") > latest:
+            latest = str(row[7] or "")
     for row in inbox_rows:
-        if len(row) > 6 and str(row[6] or "") > latest:
-            latest = str(row[6] or "")
+        if len(row) > 7 and str(row[7] or "") > latest:
+            latest = str(row[7] or "")
     for row in calendar_rows:
         if len(row) > 5 and str(row[5] or "") > latest:
             latest = str(row[5] or "")
@@ -317,6 +350,147 @@ def _ensure_expected_db_has_items() -> None:
         raise SystemExit(1)
 
 
+def _items_columns(session) -> set[str]:
+    rows = session.execute(text("PRAGMA table_info(items)")).fetchall()
+    return {str(row[1]) for row in rows if len(row) > 1}
+
+
+def _calendar_pull_state_key(calendar_id: str) -> str:
+    return f"{_CALENDAR_PULL_STATE_KEY}:{calendar_id}"
+
+
+def _get_calendar_pull_state(session, calendar_id: str) -> CalendarSyncState:
+    key = _calendar_pull_state_key(calendar_id)
+    state = session.scalar(select(CalendarSyncState).where(CalendarSyncState.calendar_id == key))
+    if state is not None:
+        return state
+    state = CalendarSyncState(calendar_id=key)
+    session.add(state)
+    session.flush()
+    return state
+
+
+def _event_dt(value: dict[str, Any] | None) -> datetime | None:
+    part = value or {}
+    raw = str(part.get("dateTime") or part.get("date") or "").strip()
+    if not raw:
+        return None
+    if len(raw) == 10 and "T" not in raw:
+        raw = f"{raw}T00:00:00+00:00"
+    return _parse_iso_datetime(raw)
+
+
+def _calendar_pull_sync_once(calendar_id: str) -> int:
+    updated_count = 0
+    client = CalendarClient()
+
+    with get_session() as session:
+        cols = _items_columns(session)
+        lookup_col = "calendar_event_id" if "calendar_event_id" in cols else ("event_id" if "event_id" in cols else None)
+        start_col = "start_at" if "start_at" in cols else ("scheduled_at" if "scheduled_at" in cols else None)
+        end_col = "end_at" if "end_at" in cols else None
+        if lookup_col is None or start_col is None:
+            return 0
+
+        state = _get_calendar_pull_state(session, calendar_id)
+        now = _utc_now()
+
+        def _process_items(items: list[dict[str, Any]]) -> None:
+            nonlocal updated_count
+            select_fields = ["id", lookup_col, start_col]
+            if end_col:
+                select_fields.append(end_col)
+            q_select = text(f"SELECT {', '.join(select_fields)} FROM items WHERE {lookup_col} = :event_id LIMIT 1")
+            for event in items:
+                event_id = str(event.get("id") or "").strip()
+                if not event_id:
+                    continue
+                if str(event.get("status") or "").strip().lower() == "cancelled":
+                    continue
+                start_dt = _event_dt(event.get("start"))
+                end_dt = _event_dt(event.get("end"))
+                if start_dt is None or end_dt is None:
+                    continue
+                start_iso = _dt_to_iso_utc(start_dt)
+                end_iso = _dt_to_iso_utc(end_dt)
+
+                row = session.execute(q_select, {"event_id": event_id}).mappings().first()
+                if row is None:
+                    continue
+
+                current_start = str(row.get(start_col) or "")
+                current_end = str(row.get(end_col) or "") if end_col else ""
+                if current_start == start_iso and (not end_col or current_end == end_iso):
+                    continue
+
+                sets = [f"{start_col} = :start_at"]
+                params: dict[str, Any] = {"id": row.get("id"), "start_at": start_iso}
+                if end_col:
+                    sets.append(f"{end_col} = :end_at")
+                    params["end_at"] = end_iso
+                if "updated_at" in cols:
+                    sets.append("updated_at = :updated_at")
+                    params["updated_at"] = now.isoformat()
+                session.execute(text(f"UPDATE items SET {', '.join(sets)} WHERE id = :id"), params)
+                updated_count += 1
+
+        def _poll(sync_token: str | None, *, time_min: str | None = None) -> str | None:
+            page_token: str | None = None
+            next_sync_token: str | None = None
+            while True:
+                response = client.list_events(
+                    calendar_id=calendar_id,
+                    sync_token=sync_token,
+                    time_min=time_min,
+                    time_max=None,
+                    page_token=page_token,
+                )
+                _process_items(list(response.get("items") or []))
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    next_sync_token = response.get("nextSyncToken")
+                    break
+            return next_sync_token
+
+        try:
+            next_token: str | None
+            if state.sync_token:
+                next_token = _poll(state.sync_token, time_min=None)
+            else:
+                full_from = (now - timedelta(days=90)).isoformat()
+                next_token = _poll(None, time_min=full_from)
+            if next_token:
+                state.sync_token = next_token
+        except HTTPStatusError as exc:
+            if int(getattr(exc.response, "status_code", 0)) == 410:
+                state.sync_token = None
+                full_from = (now - timedelta(days=90)).isoformat()
+                next_token = _poll(None, time_min=full_from)
+                if next_token:
+                    state.sync_token = next_token
+            else:
+                raise
+    return updated_count
+
+
+async def _run_calendar_pull_for_sheets() -> int:
+    if not settings.sync_in_enabled:
+        logger.info("CALENDAR pull no_changes")
+        return 0
+    calendar_id = (settings.google_calendar_id_default or "primary").strip() or "primary"
+    try:
+        async with _lock:
+            updated_count = await asyncio.to_thread(_calendar_pull_sync_once, calendar_id)
+        if updated_count > 0:
+            logger.info("CALENDAR pull updated={}", updated_count)
+        else:
+            logger.info("CALENDAR pull no_changes")
+        return updated_count
+    except Exception as exc:
+        logger.error("CALENDAR pull failed err={}", str(exc)[:300])
+        return 0
+
+
 async def _run_sheets_push_once(*, force: bool = False) -> int:
     global _last_sheets_push_sig
 
@@ -347,6 +521,7 @@ async def _run_sheets_push_once(*, force: bool = False) -> int:
             _SHEETS_TASKS_TAB,
             list(_SHEETS_TASKS_INBOX_HEADER),
             tasks_rows,
+            value_input_option="USER_ENTERED",
         )
         await asyncio.to_thread(client.clear_sheet, spreadsheet_id, _SHEETS_INBOX_TAB)
         await asyncio.to_thread(
@@ -355,6 +530,7 @@ async def _run_sheets_push_once(*, force: bool = False) -> int:
             _SHEETS_INBOX_TAB,
             list(_SHEETS_TASKS_INBOX_HEADER),
             inbox_rows,
+            value_input_option="USER_ENTERED",
         )
         await asyncio.to_thread(client.clear_sheet, spreadsheet_id, _SHEETS_CALENDAR_TAB)
         await asyncio.to_thread(
@@ -363,6 +539,7 @@ async def _run_sheets_push_once(*, force: bool = False) -> int:
             _SHEETS_CALENDAR_TAB,
             list(_SHEETS_CALENDAR_HEADER),
             calendar_rows,
+            value_input_option="USER_ENTERED",
         )
         _last_sheets_push_sig = sig
         logger.info("SHEETS export tasks={} inbox={} calendar={}", len(tasks_rows), len(inbox_rows), len(calendar_rows))
@@ -442,12 +619,15 @@ async def run_sheets_push_scheduler() -> None:
     else:
         logger.info("SHEETS enabled spreadsheet_id={}", spreadsheet_id)
 
+    await _run_calendar_pull_for_sheets()
+
     # Bootstrap export: fill table immediately on startup.
     await _run_sheets_push_once(force=True)
 
     while True:
         interval = _current_poll_interval()
         await asyncio.sleep(interval)
+        await _run_calendar_pull_for_sheets()
         await _run_sheets_push_once(force=False)
 
 

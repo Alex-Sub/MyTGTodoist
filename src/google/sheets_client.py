@@ -175,6 +175,8 @@ class SheetsClient:
         sheet_name: str,
         header: list[str],
         rows: list[list[Any]],
+        *,
+        value_input_option: str = "RAW",
     ) -> None:
         values: list[list[Any]] = [list(header)]
         for row in rows:
@@ -184,7 +186,7 @@ class SheetsClient:
             resp = client.put(
                 f"{GOOGLE_SHEETS_API}/{spreadsheet_id}/values/{target}",
                 headers=self._headers(),
-                params={"valueInputOption": "RAW"},
+                params={"valueInputOption": value_input_option},
                 json={"range": f"'{sheet_name}'!A1", "majorDimension": "ROWS", "values": values},
             )
             resp.raise_for_status()
