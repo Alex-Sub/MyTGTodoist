@@ -253,7 +253,7 @@ class SheetsClient:
         meta_range = f"'{sheet_name}'!A1:L1"
         with httpx.Client(timeout=15.0) as client:
             resp = client.put(
-                f"{GOOGLE_SHEETS_API}/{spreadsheet_id}/values/{quote(meta_range, safe=\"!:'\")}",
+                f"{GOOGLE_SHEETS_API}/{spreadsheet_id}/values/{quote(meta_range, safe='!:' + chr(39))}",
                 headers=self._headers(),
                 params={"valueInputOption": "RAW"},
                 json={"range": meta_range, "majorDimension": "ROWS", "values": [meta_row]},
@@ -263,7 +263,7 @@ class SheetsClient:
         header_range = f"'{sheet_name}'!A3:Z3"
         with httpx.Client(timeout=15.0) as client:
             resp = client.get(
-                f"{GOOGLE_SHEETS_API}/{spreadsheet_id}/values/{quote(header_range, safe=\"!:'\")}",
+                f"{GOOGLE_SHEETS_API}/{spreadsheet_id}/values/{quote(header_range, safe='!:' + chr(39))}",
                 headers=self._headers(),
             )
             resp.raise_for_status()
@@ -272,7 +272,7 @@ class SheetsClient:
             if not has_header:
                 write_header_range = f"'{sheet_name}'!A3"
                 resp = client.put(
-                    f"{GOOGLE_SHEETS_API}/{spreadsheet_id}/values/{quote(write_header_range, safe=\"!:'\")}",
+                    f"{GOOGLE_SHEETS_API}/{spreadsheet_id}/values/{quote(write_header_range, safe='!:' + chr(39))}",
                     headers=self._headers(),
                     params={"valueInputOption": "RAW"},
                     json={"range": write_header_range, "majorDimension": "ROWS", "values": [list(header)]},
@@ -283,7 +283,7 @@ class SheetsClient:
                 row[1] = status
             append_range = f"'{sheet_name}'!A4"
             resp = client.post(
-                f"{GOOGLE_SHEETS_API}/{spreadsheet_id}/values/{quote(append_range, safe=\"!:'\")}:append",
+                f"{GOOGLE_SHEETS_API}/{spreadsheet_id}/values/{quote(append_range, safe='!:' + chr(39))}:append",
                 headers=self._headers(),
                 params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"},
                 json={"range": append_range, "majorDimension": "ROWS", "values": [list(row)]},

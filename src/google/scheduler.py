@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -36,6 +37,8 @@ _last_calendar_pull_error: str | None = None
 _last_tasks_pull_error: str | None = None
 _last_sheets_pull_error: str | None = None
 _last_vitrina_error: str | None = None
+_last_sheets_push_sig: str | None = None
+_SHEETS_PUSH_HEADER = ["id", "parent_id", "level", "title", "planned_at", "status", "updated_at"]
 
 
 def _utc_now() -> datetime:
@@ -44,6 +47,89 @@ def _utc_now() -> datetime:
 
 def _fmt_dt(value: datetime | None) -> str:
     return value.isoformat() if value is not None else ""
+
+
+def _dt_to_iso_utc(value: datetime | None) -> str:
+    if value is None:
+        return ""
+    dt = value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat()
+
+
+def _build_sheets_push_rows(session) -> list[list[Any]]:
+    rows = list(
+        session.scalars(
+            select(Item).where(
+                Item.type == "task",
+                Item.status != "archived",
+            )
+        ).all()
+    )
+
+    out: list[list[Any]] = []
+    for item in sorted(rows, key=lambda x: (_dt_to_iso_utc(x.updated_at), str(x.id)), reverse=True):
+        planned_at = item.scheduled_at or item.due_at
+        out.append(
+            [
+                str(item.id or ""),
+                str(item.parent_id or ""),
+                int(item.depth or 0),
+                str(item.title or ""),
+                _dt_to_iso_utc(planned_at),
+                str(item.status or ""),
+                _dt_to_iso_utc(item.updated_at),
+            ]
+        )
+    return out
+
+
+def _sheets_push_signature(rows: list[list[Any]]) -> str:
+    if not rows:
+        return "rows=0"
+    latest = ""
+    for row in rows:
+        if len(row) > 6 and str(row[6] or "") > latest:
+            latest = str(row[6] or "")
+    return f"rows={len(rows)};latest={latest}"
+
+
+async def _run_sheets_push_once(*, force: bool = False) -> int:
+    global _last_sheets_push_sig
+
+    spreadsheet_id = (settings.google_sheets_spreadsheet_id or "").strip()
+    if not spreadsheet_id:
+        logger.warning("SHEETS disabled spreadsheet_id=empty")
+        return 0
+
+    try:
+        client = SheetsClient()
+        await asyncio.to_thread(client.ensure_tabs, spreadsheet_id, [settings.google_vitrina_sheet_name])
+
+        with get_session() as session:
+            rows = _build_sheets_push_rows(session)
+
+        sig = _sheets_push_signature(rows)
+        if not force and sig == _last_sheets_push_sig:
+            return len(rows)
+
+        await asyncio.to_thread(client.clear_sheet, spreadsheet_id, settings.google_vitrina_sheet_name)
+        await asyncio.to_thread(
+            client.write_table,
+            spreadsheet_id,
+            settings.google_vitrina_sheet_name,
+            list(_SHEETS_PUSH_HEADER),
+            rows,
+        )
+        _last_sheets_push_sig = sig
+        logger.info("SHEETS push ok rows={}", len(rows))
+        return len(rows)
+    except Exception as exc:
+        logger.error("SHEETS push failed err={}", str(exc)[:300])
+        return 0
 
 
 def _get_sync_state(session) -> CalendarSyncState:
@@ -102,6 +188,22 @@ async def run_calendar_scheduler() -> None:
         interval = _current_poll_interval()
         logger.debug("sync_poll_sleep_sec={} mode={}", interval, "active" if interval == int(settings.sync_poll_active_sec) else "idle")
         await asyncio.sleep(interval)
+
+
+async def run_sheets_push_scheduler() -> None:
+    spreadsheet_id = (settings.google_sheets_spreadsheet_id or "").strip()
+    if not spreadsheet_id:
+        logger.warning("SHEETS disabled spreadsheet_id=empty")
+    else:
+        logger.info("SHEETS enabled spreadsheet_id={}", spreadsheet_id)
+
+    # Bootstrap export: fill table immediately on startup.
+    await _run_sheets_push_once(force=True)
+
+    while True:
+        interval = _current_poll_interval()
+        await asyncio.sleep(interval)
+        await _run_sheets_push_once(force=False)
 
 
 async def _run_pull() -> None:
@@ -424,3 +526,15 @@ async def _run_vitrina_refresh() -> None:
     except Exception as exc:
         _last_vitrina_error = str(exc)[:300]
         logger.error("vitrina refresh error: {}", exc)
+
+
+def main() -> None:
+    mode = (os.getenv("GOOGLE_SYNC_MODE", "full") or "full").strip().lower()
+    if mode in {"sheets", "sheets_push", "sheets-only"}:
+        asyncio.run(run_sheets_push_scheduler())
+        return
+    asyncio.run(run_calendar_scheduler())
+
+
+if __name__ == "__main__":
+    main()

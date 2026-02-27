@@ -1,4 +1,27 @@
 services:
+  google-sync:
+    build:
+      context: .
+      dockerfile: ./google-sync/Dockerfile
+    env_file:
+      - deploy/tenants/.env.alexey
+    environment:
+      TZ: ${TZ:-Europe/Moscow}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
+      SQLITE_PATH: ${DB_PATH:-/data/organizer.db}
+      GOOGLE_SYNC_MODE: ${GOOGLE_SYNC_MODE:-sheets_push}
+      SYNC_POLL_ACTIVE_SEC: ${SYNC_POLL_ACTIVE_SEC:-30}
+      SYNC_POLL_IDLE_SEC: ${SYNC_POLL_IDLE_SEC:-21600}
+      SYNC_ACTIVE_WINDOW_MIN: ${SYNC_ACTIVE_WINDOW_MIN:-30}
+    volumes:
+      - db_data:/data
+      - ./secrets:/secrets:ro
+    depends_on:
+      organizer-api:
+        condition: service_healthy
+    command: ["python", "-m", "src.google.scheduler"]
+    restart: unless-stopped
+
   organizer-api:
     build:
       context: ./organizer-api

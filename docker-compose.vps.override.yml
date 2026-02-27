@@ -1,4 +1,10 @@
 services:
+  google-sync:
+    environment:
+      SQLITE_PATH: ${DB_PATH:-/data/organizer.db}
+      TZ: ${TZ:-Europe/Moscow}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
+
   organizer-api:
     environment:
       DB_PATH: ${DB_PATH:-/data/organizer.db}
