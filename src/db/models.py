@@ -204,3 +204,31 @@ class SyncOutbox(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class SyncState(Base):
+    __tablename__ = "sync_state"
+
+    item_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    calendar_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    last_db_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_sheet_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_calendar_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_sheet_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_calendar_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_db_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_conflict_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SyncConflict(Base):
+    __tablename__ = "sync_conflicts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    item_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    db_payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sheet_payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    calendar_payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open", server_default="open", index=True)
+    resolution: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

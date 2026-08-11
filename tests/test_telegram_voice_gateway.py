@@ -1,413 +1,323 @@
+from __future__ import annotations
+
 import importlib.util
+import sys
+import types
 from pathlib import Path
+from typing import Any, Dict, List
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BOT_PATH = ROOT / "telegram-bot" / "bot.py"
-
-spec = importlib.util.spec_from_file_location("telegram_bot_module", BOT_PATH)
-assert spec is not None and spec.loader is not None
-telegram_bot = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(telegram_bot)
+APP_SRC = ROOT / "telegram-bot" / "app-integration" / "src"
+HANDLER_PATH = APP_SRC / "app" / "handler.py"
+RUNTIME_BRIDGE_PATH = APP_SRC / "integrations" / "telegram" / "runtime_bridge.py"
+UPDATE_MAPPER_PATH = APP_SRC / "integrations" / "telegram" / "update_mapper.py"
 
 
-def test_build_runtime_envelope_from_ml_happy_path() -> None:
-    response = {
-        "transcript": "создай задачу купить молоко",
-        "transcript_norm": "создай задачу купить молоко",
-        "command": {
-            "intent": "create_task",
-            "title": "Купить молоко",
-            "details": "2 литра",
-            "when": "2026-02-24T10:00:00+01:00",
-            "priority": "high",
-            "tags": ["home"],
-            "assignees": ["alexey"],
+def _load_module(module_path: Path, module_name: str):
+    preserved: dict[str, Any] = {}
+    for key in list(sys.modules.keys()):
+        if key == "src" or key.startswith("src."):
+            preserved[key] = sys.modules.pop(key)
+
+    src_pkg = types.ModuleType("src")
+    src_pkg.__path__ = [str(APP_SRC)]  # type: ignore[attr-defined]
+    sys.modules["src"] = src_pkg
+
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+
+    for key in list(sys.modules.keys()):
+        if key == "src" or key.startswith("src."):
+            sys.modules.pop(key)
+    sys.modules.update(preserved)
+    return module
+
+
+class _AsrSequence:
+    def __init__(self, outputs: list[Any]) -> None:
+        self.outputs = list(outputs)
+        self.calls = 0
+
+    def transcribe(
+        self,
+        audio_bytes: bytes,
+        mime_type: str | None = None,  # noqa: ARG002
+        filename: str | None = None,  # noqa: ARG002
+        request_id: str | None = None,  # noqa: ARG002
+    ) -> str:
+        _ = audio_bytes
+        self.calls += 1
+        if not self.outputs:
+            return ""
+        current = self.outputs.pop(0)
+        if isinstance(current, BaseException):
+            raise current
+        return str(current)
+
+
+class _ProbeLLM:
+    def __init__(self, payload: dict | None = None) -> None:
+        self.payload = payload or {"intent": "task.create", "entities": {"title": "test"}}
+        self.calls = 0
+
+    def parse(self, *, text: str) -> dict:  # noqa: ARG002
+        self.calls += 1
+        return dict(self.payload)
+
+
+class _ProbeREC:
+    def __init__(self, payload: dict | None = None) -> None:
+        self.payload = payload or {"outcome": "ok", "hits": [{"id": "h1", "type": "task"}]}
+        self.calls = 0
+
+    def query(self, payload: dict) -> dict:  # noqa: ARG002
+        self.calls += 1
+        return dict(self.payload)
+
+
+class _FakeDb:
+    def __init__(self, session: dict | None) -> None:
+        self.session = session
+        self.deleted_contexts: list[str] = []
+        self.upserts: list[dict] = []
+
+    def get_active_clarification_session(self, context_key: str, ttl_seconds: int) -> dict | None:  # noqa: ARG002
+        return self.session
+
+    def upsert_clarification_session(self, **kwargs) -> None:
+        self.upserts.append(kwargs)
+
+    def delete_clarification_session(self, context_key: str) -> None:
+        self.deleted_contexts.append(context_key)
+
+    def get_command_dedup(self, idempotency_key: str) -> dict | None:  # noqa: ARG002
+        return None
+
+    def reserve_command_dedup(self, idempotency_key: str, intent: str) -> bool:  # noqa: ARG002
+        return True
+
+    def delete_command_dedup(self, idempotency_key: str) -> None:  # noqa: ARG002
+        return None
+
+    def finalize_command_dedup(self, **kwargs) -> None:  # noqa: ARG002
+        return None
+
+    def is_command_dedup_stale(self, existing: dict, ttl_seconds: int) -> bool:  # noqa: ARG002
+        return False
+
+    def reclaim_command_dedup(self, idempotency_key: str, intent: str) -> bool:  # noqa: ARG002
+        return False
+
+
+def test_voice_update_maps_to_runtime_request_with_voice_metadata() -> None:
+    mapper = _load_module(UPDATE_MAPPER_PATH, "app_integration_update_mapper_for_voice_gateway")
+    update = {
+        "update_id": 1001,
+        "message": {
+            "message_id": 77,
+            "chat": {"id": 2002},
+            "from": {"id": 1001},
+            "voice": {
+                "file_id": "voice-file-1",
+                "file_unique_id": "voice-uniq-1",
+                "duration": 9,
+                "mime_type": "audio/ogg",
+            },
         },
     }
-    envelope, err = telegram_bot._build_runtime_envelope_from_ml_response(
-        chat_id=123,
-        update_id=456,
-        message_id=789,
-        response_json=response,
-    )
-    assert err is None
-    assert envelope is not None
-    assert envelope["command"]["intent"] == "task.create"
-    entities = envelope["command"]["entities"]
-    assert entities["title"] == "Купить молоко"
-    assert entities["planned_at"] == "2026-02-24T10:00:00+01:00"
-    assert entities["source_msg_id"] == "tg:123:789"
+
+    req = mapper.map_update_to_request(update, app_id="app", tenant_id="tenant", timezone="Europe/Moscow")
+
+    assert req.text is None
+    assert req.audio_filename == "voice-file-1.ogg"
+    voice_meta = req.metadata.get("voice")
+    assert isinstance(voice_meta, dict)
+    assert voice_meta["file_id"] == "voice-file-1"
+    assert voice_meta["file_unique_id"] == "voice-uniq-1"
+    assert voice_meta["duration"] == 9
 
 
-def test_ml_gateway_timeout_returns_asr_timeout(monkeypatch) -> None:
-    class FakeRequests:
-        def post(self, *args, **kwargs):  # noqa: ANN002, ANN003
-            raise TimeoutError("ml timeout")
+def test_voice_request_in_direct_mode_is_transcribed_and_routed_without_block_message() -> None:
+    runtime_bridge = _load_module(RUNTIME_BRIDGE_PATH, "app_integration_runtime_bridge_module_voice_gateway")
+    handler = _load_module(HANDLER_PATH, "app_integration_handler_voice_gateway_bridge")
 
-    monkeypatch.setattr(telegram_bot, "_require_requests", lambda: FakeRequests())
-    monkeypatch.setattr(telegram_bot, "ML_CORE_URL", "http://ml.local")
-    payload, err = telegram_bot._ml_gateway_voice_command(
-        b"abc",
-        filename="voice.ogg",
-        mime_type="audio/ogg",
-    )
-    assert payload is None
-    assert err == "asr_timeout"
+    class _AsrProbe:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.request_ids: List[str] = []
 
+        def transcribe(self, audio_bytes: bytes, mime_type: str | None = None, filename: str | None = None, request_id: str | None = None) -> str:  # noqa: ARG002
+            assert audio_bytes == b"voice-bytes"
+            self.calls += 1
+            self.request_ids.append(str(request_id or ""))
+            return "запланируй встречу завтра в 12"
 
-def test_build_runtime_envelope_empty_transcript_returns_asr_empty() -> None:
-    response = {
-        "transcript": "",
-        "transcript_norm": "   ",
-        "command": {"intent": "create_task", "title": "Любая задача"},
-    }
-    envelope, err = telegram_bot._build_runtime_envelope_from_ml_response(
-        chat_id=1,
-        update_id=2,
-        message_id=3,
-        response_json=response,
-    )
-    assert envelope is None
-    assert err == "asr_empty"
+    class _LlmProbe:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.last_text = ""
 
-
-def test_handle_voice_timeout_returns_retry_message(monkeypatch) -> None:
-    sent: list[str] = []
-    monkeypatch.setattr(telegram_bot, "_send_message", lambda _chat_id, text: sent.append(text))
-    monkeypatch.setattr(telegram_bot, "_tg_get_file_path", lambda _file_id: "voice/file.ogg")
-    monkeypatch.setattr(telegram_bot, "_tg_download_file", lambda _path: (b"abc", "voice.ogg", "audio/ogg"))
-    monkeypatch.setattr(
-        telegram_bot,
-        "_ml_gateway_voice_command",
-        lambda _audio, **_kwargs: (None, "asr_timeout"),
-    )
-    message = {"chat": {"id": 42}, "voice": {"file_id": "f1"}, "message_id": 7}
-    telegram_bot._handle_voice_message(update_id=1001, message=message)
-    assert sent == ["Не получилось разобрать речь. Попробуй сказать ещё раз."]
-
-
-def test_handle_voice_invalid_json_returns_later_message(monkeypatch) -> None:
-    sent: list[str] = []
-    monkeypatch.setattr(telegram_bot, "_send_message", lambda _chat_id, text: sent.append(text))
-    monkeypatch.setattr(telegram_bot, "_tg_get_file_path", lambda _file_id: "voice/file.ogg")
-    monkeypatch.setattr(telegram_bot, "_tg_download_file", lambda _path: (b"abc", "voice.ogg", "audio/ogg"))
-    monkeypatch.setattr(
-        telegram_bot,
-        "_ml_gateway_voice_command",
-        lambda _audio, **_kwargs: (None, "llm_invalid_output"),
-    )
-    message = {"chat": {"id": 42}, "voice": {"file_id": "f1"}, "message_id": 7}
-    telegram_bot._handle_voice_message(update_id=1002, message=message)
-    assert sent == ["Я сейчас не могу корректно обработать запрос. Давай попробуем позже."]
-
-
-def test_handle_voice_clarify_creates_pending_and_asks_question(monkeypatch) -> None:
-    sent: list[tuple[int, str, dict]] = []
-    stored: dict[str, object] = {}
-    monkeypatch.setattr(telegram_bot, "_tg_get_file_path", lambda _file_id: "voice/file.ogg")
-    monkeypatch.setattr(telegram_bot, "_tg_download_file", lambda _path: (b"abc", "voice.ogg", "audio/ogg"))
-    monkeypatch.setattr(
-        telegram_bot,
-        "_ml_gateway_voice_command",
-        lambda _audio, **_kwargs: (
-            {
-                "type": "clarify",
-                "clarifying_question": "Что выбрать: создать блок времени или создать задачу?",
-                "choices": [
-                    {
-                        "id": "timeblock_create",
-                        "title": "Поставить блок времени",
-                        "patch": {"command": {"intent": "timeblock.create"}},
-                    },
-                    {
-                        "id": "task_create",
-                        "title": "Создать задачу",
-                        "patch": {"command": {"intent": "task.create"}},
-                    },
-                ],
-                "draft_envelope": {
-                    "trace_id": "tr-1",
-                    "source": {"channel": "telegram_voice"},
-                    "command": {"intent": "task.create", "entities": {"title": "Созвон завтра"}},
+        def parse(self, *, text: str) -> Dict[str, Any]:
+            self.calls += 1
+            self.last_text = text
+            return {
+                "intent": "schedule_meeting",
+                "entities": {
+                    "text": text,
+                    "date": "2026-04-29",
+                    "time": "12",
                 },
-            },
-            None,
-        ),
+            }
+
+    class _RecProbe:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def query(self, payload: Dict[str, Any]) -> Dict[str, Any]:  # noqa: ARG002
+            self.calls += 1
+            return {"outcome": "ok", "hits": []}
+
+    asr = _AsrProbe()
+    llm = _LlmProbe()
+    rec = _RecProbe()
+
+    def direct_handler(req):  # noqa: ANN001
+        return handler.handle_user_attempt(
+            request_id=req.request_id,
+            user_id=req.user_id,
+            channel=req.channel,
+            asr_client=asr,
+            llm_client=llm,
+            rec_client=rec,
+            audio_bytes=req.audio_bytes,
+            audio_mime=req.audio_mime,
+            audio_filename=req.audio_filename,
+            text=req.text,
+            metadata=req.metadata,
+            local_db=None,
+            app_id=req.app_id,
+            tenant_id=req.tenant_id,
+            source_chat_id=req.chat_id,
+            source_message_id=req.source_message_id,
+        )
+
+    bridge = runtime_bridge.RuntimeBridge(
+        worker_command_url="http://worker/runtime/command",
+        direct_handler=direct_handler,
+        direct_voice_enabled=False,
     )
-    monkeypatch.setattr(telegram_bot, "_pending_clarify_put", lambda uid, payload: stored.update({"uid": uid, "payload": payload}))
-    monkeypatch.setattr(
-        telegram_bot,
-        "_send_message_with_keyboard",
-        lambda chat_id, text, reply_markup: sent.append((chat_id, text, reply_markup)),
-    )
-    monkeypatch.setattr(telegram_bot, "_worker_post_ex", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("runtime must not be called")))
-
-    message = {"chat": {"id": 42}, "from": {"id": 4242}, "voice": {"file_id": "f1"}, "message_id": 7}
-    telegram_bot._handle_voice_message(update_id=1101, message=message)
-
-    assert stored.get("uid") == 4242
-    pending = stored.get("payload")
-    assert isinstance(pending, dict)
-    assert pending.get("clarifying_question") == "Что выбрать: создать блок времени или создать задачу?"
-    assert sent
-    assert sent[0][0] == 42
-    assert sent[0][1] == "Что выбрать: создать блок времени или создать задачу?"
-
-
-def test_pending_text_choice_applies_patch_and_routes_to_runtime(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(telegram_bot, "PENDING_CLARIFY_PATH", str(tmp_path / "pending.json"))
-    telegram_bot._pending_clarify_state = {
-        "99": {
-            "pending_id": "p-1",
-            "trace_id": "tr-99",
-            "channel": "telegram_voice",
-            "user_id": "99",
-            "created_at": "2026-02-26T00:00:00Z",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "clarifying_question": "Что выбрать?",
-            "choices": [
-                {"id": "timeblock_create", "title": "Поставить блок времени", "patch": {"command": {"intent": "timeblock.create"}}},
-                {"id": "task_create", "title": "Создать задачу", "patch": {"command": {"intent": "task.create"}}},
-            ],
-            "draft_envelope": {
-                "trace_id": "tr-99",
-                "source": {"channel": "telegram_voice"},
-                "command": {"intent": "task.create", "entities": {"title": "Созвон завтра"}},
-            },
-            "stage": "llm_disambiguation",
-        }
-    }
-    posted: list[dict] = []
-    sent: list[str] = []
-    monkeypatch.setattr(telegram_bot, "_queue_depths", lambda: (0, 0))
-    monkeypatch.setattr(telegram_bot, "_enqueue_text", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not enqueue while pending exists")))
-    monkeypatch.setattr(telegram_bot, "_p2_handle_text", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("p2 flow must not run while pending exists")))
-    monkeypatch.setattr(
-        telegram_bot,
-        "_worker_post_ex",
-        lambda path, payload: (posted.append({"path": path, "payload": payload}) or True, {"ok": True, "user_message": "OK"}, 200, None),
-    )
-    monkeypatch.setattr(telegram_bot, "_send_message", lambda _chat_id, text: sent.append(text))
-
-    message = {"chat": {"id": 99}, "from": {"id": 99}, "message_id": 5, "text": "блок"}
-    telegram_bot._handle_text_message(update_id=2001, message=message, pending_state={})
-
-    assert posted
-    assert posted[0]["path"] == "/runtime/command"
-    assert posted[0]["payload"]["command"]["intent"] == "timeblock.create"
-    assert "source_msg_id" in posted[0]["payload"]["command"]["entities"]
-    assert "99" not in telegram_bot._pending_clarify_state
-    assert sent == ["OK"]
-
-
-def test_expired_pending_is_pruned_and_message_goes_to_normal_flow(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(telegram_bot, "PENDING_CLARIFY_PATH", str(tmp_path / "pending.json"))
-    telegram_bot._pending_clarify_state = {
-        "77": {
-            "pending_id": "p-expired",
-            "trace_id": "tr-77",
-            "channel": "telegram_text",
-            "user_id": "77",
-            "created_at": "2020-01-01T00:00:00Z",
-            "expires_at": "2020-01-01T00:00:01Z",
-            "clarifying_question": "Выбор?",
-            "choices": [{"id": "task_create", "title": "Создать задачу", "patch": {"command": {"intent": "task.create"}}}],
-            "draft_envelope": None,
-            "stage": "llm_disambiguation",
-        }
-    }
-    enq_calls: list[dict] = []
-    sent: list[str] = []
-    monkeypatch.setattr(telegram_bot, "_queue_depths", lambda: (0, 0))
-    monkeypatch.setattr(
-        telegram_bot,
-        "_enqueue_text",
-        lambda **kwargs: (enq_calls.append(kwargs) or True, 1),
-    )
-    monkeypatch.setattr(telegram_bot, "_p2_handle_text", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(telegram_bot, "_send_message", lambda _chat_id, text: sent.append(text))
-
-    message = {"chat": {"id": 77}, "from": {"id": 77}, "message_id": 11, "text": "купи молоко"}
-    telegram_bot._handle_text_message(update_id=2002, message=message, pending_state={})
-
-    assert enq_calls
-    assert sent == ["Принято. В очереди: 1."]
-    assert "77" not in telegram_bot._pending_clarify_state
-
-
-def test_pending_unknown_text_replies_choose_one(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(telegram_bot, "PENDING_CLARIFY_PATH", str(tmp_path / "pending.json"))
-    telegram_bot._pending_clarify_state = {
-        "55": {
-            "pending_id": "p-55",
-            "trace_id": "tr-55",
-            "channel": "telegram_text",
-            "user_id": "55",
-            "created_at": "2026-02-26T00:00:00Z",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "clarifying_question": "Что выбрать?",
-            "choices": [
-                {"id": "task_create", "title": "Создать задачу", "patch": {"command": {"intent": "task.create"}}},
-                {"id": "timeblock_create", "title": "Поставить блок времени", "patch": {"command": {"intent": "timeblock.create"}}},
-            ],
-            "draft_envelope": None,
-            "stage": "llm_disambiguation",
-        }
-    }
-    sent_kb: list[tuple[int, str, dict]] = []
-    monkeypatch.setattr(telegram_bot, "_send_message_with_keyboard", lambda chat_id, text, reply_markup: sent_kb.append((chat_id, text, reply_markup)))
-    monkeypatch.setattr(telegram_bot, "_queue_depths", lambda: (_ for _ in ()).throw(AssertionError("must not enqueue")))
-    monkeypatch.setattr(telegram_bot, "_worker_post_ex", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("runtime must not be called")))
-
-    message = {"chat": {"id": 55}, "from": {"id": 55}, "message_id": 9, "text": "что?"}
-    telegram_bot._handle_text_message(update_id=2003, message=message, pending_state={})
-
-    assert sent_kb
-    assert sent_kb[0][1] == "Не понял выбор. Пожалуйста, выберите один из вариантов:"
-    assert "55" in telegram_bot._pending_clarify_state
-
-
-def test_text_list_active_rule_routes_to_runtime_without_inbox_enqueue(monkeypatch) -> None:
-    sent: list[str] = []
-    runtime_calls: list[tuple[str, dict]] = []
-    monkeypatch.setattr(
-        telegram_bot,
-        "_enqueue_text",
-        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not enqueue list-intent text into inbox_queue")),
-    )
-    monkeypatch.setattr(
-        telegram_bot,
-        "_queue_depths",
-        lambda: (_ for _ in ()).throw(AssertionError("must not check queue depths for list-intent text")),
-    )
-    monkeypatch.setattr(
-        telegram_bot,
-        "_p2_handle_text",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("p2 flow must not run for list-intent text")),
-    )
-    monkeypatch.setattr(telegram_bot, "_handle_pending_clarification_text", lambda **_kwargs: False)
-    monkeypatch.setattr(
-        telegram_bot,
-        "_worker_post_ex",
-        lambda path, payload: (
-            runtime_calls.append((path, payload)) or True,
-            {"ok": True, "debug": {"tasks": []}},
-            200,
-            None,
-        ),
-    )
-    monkeypatch.setattr(telegram_bot, "_send_message", lambda _chat_id, text: sent.append(text))
-
-    message = {"chat": {"id": 77}, "from": {"id": 77}, "message_id": 12, "text": "список активных задач"}
-    telegram_bot._handle_text_message(update_id=3001, message=message, pending_state={})
-
-    assert runtime_calls
-    assert runtime_calls[0][0] == "/runtime/command"
-    assert runtime_calls[0][1]["command"]["intent"] == "tasks.list_active"
-    assert runtime_calls[0][1]["command"]["intent"] != "task.create"
-    assert runtime_calls[0][1]["command"]["entities"] == {}
-    assert sent == ["Список пуст."]
-
-
-def test_text_list_tomorrow_rule_routes_to_runtime_without_inbox_enqueue(monkeypatch) -> None:
-    sent: list[str] = []
-    runtime_calls: list[tuple[str, dict]] = []
-    monkeypatch.setattr(
-        telegram_bot,
-        "_enqueue_text",
-        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not enqueue list-intent text into inbox_queue")),
-    )
-    monkeypatch.setattr(
-        telegram_bot,
-        "_queue_depths",
-        lambda: (_ for _ in ()).throw(AssertionError("must not check queue depths for list-intent text")),
-    )
-    monkeypatch.setattr(
-        telegram_bot,
-        "_p2_handle_text",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("p2 flow must not run for list-intent text")),
-    )
-    monkeypatch.setattr(telegram_bot, "_handle_pending_clarification_text", lambda **_kwargs: False)
-    monkeypatch.setattr(
-        telegram_bot,
-        "_worker_post_ex",
-        lambda path, payload: (
-            runtime_calls.append((path, payload)) or True,
-            {"ok": True, "debug": {"tasks": []}},
-            200,
-            None,
-        ),
-    )
-    monkeypatch.setattr(telegram_bot, "_send_message", lambda _chat_id, text: sent.append(text))
-
-    message = {"chat": {"id": 78}, "from": {"id": 78}, "message_id": 13, "text": "выведи задачи на завтра"}
-    telegram_bot._handle_text_message(update_id=3002, message=message, pending_state={})
-
-    assert runtime_calls
-    assert runtime_calls[0][0] == "/runtime/command"
-    assert runtime_calls[0][1]["command"]["intent"] == "tasks.list_tomorrow"
-    assert runtime_calls[0][1]["command"]["intent"] != "task.create"
-    assert runtime_calls[0][1]["command"]["entities"] == {}
-    assert sent == ["Список пуст."]
-
-
-def test_text_regular_task_still_goes_to_inbox_queue(monkeypatch) -> None:
-    enq_calls: list[dict] = []
-    sent: list[str] = []
-    monkeypatch.setattr(telegram_bot, "_handle_pending_clarification_text", lambda **_kwargs: False)
-    monkeypatch.setattr(telegram_bot, "_queue_depths", lambda: (0, 0))
-    monkeypatch.setattr(
-        telegram_bot,
-        "_enqueue_text",
-        lambda **kwargs: (enq_calls.append(kwargs) or True, 1),
-    )
-    monkeypatch.setattr(telegram_bot, "_p2_handle_text", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(telegram_bot, "_send_message", lambda _chat_id, text: sent.append(text))
-    monkeypatch.setattr(
-        telegram_bot,
-        "_worker_runtime_command",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("runtime list command must not run for regular task text")),
+    req = runtime_bridge.TelegramRuntimeRequest(
+        request_id="tg:voice:1",
+        app_id="app",
+        tenant_id="tenant",
+        channel="telegram",
+        user_id="u-voice",
+        chat_id="c-voice",
+        source_message_id="m-voice",
+        text=None,
+        audio_bytes=b"voice-bytes",
+        audio_mime="audio/ogg",
+        audio_filename="voice.ogg",
+        timezone="Europe/Moscow",
+        metadata={"voice": {"file_id": "file-1", "mime_type": "audio/ogg"}},
     )
 
-    message = {"chat": {"id": 79}, "from": {"id": 79}, "message_id": 14, "text": "купи молоко"}
-    telegram_bot._handle_text_message(update_id=3003, message=message, pending_state={})
+    result = bridge.process_request(req)
 
-    assert enq_calls
-    assert sent == ["Принято. В очереди: 1."]
-
-
-def test_format_runtime_reply_renders_tasks_list() -> None:
-    payload = {
-        "ok": True,
-        "user_message": "Список задач на завтра готов.",
-        "debug": {
-            "tasks": [
-                {
-                    "id": 10,
-                    "title": "Подготовить встречу",
-                    "planned_at": "2026-02-27T09:00:00+03:00",
-                    "status": "IN_PROGRESS",
-                    "parent_id": None,
-                    "level": 0,
-                },
-                {
-                    "id": 11,
-                    "title": "Сделать отчёт",
-                    "planned_at": None,
-                    "status": "NEW",
-                    "parent_id": 10,
-                    "level": 1,
-                },
-            ]
-        },
-    }
-    text = telegram_bot._format_runtime_reply(payload)
-    assert "1. #10 Подготовить встречу" in text
-    assert "2. #11 Сделать отчёт" in text
+    assert asr.calls == 1
+    assert asr.request_ids == ["tg:voice:1"]
+    assert llm.calls == 1
+    assert llm.last_text == "запланируй встречу завтра в 12"
+    assert result.outcome == "rec_needs_clarification"
+    assert result.needs_clarification is True
+    assert "Время: 12:00" in str(result.clarifying_question or "")
+    assert "Голосовые сообщения в режиме runtime_core_direct пока не поддерживаются" not in str(result.reply_text or "")
+    assert bool(result.telemetry.get("voice_request")) is True
 
 
-def test_format_runtime_reply_empty_tasks_returns_list_empty() -> None:
-    payload = {"ok": True, "user_message": "Список активных задач готов.", "debug": {"tasks": []}}
-    text = telegram_bot._format_runtime_reply(payload)
-    assert text == "Список пуст."
+def test_voice_empty_transcript_retries_once_then_fallback() -> None:
+    handler = _load_module(HANDLER_PATH, "app_integration_handler_voice_gateway_empty")
+    asr = _AsrSequence(["", ""])
+    llm = _ProbeLLM()
+    rec = _ProbeREC()
+
+    result = handler.handle_user_attempt(
+        request_id="voice-empty-1",
+        user_id="u-voice-empty",
+        channel="telegram",
+        asr_client=asr,
+        llm_client=llm,
+        rec_client=rec,
+        audio_bytes=b"voice-bytes",
+        text=None,
+        app_id="app",
+        tenant_id="tenant",
+        source_chat_id="chat-voice-empty",
+        source_message_id="msg-voice-empty",
+    )
+
+    assert result["outcome"] == "empty_transcript"
+    assert result["user_message"] == "Не удалось разобрать голос. Повтори ещё раз чуть длиннее."
+    assert asr.calls == 2
+    assert llm.calls == 0
+    assert rec.calls == 0
+
+
+def test_voice_asr_timeout_retries_once_then_fallback() -> None:
+    handler = _load_module(HANDLER_PATH, "app_integration_handler_voice_gateway_timeout")
+    asr = _AsrSequence([TimeoutError("t1"), TimeoutError("t2")])
+    llm = _ProbeLLM()
+    rec = _ProbeREC()
+
+    result = handler.handle_user_attempt(
+        request_id="voice-timeout-1",
+        user_id="u-voice-timeout",
+        channel="telegram",
+        asr_client=asr,
+        llm_client=llm,
+        rec_client=rec,
+        audio_bytes=b"voice-bytes",
+        text=None,
+        app_id="app",
+        tenant_id="tenant",
+        source_chat_id="chat-voice-timeout",
+        source_message_id="msg-voice-timeout",
+    )
+
+    assert result["outcome"] == "asr_timeout"
+    assert result["user_message"] == "Сейчас не получилось обработать голос. Попробуй ещё раз или напиши текстом."
+    assert asr.calls == 2
+    assert llm.calls == 0
+    assert rec.calls == 0
+
+
+def test_voice_task_transcript_enters_active_task_confirm_flow() -> None:
+    handler = _load_module(HANDLER_PATH, "app_integration_handler_voice_gateway_success")
+    asr = _AsrSequence(["Купить молоко"])
+    llm = _ProbeLLM(payload={"intent": "task.create", "entities": {"title": "Купить молоко"}})
+    rec = _ProbeREC()
+
+    result = handler.handle_user_attempt(
+        request_id="voice-success-1",
+        user_id="u-voice-success",
+        channel="telegram",
+        asr_client=asr,
+        llm_client=llm,
+        rec_client=rec,
+        audio_bytes=b"voice-bytes",
+        text=None,
+        app_id="app",
+        tenant_id="tenant",
+        source_chat_id="chat-voice-success",
+        source_message_id="msg-voice-success",
+    )
+
+    assert result["outcome"] == "rec_needs_clarification"
+    assert result["rec"]["missing_field"] == "task_create_confirm"
+    assert result["command"]["intent"] == "task.create"
+    assert "Создать задачу?" in str(result["user_message"])
+    assert llm.calls == 1

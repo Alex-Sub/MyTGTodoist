@@ -4,6 +4,7 @@ import importlib.util
 import logging
 import sys
 import types
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -129,6 +130,39 @@ def _request(runtime_bridge_module):
     )
 
 
+def _task_request(runtime_bridge_module):
+    return runtime_bridge_module.TelegramRuntimeRequest(
+        request_id="req-task-dup-1",
+        app_id="app",
+        tenant_id="tenant",
+        channel="telegram",
+        user_id="u1",
+        chat_id="c1",
+        source_message_id="m1",
+        text="создай задачу купить молоко завтра",
+        timezone="Europe/Moscow",
+        metadata={},
+    )
+
+
+def _voice_request(runtime_bridge_module):
+    return runtime_bridge_module.TelegramRuntimeRequest(
+        request_id="tg:voice:1",
+        app_id="app",
+        tenant_id="tenant",
+        channel="telegram",
+        user_id="u-voice",
+        chat_id="c-voice",
+        source_message_id="m-voice",
+        text=None,
+        audio_bytes=b"voice-bytes",
+        audio_mime="audio/ogg",
+        audio_filename="voice.ogg",
+        timezone="Europe/Moscow",
+        metadata={"voice": {"file_id": "file-1", "mime_type": "audio/ogg"}},
+    )
+
+
 def test_temporal_confirm_schedule_meeting_is_normalized_for_worker(caplog) -> None:
     runtime_bridge = _load_module(RUNTIME_BRIDGE_PATH, "app_integration_runtime_bridge_module_a")
     posted: List[Dict[str, Any]] = []
@@ -165,6 +199,161 @@ def test_temporal_confirm_schedule_meeting_is_normalized_for_worker(caplog) -> N
     assert getattr(rec, "normalized_intent") == "meeting.create"
     assert "start_at" in str(getattr(rec, "payload_keys", []))
     assert result.needs_clarification is False
+
+
+
+
+def test_voice_request_in_direct_mode_is_transcribed_and_routed_without_block_message() -> None:
+    runtime_bridge = _load_module(RUNTIME_BRIDGE_PATH, "app_integration_runtime_bridge_module_voice_direct")
+
+    class _AsrProbe:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.request_ids: List[str] = []
+
+        def transcribe(self, audio_bytes: bytes, mime_type: str | None = None, filename: str | None = None, request_id: str | None = None) -> str:  # noqa: ARG002
+            assert audio_bytes == b"voice-bytes"
+            self.calls += 1
+            self.request_ids.append(str(request_id or ""))
+            return "запланируй встречу завтра в 12"
+
+    class _LlmProbe:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.last_text = ""
+
+        def parse(self, *, text: str) -> Dict[str, Any]:
+            self.calls += 1
+            self.last_text = text
+            return {
+                "intent": "schedule_meeting",
+                "entities": {
+                    "text": text,
+                    "date": "2026-04-29",
+                    "time": "12",
+                },
+            }
+
+    class _RecProbe:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def query(self, payload: Dict[str, Any]) -> Dict[str, Any]:  # noqa: ARG002
+            self.calls += 1
+            return {"outcome": "ok", "hits": []}
+
+    cfg = types.SimpleNamespace(
+        app_id="app",
+        clarification_ttl_sec=300,
+        command_dedup_reservation_ttl_sec=120,
+    )
+    asr = _AsrProbe()
+    llm = _LlmProbe()
+    rec = _RecProbe()
+    direct_handler = runtime_bridge.build_runtime_core_direct_handler(
+        cfg=cfg,
+        asr_client=asr,
+        llm_client=llm,
+        rec_client=rec,
+        local_db=None,
+    )
+    bridge = runtime_bridge.RuntimeBridge(
+        worker_command_url="http://worker/runtime/command",
+        direct_handler=direct_handler,
+        direct_voice_enabled=False,
+    )
+
+    result = bridge.process_request(_voice_request(runtime_bridge))
+
+    assert asr.calls == 1
+    assert asr.request_ids == ["tg:voice:1"]
+    assert llm.calls == 1
+    assert llm.last_text == "запланируй встречу завтра в 12"
+    assert result.outcome == "direct_processed"
+    assert result.needs_clarification is True
+    assert "Время: 12:00" in str(result.clarifying_question or "")
+    assert "Голосовые сообщения в режиме runtime_core_direct пока не поддерживаются" not in str(result.reply_text or "")
+    assert bool(result.telemetry.get("voice_request")) is True
+
+
+def test_runtime_core_direct_generic_task_phrase_routes_before_memory_and_logs(caplog) -> None:
+    runtime_bridge = _load_module(RUNTIME_BRIDGE_PATH, "app_integration_runtime_bridge_module_generic_task_route")
+
+    class _LlmUnknown:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def parse(self, *, text: str) -> Dict[str, Any]:
+            self.calls += 1
+            return {
+                "intent": "unknown",
+                "entities": {
+                    "text": text,
+                },
+            }
+
+    class _RecProbe:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def query(self, payload: Dict[str, Any]) -> Dict[str, Any]:  # noqa: ARG002
+            self.calls += 1
+            return {"outcome": "empty", "hits": []}
+
+    cfg = types.SimpleNamespace(
+        app_id="app",
+        clarification_ttl_sec=300,
+        command_dedup_reservation_ttl_sec=120,
+    )
+    llm = _LlmUnknown()
+    rec = _RecProbe()
+    direct_handler = runtime_bridge.build_runtime_core_direct_handler(
+        cfg=cfg,
+        asr_client=None,
+        llm_client=llm,
+        rec_client=rec,
+        local_db=None,
+    )
+    req = runtime_bridge.TelegramRuntimeRequest(
+        request_id="tg:generic-task:1",
+        app_id="app",
+        tenant_id="tenant",
+        channel="telegram",
+        user_id="u1",
+        chat_id="c1",
+        source_message_id="m1",
+        text="купить хлеб завтра",
+        timezone="Europe/Moscow",
+        metadata={},
+    )
+
+    with caplog.at_level(logging.INFO):
+        result = direct_handler(req)
+
+    assert result["outcome"] == "rec_needs_clarification"
+    assert result["rec"]["missing_field"] == "task_create_confirm"
+    assert str(result["command"].get("intent") or "") == "task.create"
+    assert str(result["command"].get("title") or "") == "Купить хлеб"
+    expected_planned_at = (date.today() + timedelta(days=1)).isoformat()
+    assert str(result["command"].get("planned_at") or "") == expected_planned_at
+    assert "В памяти нет данных по этому запросу." not in str(result.get("user_message") or "")
+    assert rec.calls == 0
+
+    record = next((r for r in caplog.records if r.getMessage() == "generic_task_fallback_selected"), None)
+    assert record is not None
+    assert getattr(record, "raw_text") == "купить хлеб завтра"
+    assert getattr(record, "title") == "Купить хлеб"
+    assert getattr(record, "planned_at") == expected_planned_at
+    assert getattr(record, "route") == "task.create"
+    route_record = next((r for r in caplog.records if r.getMessage() == "runtime_route_selected"), None)
+    assert route_record is not None
+    assert getattr(route_record, "raw_text") == "купить хлеб завтра"
+    assert getattr(route_record, "route") == "task.create"
+    assert getattr(route_record, "reason") in {"explicit_task_marker", "generic_task_with_date", "generic_task_safety_guard_before_memory"}
+    entry_record = next((r for r in caplog.records if r.getMessage() == "telegram_text_route_entry"), None)
+    assert entry_record is not None
+    assert getattr(entry_record, "raw_text") == "купить хлеб завтра"
+    assert getattr(entry_record, "route_rules_version") == "stage67-hardguard-v2"
 
 
 def test_runtime_bridge_normalize_date_ymd_without_year_uses_current_year_for_ddmm() -> None:
@@ -286,6 +475,24 @@ def test_runtime_bridge_normalize_meeting_title_removes_duplicated_event_words()
     assert cleaned_call == "Созвон с подрядчиком"
 
 
+def test_runtime_bridge_normalize_meeting_title_cleans_arrow_and_command_tail() -> None:
+    runtime_bridge = _load_module(RUNTIME_BRIDGE_PATH, "app_integration_runtime_bridge_module_title_clean_arrow")
+    cleaned = runtime_bridge.RuntimeBridge._normalize_meeting_title("встреча в 11 → 29.04", "встреча")
+    assert cleaned == "Встреча"
+
+
+def test_runtime_bridge_normalize_meeting_title_collapses_exact_duplicate_kind() -> None:
+    runtime_bridge = _load_module(RUNTIME_BRIDGE_PATH, "app_integration_runtime_bridge_module_title_clean_dup_kind")
+    cleaned = runtime_bridge.RuntimeBridge._normalize_meeting_title("созвон созвон", "созвон")
+    assert cleaned == "Созвон"
+
+
+def test_runtime_bridge_normalize_meeting_title_keeps_meaningful_subject_after_case_artifact() -> None:
+    runtime_bridge = _load_module(RUNTIME_BRIDGE_PATH, "app_integration_runtime_bridge_module_title_case_artifact")
+    cleaned = runtime_bridge.RuntimeBridge._normalize_meeting_title("встреча встречу с Иваном", "встреча")
+    assert cleaned == "Встреча с Иваном"
+
+
 def test_temporal_confirm_schedule_call_is_normalized_for_worker() -> None:
     runtime_bridge = _load_module(RUNTIME_BRIDGE_PATH, "app_integration_runtime_bridge_module_schedule_call")
     posted: List[Dict[str, Any]] = []
@@ -332,6 +539,59 @@ def test_temporal_confirm_schedule_call_is_normalized_for_worker() -> None:
     entities = posted[0]["json"]["command"]["entities"]
     assert entities.get("meeting_kind") == "созвон"
     assert str(entities.get("title") or "").startswith("Созвон")
+
+
+def test_meeting_create_payload_preserves_locked_meeting_kind_for_all_event_types() -> None:
+    runtime_bridge = _load_module(RUNTIME_BRIDGE_PATH, "app_integration_runtime_bridge_module_locked_kind_consistency")
+    cases = [
+        ("встреча", "Встреча"),
+        ("собрание", "Собрание"),
+        ("созвон", "Созвон"),
+        ("мероприятие", "Мероприятие"),
+    ]
+
+    for idx, (meeting_kind, title_prefix) in enumerate(cases, start=1):
+        posted: List[Dict[str, Any]] = []
+
+        def _fake_post(url, json, timeout):  # noqa: ANN001
+            posted.append({"url": url, "json": dict(json), "timeout": timeout})
+            return _FakeResponse({"ok": True, "user_message": "ok", "calendar_event_id": f"evt-locked-kind-{idx}", "debug": {"calendar_commit": "ok"}})
+
+        def _direct(_req):  # noqa: ANN001
+            payload = _execution_payload("meeting.create", time_value="15")
+            cmd = payload.get("command", {})
+            cmd["meeting_kind"] = meeting_kind
+            entities = cmd.get("entities", {}) if isinstance(cmd.get("entities"), dict) else {}
+            entities["meeting_kind"] = meeting_kind
+            entities["text"] = "встреча с Иваном завтра в 15 на 60 минут"
+            cmd["entities"] = entities
+            payload["command"] = cmd
+            return payload
+
+        bridge = runtime_bridge.RuntimeBridge(
+            worker_command_url="http://worker/runtime/command",
+            direct_handler=_direct,
+            http_post=_fake_post,
+        )
+        req = runtime_bridge.TelegramRuntimeRequest(
+            request_id=f"req-locked-kind-{idx}",
+            app_id="app",
+            tenant_id="tenant",
+            channel="telegram",
+            user_id=f"u-locked-kind-{idx}",
+            chat_id=f"c-locked-kind-{idx}",
+            source_message_id=f"m-locked-kind-{idx}",
+            text=f"запланируй {meeting_kind} завтра в 15",
+            timezone="Europe/Moscow",
+            metadata={},
+        )
+        result = bridge.process_request(req)
+
+        assert result.outcome == "direct_processed"
+        assert posted
+        entities = posted[0]["json"]["command"]["entities"]
+        assert entities.get("meeting_kind") == meeting_kind
+        assert str(entities.get("title") or "").startswith(title_prefix)
 
 
 def test_temporal_confirm_schedule_block_is_normalized_for_worker() -> None:
@@ -572,6 +832,40 @@ def test_meeting_create_confirm_yes_returns_created_message() -> None:
     text = str(result.reply_text or "")
     assert "Встреча создана" in text
     assert "Встреча перенесена" not in text
+
+
+def test_temporal_commit_envelope_preserves_comment_from_command_and_draft() -> None:
+    runtime_bridge = _load_module(RUNTIME_BRIDGE_PATH, "app_integration_runtime_bridge_module_comment_env")
+    posted: List[Dict[str, Any]] = []
+
+    def _fake_post(url, json, timeout):  # noqa: ANN001
+        posted.append({"url": url, "json": dict(json), "timeout": timeout})
+        return _FakeResponse({"ok": True, "user_message": "Встреча создана", "calendar_event_id": "evt-comment-env-1", "debug": {"calendar_commit": "ok"}})
+
+    def _direct(_req):  # noqa: ANN001
+        payload = _execution_payload_edited_draft("meeting.create", new_date="2026-04-13", new_time="12", new_duration=30)
+        cmd = payload["command"]
+        cmd["comment_text"] = "обсудить договор"
+        entities = cmd.get("entities") if isinstance(cmd.get("entities"), dict) else {}
+        entities["comment_text"] = "обсудить договор"
+        cmd["entities"] = entities
+        draft = cmd.get("__temporal_draft") if isinstance(cmd.get("__temporal_draft"), dict) else {}
+        draft["comment"] = "обсудить договор"
+        cmd["__temporal_draft"] = draft
+        return payload
+
+    bridge = runtime_bridge.RuntimeBridge(
+        worker_command_url="http://worker/runtime/command",
+        direct_handler=_direct,
+        http_post=_fake_post,
+    )
+
+    result = bridge.process_request(_request(runtime_bridge))
+
+    assert result.outcome == "direct_processed"
+    assert posted
+    entities = posted[0]["json"]["command"]["entities"]
+    assert entities["comment_text"] == "обсудить договор"
 
 
 def test_meeting_update_confirm_yes_returns_rescheduled_message() -> None:

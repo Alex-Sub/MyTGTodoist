@@ -1,18 +1,22 @@
 import importlib
 import importlib.util as importlib_util
+import argparse
 import json
 import logging
 import os
 import re
 import sqlite3
+import traceback
 import time
 import socket
 import sys
 import threading
+import uuid
 from pathlib import Path
 from datetime import datetime, timedelta, timezone, date
 from typing import Any
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import urllib.error
 import urllib.request
 
 import requests
@@ -35,11 +39,18 @@ def _ensure_local_no_proxy() -> None:
 _ensure_local_no_proxy()
 
 
+_ROOT_DIR = Path(__file__).resolve().parent
+if str(_ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_ROOT_DIR))
+_REPO_ROOT_DIR = _ROOT_DIR.parent
+if str(_REPO_ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT_DIR))
 _SRC_DIR = Path(__file__).resolve().parent / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 from organizer_worker.startup_preflight import ensure_canon_mounted
 from organizer_worker.google_calendar_idempotency import build_item_ical_uid, create_or_reuse_event
+from organizer_worker import db
 _P2_RUNTIME_PATH = _SRC_DIR / "p2_tasks_runtime.py"
 _P2_SPEC = importlib_util.spec_from_file_location("p2_tasks_runtime", _P2_RUNTIME_PATH)
 if _P2_SPEC is None or _P2_SPEC.loader is None:
@@ -52,13 +63,20 @@ try:
 except RuntimeError as exc:
     local_canon = Path(__file__).resolve().parents[1] / "canon" / "intents_v2.yml"
     if not Path("/.dockerenv").exists() and local_canon.exists():
-        logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+        logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), force=True)
         logging.warning("canon_local_fallback path=%s", local_canon)
     else:
-        logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+        logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), force=True)
         logging.error("%s", str(exc))
         raise SystemExit(1)
-from organizer_worker.handlers import dispatch_intent
+from organizer_worker.handlers import INTENT_ALIAS_TO_CANON, dispatch_intent
+import shared_runtime as _shared_runtime
+import runtime_search as _runtime_search_module
+import runtime_sync_conflicts as _runtime_sync_conflicts_module
+import runtime_calendar as _runtime_calendar_module
+import runtime_handlers as _runtime_handlers_module
+import runtime_server as _runtime_server_module
+import legacy_queue as _legacy_queue_module
 
 DB_PATH = os.getenv("DB_PATH", "/data/organizer.db")
 TIMEZONE_NAME = os.getenv("TIMEZONE_NAME", os.getenv("TIMEZONE", "Europe/Moscow"))
@@ -91,25 +109,23 @@ BACKLOG_LIMIT = int(os.getenv("BACKLOG_LIMIT", "50"))
 P7_MODE = (os.getenv("P7_MODE", "off") or "off").strip().lower()
 ASR_DT_SELF_CHECK = os.getenv("ASR_DT_SELF_CHECK", "0") == "1"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ML_CORE_URL = os.getenv("ML_CORE_URL", "http://host.docker.internal:19000").strip()
-# Legacy env (kept for compatibility, intentionally unused).
-ASR_SERVICE_URL = os.getenv("ASR_SERVICE_URL", "").strip()
+_ML_GATEWAY_URL_RAW = os.getenv("ML_GATEWAY_URL", "").strip()
+ML_GATEWAY_URL = _ML_GATEWAY_URL_RAW or "http://host.docker.internal:19000"
 TG_HTTP_CONNECT_TIMEOUT = int(os.getenv("TG_HTTP_CONNECT_TIMEOUT", "3"))
 TG_HTTP_READ_TIMEOUT = int(os.getenv("TG_HTTP_READ_TIMEOUT", "90"))
 TG_HTTP_RETRIES = int(os.getenv("TG_HTTP_RETRIES", "2"))
 TG_HTTP_RETRY_SLEEP = float(os.getenv("TG_HTTP_RETRY_SLEEP", "0.3"))
+TG_HTTP_429_RETRIES = int(os.getenv("TG_HTTP_429_RETRIES", "2"))
+WORKER_TG_TEXT_CHUNK = int(os.getenv("WORKER_TG_TEXT_CHUNK", "3500"))
 ASR_HTTP_READ_TIMEOUT = int(os.getenv("ASR_HTTP_READ_TIMEOUT", "180"))
+LOG_ML_RAW = os.getenv("LOG_ML_RAW", "0") == "1"
 MEETING_DEFAULT_MINUTES = int(os.getenv("MEETING_DEFAULT_MINUTES", "30"))
 LOCAL_TZ_OFFSET_MIN = int(os.getenv("LOCAL_TZ_OFFSET_MIN", "180"))  # +03:00 default
 ORGANIZER_API_URL = os.getenv("ORGANIZER_API_URL", "http://organizer-api:8000")
 DEFAULT_HOUR = int(os.getenv("DT_DEFAULT_HOUR", "10"))
 DEFAULT_MINUTE = int(os.getenv("DT_DEFAULT_MINUTE", "0"))
-MARKER_HOUR = int(os.getenv("DT_MARKER_HOUR", "6"))
-MARKER_MINUTE = int(os.getenv("DT_MARKER_MINUTE", "0"))
 DT_REQUIRE_AMPM_FOR_SHORT_HOURS = os.getenv("DT_REQUIRE_AMPM_FOR_SHORT_HOURS", "1") == "1"
 DT_SHORT_HOUR_MAX = int(os.getenv("DT_SHORT_HOUR_MAX", "12"))
-DT_AMBIGUOUS_MARKER_HOUR = int(os.getenv("DT_AMBIGUOUS_MARKER_HOUR", "6"))
-DT_AMBIGUOUS_MARKER_MINUTE = int(os.getenv("DT_AMBIGUOUS_MARKER_MINUTE", "0"))
 DEFAULT_WEEKDAY = int(os.getenv("DT_DEFAULT_WEEKDAY", "0"))  # 0=Mon..6=Sun
 DEFAULT_MONTHDAY = int(os.getenv("DT_DEFAULT_MONTHDAY", "1"))  # for month-only refs
 DEFAULT_YEAR_MONTH = int(os.getenv("DT_DEFAULT_YEAR_MONTH", "1"))  # 1..12
@@ -126,7 +142,17 @@ B2_CLAIM_LEASE_SEC = int(os.getenv("B2_CLAIM_LEASE_SEC", "120"))
 B2_MAX_ATTEMPTS = int(os.getenv("B2_MAX_ATTEMPTS", "5"))
 B2_REQUEUE_FAILED_EVERY_SEC = int(os.getenv("B2_REQUEUE_FAILED_EVERY_SEC", "15"))
 B2_REQUEUE_FAILED_BATCH = int(os.getenv("B2_REQUEUE_FAILED_BATCH", "10"))
+B2_REPLAY_MAX_AGE_SEC = int(os.getenv("B2_REPLAY_MAX_AGE_SEC", "900"))
+B2_REPLAY_SCAN_LIMIT = int(os.getenv("B2_REPLAY_SCAN_LIMIT", "200"))
 B2_IDLE_SLEEP_SEC = float(os.getenv("B2_IDLE_SLEEP_SEC", "0.5"))
+RUNTIME_TRACE_DEDUP_TTL_SEC = int(os.getenv("RUNTIME_TRACE_DEDUP_TTL_SEC", "86400"))
+CALENDAR_DRIFT_FAST_CHECK_SEC = int(os.getenv("CALENDAR_DRIFT_FAST_CHECK_SEC", "900"))
+CALENDAR_DRIFT_FAST_LOOKBACK_DAYS = int(os.getenv("CALENDAR_DRIFT_FAST_LOOKBACK_DAYS", "7"))
+CALENDAR_DRIFT_FAST_LOOKAHEAD_DAYS = int(os.getenv("CALENDAR_DRIFT_FAST_LOOKAHEAD_DAYS", "30"))
+CALENDAR_DRIFT_FULL_LOOKBACK_DAYS = int(os.getenv("CALENDAR_DRIFT_FULL_LOOKBACK_DAYS", "30"))
+CALENDAR_DRIFT_FULL_LOOKAHEAD_DAYS = int(os.getenv("CALENDAR_DRIFT_FULL_LOOKAHEAD_DAYS", "180"))
+CALENDAR_DRIFT_FULL_HOUR = int(os.getenv("CALENDAR_DRIFT_FULL_HOUR", "3"))
+CALENDAR_DRIFT_FULL_MINUTE = int(os.getenv("CALENDAR_DRIFT_FULL_MINUTE", "30"))
 SCHEMA_PATH = os.getenv("B2_SCHEMA_PATH", "/app/migrations/001_inbox_queue.sql")
 MIGRATIONS_DIR = os.getenv("MIGRATIONS_DIR", "/app/migrations")
 P2_ENFORCE_STATUS = os.getenv("P2_ENFORCE_STATUS", "0") == "1"
@@ -142,12 +168,10 @@ _P5_OVERLOAD_COUNT_TODAY: int = 0
 _P5_NUDGE_EMITTED: bool = False
 
 def _local_tz() -> timezone:
-    return timezone(timedelta(minutes=LOCAL_TZ_OFFSET_MIN))
+    return _shared_runtime._local_tz(LOCAL_TZ_OFFSET_MIN)
 
 def as_dict(row: sqlite3.Row | dict | None) -> dict:
-    if row is None:
-        return {}
-    return row if isinstance(row, dict) else dict(row)
+    return _shared_runtime.as_dict(row)
 
 
 def _to_int_or_none(value: Any) -> int | None:
@@ -157,6 +181,1613 @@ def _to_int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _parse_iso_utc_or_none(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(raw)
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
+
+
+def _queue_item_age_sec(row: dict, now_ts: float) -> float | None:
+    base_ts = (
+        row.get("ingested_at")
+        or row.get("created_at")
+        or row.get("updated_at")
+    )
+    parsed = _parse_iso_utc_or_none(base_ts)
+    if parsed is None:
+        return None
+    return max(0.0, float(now_ts - parsed.timestamp()))
+
+
+def _is_stale_queue_row(row: dict, now_ts: float) -> tuple[bool, float | None]:
+    if B2_REPLAY_MAX_AGE_SEC <= 0:
+        return False, None
+    age = _queue_item_age_sec(row, now_ts)
+    if age is None:
+        return False, None
+    return age > float(B2_REPLAY_MAX_AGE_SEC), age
+
+
+# SHARED_RUNTIME_HELPERS_START
+def _runtime_trace_dedup_init(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runtime_trace_dedup (
+            trace_id TEXT PRIMARY KEY,
+            response_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _runtime_sync_conflicts_init(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_conflicts (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            source TEXT NOT NULL,
+            entity_ref TEXT NULL,
+            calendar_event_id TEXT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            notified_at TEXT NULL,
+            last_checked_at TEXT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            resolved_at TEXT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_sync_conflicts_user_status ON sync_conflicts(user_id, status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_sync_conflicts_calendar_event ON sync_conflicts(calendar_event_id)"
+    )
+    cols = {
+        str(as_dict(row).get("name") or "")
+        for row in conn.execute("PRAGMA table_info(sync_conflicts)").fetchall()
+    }
+    if "notified_at" not in cols:
+        conn.execute("ALTER TABLE sync_conflicts ADD COLUMN notified_at TEXT NULL")
+    if "last_checked_at" not in cols:
+        conn.execute("ALTER TABLE sync_conflicts ADD COLUMN last_checked_at TEXT NULL")
+
+
+def _runtime_trace_dedup_prune(conn: sqlite3.Connection) -> None:
+    ttl = int(RUNTIME_TRACE_DEDUP_TTL_SEC)
+    if ttl <= 0:
+        return
+    conn.execute(
+        """
+        DELETE FROM runtime_trace_dedup
+        WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ','now', '-' || ? || ' seconds')
+        """,
+        (str(ttl),),
+    )
+
+
+def _runtime_trace_dedup_get(trace_id: str) -> dict | None:
+    key = str(trace_id or "").strip()
+    if not key:
+        return None
+    with _get_conn() as conn:
+        _runtime_trace_dedup_init(conn)
+        _runtime_trace_dedup_prune(conn)
+        row = conn.execute(
+            "SELECT response_json FROM runtime_trace_dedup WHERE trace_id = ? LIMIT 1",
+            (key,),
+        ).fetchone()
+        conn.commit()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(str(as_dict(row).get("response_json") or "{}"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _runtime_trace_dedup_put(trace_id: str, payload: dict) -> None:
+    key = str(trace_id or "").strip()
+    if not key or not isinstance(payload, dict):
+        return
+    try:
+        raw = json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        return
+    with _get_conn() as conn:
+        _runtime_trace_dedup_init(conn)
+        _runtime_trace_dedup_prune(conn)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO runtime_trace_dedup (trace_id, response_json, created_at)
+            VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            """,
+            (key, raw),
+        )
+        conn.commit()
+
+
+def _runtime_trace_dedup_replace(trace_id: str, payload: dict) -> None:
+    _runtime_trace_dedup_put(trace_id, payload)
+
+
+def _runtime_trace_dedup_delete(trace_ids: list[str]) -> int:
+    keys = [str(item or "").strip() for item in trace_ids if str(item or "").strip()]
+    if not keys:
+        return 0
+    with _get_conn() as conn:
+        _runtime_trace_dedup_init(conn)
+        cur = conn.executemany(
+            "DELETE FROM runtime_trace_dedup WHERE trace_id = ?",
+            [(key,) for key in keys],
+        )
+        conn.commit()
+    return int(cur.rowcount or 0)
+
+
+def _runtime_trace_list_rows_for_user(user_id: str, *, limit: int = 200) -> list[tuple[str, dict[str, Any]]]:
+    uid = str(user_id or "").strip()
+    if not uid:
+        return []
+    with _get_conn() as conn:
+        _runtime_trace_dedup_init(conn)
+        _runtime_trace_dedup_prune(conn)
+        rows = conn.execute(
+            """
+            SELECT trace_id, response_json
+            FROM runtime_trace_dedup
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (int(max(1, limit)),),
+        ).fetchall()
+    out: list[tuple[str, dict[str, Any]]] = []
+    for row in rows:
+        raw = str(as_dict(row).get("response_json") or "")
+        trace_id = str(as_dict(row).get("trace_id") or "").strip()
+        if not raw or not trace_id:
+            continue
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        event_id = str(payload.get("calendar_event_id") or "").strip()
+        if not event_id:
+            continue
+        debug = payload.get("debug")
+        debug = debug if isinstance(debug, dict) else {}
+        payload_uid = str(debug.get("user_id") or payload.get("user_id") or "").strip()
+        if payload_uid != uid:
+            continue
+        out.append((trace_id, payload))
+    return out
+
+
+def _runtime_trace_list_all_rows(*, limit: int = 5000) -> list[tuple[str, dict[str, Any]]]:
+    with _get_conn() as conn:
+        _runtime_trace_dedup_init(conn)
+        _runtime_trace_dedup_prune(conn)
+        rows = conn.execute(
+            """
+            SELECT trace_id, response_json
+            FROM runtime_trace_dedup
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (int(max(1, limit)),),
+        ).fetchall()
+    out: list[tuple[str, dict[str, Any]]] = []
+    for row in rows:
+        raw = str(as_dict(row).get("response_json") or "")
+        trace_id = str(as_dict(row).get("trace_id") or "").strip()
+        if not raw or not trace_id:
+            continue
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            out.append((trace_id, payload))
+    return out
+
+
+def _parse_drift_range_bound(value: Any, *, end_of_day: bool) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    parsed_dt = _parse_iso_datetime_to_local(raw)
+    if parsed_dt is not None:
+        return parsed_dt
+    parsed_date = _parse_date_token_ymd(raw)
+    if parsed_date is None:
+        return None
+    if end_of_day:
+        return datetime(parsed_date.year, parsed_date.month, parsed_date.day, 23, 59, 59, tzinfo=_local_tz())
+    return datetime(parsed_date.year, parsed_date.month, parsed_date.day, 0, 0, 0, tzinfo=_local_tz())
+
+
+def _runtime_snapshot_in_range(snapshot: dict[str, Any], from_dt: datetime | None, to_dt: datetime | None) -> bool:
+    start_at = _parse_iso_datetime_to_local(snapshot.get("start_at"))
+    if start_at is None:
+        date_raw = str(snapshot.get("start_at_date") or "").strip()
+        time_raw = str(snapshot.get("start_at_time") or "").strip() or "00:00"
+        date_token = _parse_date_token_ymd(date_raw)
+        time_token = _parse_time_token_hhmm(time_raw)
+        if date_token is None or time_token is None:
+            return True
+        start_at = datetime(date_token.year, date_token.month, date_token.day, time_token[0], time_token[1], tzinfo=_local_tz())
+    if from_dt is not None and start_at < from_dt:
+        return False
+    if to_dt is not None and start_at > to_dt:
+        return False
+    return True
+
+
+def _runtime_sync_conflict_snapshot_from_payload(trace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    base = payload.get("__trace_snapshot")
+    base = dict(base) if isinstance(base, dict) else {}
+    debug = payload.get("debug")
+    debug = debug if isinstance(debug, dict) else {}
+    summary = {
+        "trace_id": trace_id,
+        "user_id": str(base.get("user_id") or debug.get("user_id") or payload.get("user_id") or "").strip(),
+        "calendar_event_id": str(
+            base.get("calendar_event_id") or payload.get("calendar_event_id") or debug.get("calendar_event_id") or ""
+        ).strip(),
+        "source_msg_id": str(base.get("source_msg_id") or payload.get("source_msg_id") or "").strip(),
+        "title": str(base.get("title") or payload.get("title") or "Встреча").strip() or "Встреча",
+        "meeting_kind": str(base.get("meeting_kind") or payload.get("meeting_kind") or "").strip(),
+        "start_at": str(base.get("start_at") or payload.get("start_at") or "").strip(),
+        "start_at_date": str(base.get("start_at_date") or payload.get("start_at_date") or "").strip(),
+        "start_at_time": str(base.get("start_at_time") or payload.get("start_at_time") or "").strip(),
+        "duration_minutes": base.get("duration_minutes") or payload.get("duration_minutes"),
+        "comment_text": str(
+            base.get("comment_text")
+            or payload.get("comment_text")
+            or payload.get("description")
+            or payload.get("comment")
+            or ""
+        ).strip(),
+    }
+    if summary["start_at"] and (not summary["start_at_date"] or not summary["start_at_time"]):
+        parsed = _parse_iso_datetime_to_local(summary["start_at"])
+        if parsed is not None:
+            if not summary["start_at_date"]:
+                summary["start_at_date"] = parsed.date().isoformat()
+            if not summary["start_at_time"]:
+                summary["start_at_time"] = parsed.strftime("%H:%M")
+    if summary["duration_minutes"] in (None, ""):
+        summary["duration_minutes"] = DEFAULT_DURATION_MIN
+    chat_id, _message_id = _parse_tg_source_msg_id(summary.get("source_msg_id"))
+    summary["chat_id"] = str(chat_id or "").strip()
+    return summary
+
+
+def _runtime_sync_conflict_summary_text(conflict: dict[str, Any]) -> str:
+    title = str(conflict.get("title") or "Встреча").strip() or "Встреча"
+    start_date = str(conflict.get("start_at_date") or "").strip()
+    start_time = str(conflict.get("start_at_time") or "").strip()
+    duration = str(conflict.get("duration_minutes") or "").strip()
+    comment_text = str(conflict.get("comment_text") or "").strip()
+    parts = [title]
+    if start_date or start_time:
+        parts.append(" ".join([p for p in (start_date, start_time) if p]).strip())
+    if duration:
+        parts.append(f"{duration} мин")
+    if comment_text:
+        parts.append(f"Комментарий: {comment_text}")
+    return "\n".join([part for part in parts if part])
+
+
+def _runtime_sync_conflict_row_to_payload(row: Any) -> dict[str, Any]:
+    item = as_dict(row)
+    payload_raw = str(item.get("payload_json") or "{}")
+    try:
+        payload_json = json.loads(payload_raw)
+    except Exception:
+        payload_json = {}
+    payload_json = payload_json if isinstance(payload_json, dict) else {}
+    out = {
+        "id": str(item.get("id") or "").strip(),
+        "user_id": str(item.get("user_id") or "").strip(),
+        "kind": str(item.get("kind") or "").strip(),
+        "source": str(item.get("source") or "").strip(),
+        "entity_ref": str(item.get("entity_ref") or "").strip(),
+        "calendar_event_id": str(item.get("calendar_event_id") or "").strip(),
+        "status": str(item.get("status") or "").strip(),
+        "notified_at": str(item.get("notified_at") or "").strip(),
+        "last_checked_at": str(item.get("last_checked_at") or "").strip(),
+        "created_at": str(item.get("created_at") or "").strip(),
+        "updated_at": str(item.get("updated_at") or "").strip(),
+        "resolved_at": str(item.get("resolved_at") or "").strip(),
+        "payload": payload_json,
+    }
+    out.update({k: v for k, v in payload_json.items() if k not in out})
+    out["summary_text"] = _runtime_sync_conflict_summary_text(out)
+    return out
+
+
+def _runtime_sync_conflict_create_or_reopen(
+    *,
+    user_id: str,
+    source: str,
+    entity_ref: str,
+    calendar_event_id: str,
+    payload: dict[str, Any],
+    kind: str = "calendar_missing",
+) -> dict[str, Any]:
+    uid = str(user_id or "").strip()
+    entity_key = str(entity_ref or "").strip()
+    event_id = str(calendar_event_id or "").strip()
+    payload_json = dict(payload if isinstance(payload, dict) else {})
+    payload_json["calendar_event_id"] = event_id
+    payload_json["user_id"] = uid
+    raw = json.dumps(payload_json, ensure_ascii=False)
+    lifecycle = "created"
+    with _get_conn() as conn:
+        _runtime_sync_conflicts_init(conn)
+        row = conn.execute(
+            """
+            SELECT *
+            FROM sync_conflicts
+            WHERE user_id = ?
+              AND source = ?
+              AND entity_ref = ?
+              AND kind = ?
+              AND calendar_event_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (uid, str(source or "").strip(), entity_key, str(kind or "").strip(), event_id),
+        ).fetchone()
+        if row is None:
+            conflict_id = f"sc-{uuid.uuid4().hex[:12]}"
+            conn.execute(
+                """
+                INSERT INTO sync_conflicts (
+                    id, user_id, kind, source, entity_ref, calendar_event_id, payload_json,
+                    status, notified_at, last_checked_at, created_at, updated_at, resolved_at
+                )
+                VALUES (
+                    ?, ?, ?, ?, ?, ?, ?,
+                    'pending',
+                    NULL,
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    NULL
+                )
+                """,
+                (conflict_id, uid, kind, source, entity_key, event_id, raw),
+            )
+            row = conn.execute("SELECT * FROM sync_conflicts WHERE id = ?", (conflict_id,)).fetchone()
+        else:
+            row_dict = as_dict(row)
+            status = str(row_dict.get("status") or "").strip().lower()
+            if status in {"resolved"}:
+                lifecycle = "recreated"
+                conflict_id = f"sc-{uuid.uuid4().hex[:12]}"
+                conn.execute(
+                    """
+                    INSERT INTO sync_conflicts (
+                        id, user_id, kind, source, entity_ref, calendar_event_id, payload_json,
+                        status, notified_at, last_checked_at, created_at, updated_at, resolved_at
+                    )
+                    VALUES (
+                        ?, ?, ?, ?, ?, ?, ?,
+                        'pending',
+                        NULL,
+                        strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                        strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                        strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                        NULL
+                    )
+                    """,
+                    (conflict_id, uid, kind, source, entity_key, event_id, raw),
+                )
+                row = conn.execute("SELECT * FROM sync_conflicts WHERE id = ?", (conflict_id,)).fetchone()
+            elif status == "pending":
+                lifecycle = "existing_pending"
+                conn.execute(
+                    """
+                    UPDATE sync_conflicts
+                    SET calendar_event_id = ?,
+                        payload_json = ?,
+                        status = 'pending',
+                        last_checked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                        resolved_at = NULL
+                    WHERE id = ?
+                    """,
+                    (event_id, raw, str(row_dict.get("id") or "").strip()),
+                )
+                row = conn.execute(
+                    "SELECT * FROM sync_conflicts WHERE id = ?",
+                    (str(row_dict.get("id") or "").strip(),),
+                ).fetchone()
+            else:
+                lifecycle = "existing_skipped"
+                conn.execute(
+                    """
+                    UPDATE sync_conflicts
+                    SET calendar_event_id = ?,
+                        payload_json = ?,
+                        status = ?,
+                        last_checked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                    WHERE id = ?
+                    """,
+                    (event_id, raw, status or "skipped", str(row_dict.get("id") or "").strip()),
+                )
+                row = conn.execute(
+                    "SELECT * FROM sync_conflicts WHERE id = ?",
+                    (str(row_dict.get("id") or "").strip(),),
+                ).fetchone()
+        conn.commit()
+    assert row is not None
+    payload_out = _runtime_sync_conflict_row_to_payload(row)
+    payload_out["lifecycle"] = lifecycle
+    return payload_out
+
+
+def _runtime_sync_conflict_get(conflict_id: str) -> dict[str, Any] | None:
+    key = str(conflict_id or "").strip()
+    if not key:
+        return None
+    with _get_conn() as conn:
+        _runtime_sync_conflicts_init(conn)
+        row = conn.execute("SELECT * FROM sync_conflicts WHERE id = ? LIMIT 1", (key,)).fetchone()
+    if row is None:
+        return None
+    return _runtime_sync_conflict_row_to_payload(row)
+
+
+def _runtime_sync_conflict_set_status(conflict_id: str, status: str) -> dict[str, Any] | None:
+    key = str(conflict_id or "").strip()
+    if not key:
+        return None
+    normalized = str(status or "").strip().lower() or "pending"
+    resolved_at_sql = "strftime('%Y-%m-%dT%H:%M:%fZ','now')" if normalized == "resolved" else "NULL"
+    with _get_conn() as conn:
+        _runtime_sync_conflicts_init(conn)
+        conn.execute(
+            f"""
+            UPDATE sync_conflicts
+            SET status = ?,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                resolved_at = {resolved_at_sql}
+            WHERE id = ?
+            """,
+            (normalized, key),
+        )
+        row = conn.execute("SELECT * FROM sync_conflicts WHERE id = ? LIMIT 1", (key,)).fetchone()
+        conn.commit()
+    if row is None:
+        return None
+    return _runtime_sync_conflict_row_to_payload(row)
+
+
+def _runtime_sync_conflict_mark_notified(conflict_id: str) -> dict[str, Any] | None:
+    key = str(conflict_id or "").strip()
+    if not key:
+        return None
+    with _get_conn() as conn:
+        _runtime_sync_conflicts_init(conn)
+        conn.execute(
+            """
+            UPDATE sync_conflicts
+            SET notified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = ?
+            """,
+            (key,),
+        )
+        row = conn.execute("SELECT * FROM sync_conflicts WHERE id = ? LIMIT 1", (key,)).fetchone()
+        conn.commit()
+    if row is None:
+        return None
+    return _runtime_sync_conflict_row_to_payload(row)
+
+
+def _runtime_sync_conflict_keyboard(conflict_id: str) -> dict[str, Any]:
+    cid = str(conflict_id or "").strip()
+    return {
+        "inline_keyboard": [
+            [{"text": "Удалить из базы", "callback_data": f"sync_conflict:delete_db:{cid}"}],
+            [{"text": "Восстановить в календаре", "callback_data": f"sync_conflict:restore_calendar:{cid}"}],
+            [{"text": "Изменить", "callback_data": f"sync_conflict:edit:{cid}"}],
+            [{"text": "Пропустить", "callback_data": f"sync_conflict:skip:{cid}"}],
+        ]
+    }
+
+
+def _runtime_sync_conflict_notify_if_needed(conflict: dict[str, Any]) -> bool:
+    if not isinstance(conflict, dict):
+        return False
+    status = str(conflict.get("status") or "").strip().lower()
+    lifecycle = str(conflict.get("lifecycle") or "").strip().lower()
+    conflict_id = str(conflict.get("id") or "").strip()
+    chat_id_raw = conflict.get("chat_id") or (conflict.get("payload") or {}).get("chat_id")
+    chat_id = _to_int_or_none(chat_id_raw)
+    if status != "pending" or not conflict_id or not chat_id:
+        return False
+    if str(conflict.get("notified_at") or "").strip():
+        logging.info(
+            "sync_conflict_existing",
+            extra={"conflict_id": conflict_id, "user_id": str(conflict.get("user_id") or ""), "calendar_event_id": str(conflict.get("calendar_event_id") or "")},
+        )
+        return False
+    if lifecycle not in {"created", "recreated"}:
+        logging.info(
+            "sync_conflict_existing",
+            extra={"conflict_id": conflict_id, "user_id": str(conflict.get("user_id") or ""), "calendar_event_id": str(conflict.get("calendar_event_id") or "")},
+        )
+        return False
+    text = (
+        "Найдено событие в базе, которого нет в Google Calendar.\n"
+        f"{str(conflict.get('summary_text') or '').strip()}\n"
+        "Что сделать?"
+    ).strip()
+    sent = _tg_send_message_with_keyboard(
+        int(chat_id),
+        text,
+        _runtime_sync_conflict_keyboard(conflict_id),
+        stage="sync_conflict_notify",
+    )
+    if sent:
+        _runtime_sync_conflict_mark_notified(conflict_id)
+        logging.info(
+            "sync_conflict_created",
+            extra={"conflict_id": conflict_id, "user_id": str(conflict.get("user_id") or ""), "calendar_event_id": str(conflict.get("calendar_event_id") or "")},
+        )
+        return True
+    return False
+
+
+def _runtime_cleanup_stale_calendar_events_for_user(user_id: str, *, limit: int = 500) -> dict[str, Any]:
+    uid = str(user_id or "").strip()
+    if not uid:
+        return {"ok": False, "reason": "user_id_required", "conflicts": [], "checked": 0}
+    rows = _runtime_trace_list_rows_for_user(uid, limit=limit)
+    conflicts: list[dict[str, Any]] = []
+    checked = 0
+    for trace_id, payload in rows:
+        snapshot = _runtime_sync_conflict_snapshot_from_payload(trace_id, payload)
+        event_id = str(snapshot.get("calendar_event_id") or "").strip()
+        if not event_id:
+            continue
+        checked += 1
+        event = _calendar_get_event(event_id)
+        if bool(event.get("ok")):
+            continue
+        if int(event.get("http_status") or 0) == 404:
+            conflicts.append(
+                _runtime_sync_conflict_create_or_reopen(
+                    user_id=uid,
+                    source="runtime_trace_dedup",
+                    entity_ref=trace_id,
+                    calendar_event_id=event_id,
+                    payload=snapshot,
+                )
+            )
+    return {
+        "ok": True,
+        "user_id": uid,
+        "checked": checked,
+        "stale_found": len(conflicts),
+        "created_or_reopened": len(conflicts),
+        "conflicts": conflicts,
+    }
+
+
+def _runtime_check_calendar_drift(
+    *,
+    user_id: str = "",
+    from_value: Any = "",
+    to_value: Any = "",
+    notify: bool = True,
+    limit: int = 5000,
+) -> dict[str, Any]:
+    uid = str(user_id or "").strip()
+    from_dt = _parse_drift_range_bound(from_value, end_of_day=False)
+    to_dt = _parse_drift_range_bound(to_value, end_of_day=True)
+    logging.info(
+        "calendar_drift_check_started",
+        extra={"user_id": uid, "from": str(from_value or ""), "to": str(to_value or ""), "notify": bool(notify)},
+    )
+    rows = _runtime_trace_list_rows_for_user(uid, limit=limit) if uid else _runtime_trace_list_all_rows(limit=limit)
+    checked = 0
+    missing = 0
+    conflicts: list[dict[str, Any]] = []
+    notified = 0
+    for trace_id, payload in rows:
+        snapshot = _runtime_sync_conflict_snapshot_from_payload(trace_id, payload)
+        event_id = str(snapshot.get("calendar_event_id") or "").strip()
+        snapshot_uid = str(snapshot.get("user_id") or "").strip()
+        if not event_id:
+            continue
+        if uid and snapshot_uid != uid:
+            continue
+        if not _runtime_snapshot_in_range(snapshot, from_dt, to_dt):
+            continue
+        checked += 1
+        event = _calendar_get_event(event_id)
+        if bool(event.get("ok")):
+            continue
+        if int(event.get("http_status") or 0) != 404:
+            continue
+        missing += 1
+        logging.info(
+            "calendar_drift_missing_event_found",
+            extra={"user_id": snapshot_uid, "trace_id": trace_id, "calendar_event_id": event_id},
+        )
+        conflict = _runtime_sync_conflict_create_or_reopen(
+            user_id=snapshot_uid,
+            source="runtime_trace_dedup",
+            entity_ref=trace_id,
+            calendar_event_id=event_id,
+            payload=snapshot,
+        )
+        conflicts.append(conflict)
+        if notify and _runtime_sync_conflict_notify_if_needed(conflict):
+            notified += 1
+    logging.info(
+        "calendar_drift_check_finished",
+        extra={"user_id": uid, "checked": checked, "missing": missing, "conflicts": len(conflicts), "notified": notified},
+    )
+    return {
+        "ok": True,
+        "user_id": uid,
+        "checked": checked,
+        "missing": missing,
+        "conflicts_created_or_found": len(conflicts),
+        "notified": notified,
+        "conflicts": conflicts,
+        "from": str(from_value or ""),
+        "to": str(to_value or ""),
+    }
+
+
+def _runtime_candidate_signature(candidate: dict[str, Any]) -> str:
+    return _runtime_search_module._runtime_candidate_signature(candidate)
+
+
+def _runtime_build_trace_snapshot(
+    *,
+    trace_id: str,
+    intent: str,
+    entities: dict[str, Any],
+    response_payload: dict[str, Any],
+    user_id: str,
+) -> dict[str, Any]:
+    out = dict(response_payload if isinstance(response_payload, dict) else {})
+    event_id = str(out.get("calendar_event_id") or entities.get("calendar_event_id") or "").strip()
+    title = str(
+        entities.get("title")
+        or out.get("title")
+        or entities.get("meeting_update_source_title")
+        or "Встреча"
+    ).strip() or "Встреча"
+    start_at = str(
+        entities.get("start_at")
+        or out.get("start_at")
+        or ""
+    ).strip()
+    start_at_date = str(entities.get("start_at_date") or out.get("start_at_date") or "").strip()
+    start_at_time = str(entities.get("start_at_time") or out.get("start_at_time") or "").strip()
+    if not start_at and start_at_date and start_at_time:
+        try:
+            start_at = datetime.fromisoformat(f"{start_at_date}T{start_at_time}").replace(tzinfo=_local_tz()).isoformat()
+        except Exception:
+            start_at = ""
+    snapshot = {
+        "trace_id": trace_id,
+        "intent": str(intent or "").strip(),
+        "user_id": str(user_id or "").strip(),
+        "calendar_event_id": event_id,
+        "source_msg_id": str(entities.get("source_msg_id") or "").strip(),
+        "title": title,
+        "meeting_kind": str(entities.get("meeting_kind") or out.get("meeting_kind") or "").strip(),
+        "start_at": start_at,
+        "start_at_date": start_at_date,
+        "start_at_time": start_at_time,
+        "duration_minutes": entities.get("duration_minutes") or out.get("duration_minutes") or DEFAULT_DURATION_MIN,
+        "comment_text": str(
+            entities.get("comment_text")
+            or entities.get("description")
+            or entities.get("comment")
+            or out.get("comment_text")
+            or out.get("description")
+            or out.get("comment")
+            or ""
+        ).strip(),
+    }
+    out["__trace_snapshot"] = snapshot
+    out["user_id"] = str(user_id or "").strip()
+    if event_id:
+        out["calendar_event_id"] = event_id
+    if snapshot["start_at"]:
+        out["start_at"] = snapshot["start_at"]
+    if snapshot["start_at_date"]:
+        out["start_at_date"] = snapshot["start_at_date"]
+    if snapshot["start_at_time"]:
+        out["start_at_time"] = snapshot["start_at_time"]
+    out["duration_minutes"] = snapshot["duration_minutes"]
+    if snapshot["comment_text"] or "comment_text" in out:
+        out["comment_text"] = snapshot["comment_text"]
+    if title:
+        out["title"] = title
+    return out
+
+
+def _runtime_trace_conflict_restore_from_snapshot(conflict: dict[str, Any], *, override: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = conflict.get("payload") if isinstance(conflict.get("payload"), dict) else {}
+    snapshot = dict(payload if isinstance(payload, dict) else {})
+    if isinstance(override, dict):
+        snapshot.update({k: v for k, v in override.items() if v is not None})
+    title = str(snapshot.get("title") or "Встреча").strip() or "Встреча"
+    start_at = _parse_iso_datetime_to_local(snapshot.get("start_at"))
+    if start_at is None:
+        date_raw = str(snapshot.get("start_at_date") or "").strip()
+        time_raw = str(snapshot.get("start_at_time") or "").strip() or "10:00"
+        time_token = _parse_time_token_hhmm(time_raw)
+        date_token = _parse_date_token_ymd(date_raw)
+        if date_token is None or time_token is None:
+            return {"ok": False, "error": "invalid_conflict_snapshot"}
+        start_at = datetime(
+            date_token.year,
+            date_token.month,
+            date_token.day,
+            time_token[0],
+            time_token[1],
+            tzinfo=_local_tz(),
+        )
+    duration = int(snapshot.get("duration_minutes") or DEFAULT_DURATION_MIN)
+    end_at = start_at + timedelta(minutes=max(1, duration))
+    comment_text = str(snapshot.get("comment_text") or "").strip() or None
+    try:
+        new_event_id = _create_event(
+            str(snapshot.get("trace_id") or conflict.get("entity_ref") or f"conflict:{conflict.get('id') or ''}"),
+            title,
+            start_at,
+            end_at,
+            description=comment_text,
+            flow_id=str(conflict.get("id") or ""),
+        )
+    except Exception as exc:
+        return {"ok": False, "error": "calendar_create_failed", "detail": str(exc)[:300]}
+    if not new_event_id:
+        return {"ok": False, "error": "calendar_event_id_missing"}
+    trace_id = str(conflict.get("entity_ref") or "").strip()
+    if trace_id:
+        payload_row = _runtime_trace_dedup_get(trace_id) or {}
+        updated_payload = _runtime_build_trace_snapshot(
+            trace_id=trace_id,
+            intent=str(snapshot.get("intent") or "meeting.update"),
+            entities={
+                "calendar_event_id": str(new_event_id),
+                "title": title,
+                "start_at": start_at.isoformat(),
+                "start_at_date": start_at.date().isoformat(),
+                "start_at_time": start_at.strftime("%H:%M"),
+                "duration_minutes": duration,
+                "comment_text": comment_text or "",
+                "meeting_kind": str(snapshot.get("meeting_kind") or ""),
+            },
+            response_payload={**payload_row, "calendar_event_id": str(new_event_id)},
+            user_id=str(conflict.get("user_id") or snapshot.get("user_id") or ""),
+        )
+        _runtime_trace_dedup_replace(trace_id, updated_payload)
+    _runtime_sync_conflict_set_status(str(conflict.get("id") or ""), "resolved")
+    return {
+        "ok": True,
+        "calendar_event_id": str(new_event_id),
+        "user_message": "Событие восстановлено в календаре.",
+        "conflict_id": str(conflict.get("id") or ""),
+    }
+
+
+def _runtime_trace_find_latest_calendar_event_for_user(user_id: str, *, limit: int = 200) -> str | None:
+    uid = str(user_id or "").strip()
+    if not uid:
+        return None
+    for trace_id, payload in _runtime_trace_list_rows_for_user(uid, limit=limit):
+        snapshot = _runtime_sync_conflict_snapshot_from_payload(trace_id, payload)
+        event_id = str(snapshot.get("calendar_event_id") or "").strip()
+        if not event_id:
+            continue
+        event = _calendar_get_event(event_id)
+        if bool(event.get("ok")):
+            return event_id
+        if int(event.get("http_status") or 0) == 404:
+            _runtime_sync_conflict_create_or_reopen(
+                user_id=uid,
+                source="runtime_trace_dedup",
+                entity_ref=trace_id,
+                calendar_event_id=event_id,
+                payload=snapshot,
+            )
+    return None
+
+
+def _runtime_trace_list_calendar_events_for_user(user_id: str, *, limit: int = 200) -> list[str]:
+    uid = str(user_id or "").strip()
+    if not uid:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for trace_id, payload in _runtime_trace_list_rows_for_user(uid, limit=limit):
+        snapshot = _runtime_sync_conflict_snapshot_from_payload(trace_id, payload)
+        event_id = str(snapshot.get("calendar_event_id") or "").strip()
+        if not event_id or event_id in seen:
+            continue
+        event = _calendar_get_event(event_id)
+        if not bool(event.get("ok")):
+            if int(event.get("http_status") or 0) == 404:
+                _runtime_sync_conflict_create_or_reopen(
+                    user_id=uid,
+                    source="runtime_trace_dedup",
+                    entity_ref=trace_id,
+                    calendar_event_id=event_id,
+                    payload=snapshot,
+                )
+            continue
+        seen.add(event_id)
+        out.append(event_id)
+    return out
+
+
+def _runtime_meeting_source_for_user(user_id: str) -> dict[str, Any]:
+    return _runtime_search_module._runtime_meeting_source_for_user(
+        user_id,
+        trace_list_rows_for_user=_runtime_trace_list_rows_for_user,
+        conflict_snapshot_from_payload=_runtime_sync_conflict_snapshot_from_payload,
+        calendar_get_event=_calendar_get_event,
+        sync_conflict_create_or_reopen=_runtime_sync_conflict_create_or_reopen,
+        parse_iso_datetime_to_local=_parse_iso_datetime_to_local,
+        default_duration_min=DEFAULT_DURATION_MIN,
+        timezone_name=TIMEZONE_NAME,
+    )
+
+
+def _runtime_meeting_search_for_user(user_id: str, target_hint: str = "", meeting_kind: str = "") -> dict[str, Any]:
+    return _runtime_search_module._runtime_meeting_search_for_user(
+        user_id,
+        target_hint,
+        meeting_kind,
+        normalize_meeting_kind=_normalize_meeting_kind,
+        extract_meeting_kind_from_text=_extract_meeting_kind_from_text,
+        trace_list_rows_for_user=_runtime_trace_list_rows_for_user,
+        conflict_snapshot_from_payload=_runtime_sync_conflict_snapshot_from_payload,
+        calendar_get_event=_calendar_get_event,
+        sync_conflict_create_or_reopen=_runtime_sync_conflict_create_or_reopen,
+        parse_iso_datetime_to_local=_parse_iso_datetime_to_local,
+        runtime_candidate_signature=_runtime_candidate_signature,
+        default_duration_min=DEFAULT_DURATION_MIN,
+        meeting_kind_default=_MEETING_KIND_DEFAULT,
+    )
+
+
+def _runtime_task_search_for_user(user_id: str, target_hint: str = "") -> dict[str, Any]:
+    return _runtime_search_module._runtime_task_search_for_user(
+        user_id,
+        target_hint,
+        get_conn=_get_conn,
+        as_dict=as_dict,
+    )
+
+
+def _runtime_task_duplicate_check_for_user(
+    user_id: str,
+    *,
+    title: str,
+    planned_at: Any = None,
+    parent_task_id: Any = None,
+) -> dict[str, Any]:
+    uid = str(user_id or "").strip()
+    title_text = str(title or "").strip()
+    if not uid:
+        return {"ok": False, "reason": "user_id_required", "duplicate_found": False}
+    if not title_text:
+        return {"ok": False, "reason": "title_required", "duplicate_found": False}
+    try:
+        parent_task_id_value = int(parent_task_id) if parent_task_id not in (None, "") else None
+    except Exception:
+        return {"ok": False, "reason": "invalid_parent_task_id", "duplicate_found": False}
+    logging.info(
+        "task_duplicate_precheck_start",
+        extra={
+            "user_id": uid,
+            "title": title_text,
+            "planned_at": str(planned_at or "").strip(),
+            "planned_day": (str(planned_at or "").strip()[:10] or None),
+            "undated_scope": not bool(str(planned_at or "").strip()),
+            "parent_task_id": str(parent_task_id_value or ""),
+            "source": "worker_precheck_endpoint",
+        },
+    )
+    with _get_conn() as conn:
+        probe = db.inspect_duplicate_active_task_create_candidate(
+            conn,
+            title=title_text,
+            planned_at=(str(planned_at).strip() if planned_at is not None else None),
+            parent_task_id=parent_task_id_value,
+        )
+    duplicate_scope = "dated"
+    if bool(probe.get("undated_scope")):
+        duplicate_scope = "subtask_undated" if str(probe.get("parent_scope") or "").strip() else "inbox"
+    logging.info(
+        "task_duplicate_precheck_result",
+        extra={
+            "normalized_title": probe.get("normalized_title"),
+            "planned_at": (str(planned_at).strip() if planned_at is not None else None),
+            "planned_day": probe.get("planned_day"),
+            "undated_scope": bool(probe.get("undated_scope")),
+            "duplicate_scope": duplicate_scope,
+            "parent_task_id": probe.get("parent_scope"),
+            "candidate_count": int(probe.get("candidate_count") or 0),
+            "duplicate_found": bool(probe.get("duplicate_found")),
+            "source": "worker_precheck_endpoint",
+        },
+    )
+    duplicate = probe.get("duplicate") if isinstance(probe.get("duplicate"), dict) else None
+    if duplicate is None:
+        return {
+            "ok": True,
+            "duplicate_found": False,
+            "normalized_title": str(probe.get("normalized_title") or ""),
+            "planned_at": (str(planned_at).strip() if planned_at is not None else None),
+            "planned_day": probe.get("planned_day"),
+            "undated_scope": bool(probe.get("undated_scope")),
+            "duplicate_scope": duplicate_scope,
+            "candidate_count": int(probe.get("candidate_count") or 0),
+        }
+    return {
+        "ok": True,
+        "duplicate_found": True,
+        "normalized_title": str(probe.get("normalized_title") or ""),
+        "planned_at": (str(planned_at).strip() if planned_at is not None else None),
+        "planned_day": probe.get("planned_day"),
+        "undated_scope": bool(probe.get("undated_scope")),
+        "duplicate_scope": duplicate_scope,
+        "candidate_count": int(probe.get("candidate_count") or 0),
+        "existing_task": {
+            "id": duplicate.get("id"),
+            "title": duplicate.get("title"),
+            "planned_at": duplicate.get("planned_at"),
+            "parent_task_id": duplicate.get("parent_task_id"),
+        },
+    }
+
+
+def _runtime_timeblock_search_for_user(user_id: str, target_hint: str = "") -> dict[str, Any]:
+    return _runtime_search_module._runtime_timeblock_search_for_user(
+        user_id,
+        target_hint,
+        get_conn=_get_conn,
+        as_dict=as_dict,
+    )
+
+
+def _runtime_sync_conflict_apply_action(conflict_id: str, action: str) -> dict[str, Any]:
+    conflict = _runtime_sync_conflict_get(conflict_id)
+    if not isinstance(conflict, dict):
+        return {"ok": False, "reason": "conflict_not_found"}
+    normalized_action = str(action or "").strip().lower()
+    if normalized_action == "delete_db":
+        trace_id = str(conflict.get("entity_ref") or "").strip()
+        removed = _runtime_trace_dedup_delete([trace_id]) if trace_id else 0
+        _runtime_sync_conflict_set_status(conflict_id, "resolved")
+        return {
+            "ok": True,
+            "action": "delete_db",
+            "removed": removed,
+            "conflict_id": conflict_id,
+            "user_message": "Событие удалено из внутренней базы и больше не будет предлагаться.",
+        }
+    if normalized_action == "restore_calendar":
+        return _runtime_trace_conflict_restore_from_snapshot(conflict)
+    if normalized_action == "skip":
+        _runtime_sync_conflict_set_status(conflict_id, "skipped")
+        return {
+            "ok": True,
+            "action": "skip",
+            "conflict_id": conflict_id,
+            "user_message": "Хорошо, пока пропускаю этот конфликт.",
+        }
+    if normalized_action == "edit":
+        return {"ok": True, "action": "edit", "conflict_id": conflict_id, "conflict": conflict}
+    return {"ok": False, "reason": "unsupported_action"}
+
+
+def _runtime_sync_conflict_deps() -> dict[str, Any]:
+    return {
+        "get_conn": _get_conn,
+        "as_dict": as_dict,
+        "runtime_trace_dedup_ttl_sec": RUNTIME_TRACE_DEDUP_TTL_SEC,
+        "parse_iso_datetime_to_local": _parse_iso_datetime_to_local,
+        "parse_date_token_ymd": _parse_date_token_ymd,
+        "parse_time_token_hhmm": _parse_time_token_hhmm,
+        "local_tz": _local_tz,
+        "default_duration_min": DEFAULT_DURATION_MIN,
+        "parse_tg_source_msg_id": _parse_tg_source_msg_id,
+        "to_int_or_none": _to_int_or_none,
+        "calendar_get_event": _calendar_get_event,
+        "create_event": _create_event,
+        "tg_send_message_with_keyboard": _tg_send_message_with_keyboard,
+    }
+
+
+def _runtime_trace_dedup_get(trace_id: str) -> dict | None:
+    return _runtime_sync_conflicts_module._runtime_trace_dedup_get(
+        trace_id,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_trace_dedup_put(trace_id: str, payload: dict) -> None:
+    _runtime_sync_conflicts_module._runtime_trace_dedup_put(
+        trace_id,
+        payload,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_trace_dedup_replace(trace_id: str, payload: dict) -> None:
+    _runtime_sync_conflicts_module._runtime_trace_dedup_replace(
+        trace_id,
+        payload,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_trace_dedup_delete(trace_ids: list[str]) -> int:
+    return _runtime_sync_conflicts_module._runtime_trace_dedup_delete(
+        trace_ids,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_trace_list_rows_for_user(user_id: str, *, limit: int = 200) -> list[tuple[str, dict[str, Any]]]:
+    return _runtime_sync_conflicts_module._runtime_trace_list_rows_for_user(
+        user_id,
+        limit=limit,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_trace_list_all_rows(*, limit: int = 5000) -> list[tuple[str, dict[str, Any]]]:
+    return _runtime_sync_conflicts_module._runtime_trace_list_all_rows(
+        limit=limit,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _parse_drift_range_bound(value: Any, *, end_of_day: bool) -> datetime | None:
+    return _runtime_sync_conflicts_module._parse_drift_range_bound(
+        value,
+        end_of_day=end_of_day,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_snapshot_in_range(snapshot: dict[str, Any], from_dt: datetime | None, to_dt: datetime | None) -> bool:
+    return _runtime_sync_conflicts_module._runtime_snapshot_in_range(
+        snapshot,
+        from_dt,
+        to_dt,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_sync_conflict_snapshot_from_payload(trace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return _runtime_sync_conflicts_module._runtime_sync_conflict_snapshot_from_payload(
+        trace_id,
+        payload,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_sync_conflict_summary_text(conflict: dict[str, Any]) -> str:
+    return _runtime_sync_conflicts_module._runtime_sync_conflict_summary_text(conflict)
+
+
+def _runtime_sync_conflict_row_to_payload(row: Any) -> dict[str, Any]:
+    return _runtime_sync_conflicts_module._runtime_sync_conflict_row_to_payload(
+        row,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_sync_conflict_create_or_reopen(
+    *,
+    user_id: str,
+    source: str,
+    entity_ref: str,
+    calendar_event_id: str,
+    payload: dict[str, Any],
+    kind: str = "calendar_missing",
+) -> dict[str, Any]:
+    return _runtime_sync_conflicts_module._runtime_sync_conflict_create_or_reopen(
+        user_id=user_id,
+        source=source,
+        entity_ref=entity_ref,
+        calendar_event_id=calendar_event_id,
+        payload=payload,
+        kind=kind,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_sync_conflict_get(conflict_id: str) -> dict[str, Any] | None:
+    return _runtime_sync_conflicts_module._runtime_sync_conflict_get(
+        conflict_id,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_sync_conflict_set_status(conflict_id: str, status: str) -> dict[str, Any] | None:
+    return _runtime_sync_conflicts_module._runtime_sync_conflict_set_status(
+        conflict_id,
+        status,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_sync_conflict_mark_notified(conflict_id: str) -> dict[str, Any] | None:
+    return _runtime_sync_conflicts_module._runtime_sync_conflict_mark_notified(
+        conflict_id,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_sync_conflict_keyboard(conflict_id: str) -> dict[str, Any]:
+    return _runtime_sync_conflicts_module._runtime_sync_conflict_keyboard(conflict_id)
+
+
+def _runtime_sync_conflict_notify_if_needed(conflict: dict[str, Any]) -> bool:
+    return _runtime_sync_conflicts_module._runtime_sync_conflict_notify_if_needed(
+        conflict,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_cleanup_stale_calendar_events_for_user(user_id: str, *, limit: int = 500) -> dict[str, Any]:
+    return _runtime_sync_conflicts_module._runtime_cleanup_stale_calendar_events_for_user(
+        user_id,
+        limit=limit,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_check_calendar_drift(
+    *,
+    user_id: str = "",
+    from_value: Any = "",
+    to_value: Any = "",
+    notify: bool = True,
+    limit: int = 5000,
+) -> dict[str, Any]:
+    return _runtime_sync_conflicts_module._runtime_check_calendar_drift(
+        user_id=user_id,
+        from_value=from_value,
+        to_value=to_value,
+        notify=notify,
+        limit=limit,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_build_trace_snapshot(
+    *,
+    trace_id: str,
+    intent: str,
+    entities: dict[str, Any],
+    response_payload: dict[str, Any],
+    user_id: str,
+) -> dict[str, Any]:
+    return _runtime_sync_conflicts_module._runtime_build_trace_snapshot(
+        trace_id=trace_id,
+        intent=intent,
+        entities=entities,
+        response_payload=response_payload,
+        user_id=user_id,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_trace_conflict_restore_from_snapshot(
+    conflict: dict[str, Any],
+    *,
+    override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return _runtime_sync_conflicts_module._runtime_trace_conflict_restore_from_snapshot(
+        conflict,
+        override=override,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_trace_find_latest_calendar_event_for_user(user_id: str, *, limit: int = 200) -> str | None:
+    return _runtime_sync_conflicts_module._runtime_trace_find_latest_calendar_event_for_user(
+        user_id,
+        limit=limit,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_trace_list_calendar_events_for_user(user_id: str, *, limit: int = 200) -> list[str]:
+    return _runtime_sync_conflicts_module._runtime_trace_list_calendar_events_for_user(
+        user_id,
+        limit=limit,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _runtime_sync_conflict_apply_action(conflict_id: str, action: str) -> dict[str, Any]:
+    return _runtime_sync_conflicts_module._runtime_sync_conflict_apply_action(
+        conflict_id,
+        action,
+        deps=_runtime_sync_conflict_deps(),
+    )
+
+
+def _command_dedup_init(conn: sqlite3.Connection) -> None:
+    _shared_runtime._command_dedup_init(conn)
+
+
+def _normalize_intent_for_idempotency(raw_intent: Any) -> str:
+    return _shared_runtime._normalize_intent_for_idempotency(raw_intent)
+
+
+def _parse_tg_source_msg_id(raw: Any) -> tuple[str | None, str | None]:
+    text = str(raw or "").strip()
+    if not text:
+        return None, None
+    parts = text.split(":")
+    if len(parts) < 3:
+        return None, None
+    if str(parts[0]).strip().lower() not in {"tg", "telegram"}:
+        return None, None
+    chat_id = str(parts[1]).strip()
+    message_id = str(parts[2]).strip()
+    if not (chat_id and message_id):
+        return None, None
+    return chat_id, message_id
+
+
+def _source_channel_from_envelope(source: Any) -> str:
+    if isinstance(source, dict):
+        raw = source.get("channel") or source.get("source") or source.get("name") or ""
+    else:
+        raw = source
+    value = str(raw or "").strip().lower()
+    if "telegram" in value or value in {"tg", "telegram"}:
+        return "telegram"
+    return value
+
+
+def _runtime_idempotency_key(envelope: dict) -> str | None:
+    return _shared_runtime._runtime_idempotency_key(
+        envelope,
+        normalize_intent=_normalize_intent_for_idempotency,
+    )
+
+
+def _command_dedup_get(idempotency_key: str) -> dict | None:
+    return _shared_runtime._command_dedup_get(idempotency_key, db_path=DB_PATH)
+
+
+def _command_dedup_put(
+    idempotency_key: str,
+    *,
+    intent: str,
+    entity_type: str | None,
+    entity_id: str | None,
+) -> None:
+    _shared_runtime._command_dedup_put(
+        idempotency_key,
+        intent=intent,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        db_path=DB_PATH,
+    )
+
+
+def _command_entity_ref(payload: dict) -> tuple[str | None, str | None]:
+    if not isinstance(payload, dict):
+        return None, None
+    keys_map = (
+        ("time_block_id", "timeblock"),
+        ("task_id", "task"),
+        ("subtask_id", "subtask"),
+        ("goal_id", "goal"),
+        ("cycle_id", "cycle"),
+        ("project_id", "project"),
+        ("direction_id", "direction"),
+        ("regulation_id", "regulation"),
+        ("regulation_run_id", "regulation_run"),
+        ("event_id", "calendar_event"),
+        ("calendar_event_id", "calendar_event"),
+    )
+    for key, entity_type in keys_map:
+        value = payload.get(key)
+        if value is None:
+            continue
+        entity_id = str(value).strip()
+        if entity_id:
+            return entity_type, entity_id
+    debug = payload.get("debug")
+    if isinstance(debug, dict):
+        for key, entity_type in keys_map:
+            value = debug.get(key)
+            if value is None:
+                continue
+            entity_id = str(value).strip()
+            if entity_id:
+                return entity_type, entity_id
+    return None, None
+
+
+def _duplicate_execution_response(dedup_row: dict, *, idempotency_key: str) -> dict:
+    entity_type = str(dedup_row.get("entity_type") or "").strip()
+    entity_id = str(dedup_row.get("entity_id") or "").strip()
+    intent = str(dedup_row.get("intent") or "").strip()
+    out: dict[str, Any] = {
+        "ok": True,
+        "already_executed": True,
+        "user_message": "Уже выполнено ранее.",
+        "debug": {
+            "idempotency_key": idempotency_key,
+            "intent": intent,
+        },
+    }
+    if entity_type:
+        out["entity_type"] = entity_type
+        out["debug"]["entity_type"] = entity_type
+    if entity_id:
+        out["entity_id"] = entity_id
+        out["debug"]["entity_id"] = entity_id
+        if entity_type == "task" and entity_id.isdigit():
+            out["task_id"] = int(entity_id)
+        elif entity_type == "timeblock" and entity_id.isdigit():
+            out["time_block_id"] = int(entity_id)
+    return out
+
+
+def _runtime_flow_id(envelope: dict[str, Any], trace_id: str) -> str:
+    explicit = str(envelope.get("flow_id") or "").strip()
+    if explicit:
+        return explicit
+    source = envelope.get("source")
+    if isinstance(source, dict):
+        nested = str(source.get("flow_id") or "").strip()
+        if nested:
+            return nested
+    return trace_id
+
+
+def _runtime_source_timezone(envelope: dict[str, Any]) -> str:
+    source = envelope.get("source")
+    if isinstance(source, dict):
+        tz = str(source.get("timezone") or "").strip()
+        if tz:
+            return tz
+    return TIMEZONE_NAME
+
+
+def _runtime_handler_deps() -> dict[str, Any]:
+    return {
+        "runtime_flow_id": _runtime_flow_id,
+        "runtime_source_timezone": _runtime_source_timezone,
+        "runtime_trace_dedup_get": _runtime_trace_dedup_get,
+        "runtime_trace_dedup_put": _runtime_trace_dedup_put,
+        "normalize_intent_for_idempotency": _normalize_intent_for_idempotency,
+        "runtime_idempotency_key": _runtime_idempotency_key,
+        "command_dedup_get": _command_dedup_get,
+        "duplicate_execution_response": _duplicate_execution_response,
+        "dispatch_intent": dispatch_intent,
+        "runtime_commit_temporal_calendar": _runtime_commit_temporal_calendar,
+        "runtime_commit_meeting_update_calendar": _runtime_commit_meeting_update_calendar,
+        "runtime_commit_meeting_comment_update_calendar": _runtime_commit_meeting_comment_update_calendar,
+        "command_entity_ref": _command_entity_ref,
+        "command_dedup_put": _command_dedup_put,
+        "runtime_build_trace_snapshot": _runtime_build_trace_snapshot,
+    }
+
+
+def _runtime_server_deps() -> dict[str, Any]:
+    return {
+        "handle_runtime_command": _runtime_handlers_module.handle_runtime_command,
+        "runtime_handler_deps": _runtime_handler_deps,
+        "runtime_meeting_source_for_user": _runtime_meeting_source_for_user,
+        "runtime_meeting_search_for_user": _runtime_meeting_search_for_user,
+        "runtime_cleanup_stale_calendar_events_for_user": _runtime_cleanup_stale_calendar_events_for_user,
+        "runtime_check_calendar_drift": _runtime_check_calendar_drift,
+        "runtime_sync_conflict_apply_action": _runtime_sync_conflict_apply_action,
+        "runtime_task_search_for_user": _runtime_task_search_for_user,
+        "runtime_task_duplicate_check_for_user": _runtime_task_duplicate_check_for_user,
+        "runtime_timeblock_search_for_user": _runtime_timeblock_search_for_user,
+    }
+
+
+_MEETING_KIND_DEFAULT = "встреча"
+
+
+def _normalize_meeting_kind(raw: Any) -> str:
+    value = str(raw or "").strip().lower().replace("ё", "е")
+    if not value:
+        return ""
+    if value.startswith("собран"):
+        return "собрание"
+    if value.startswith("созвон") or value.startswith("звон"):
+        return "созвон"
+    if value.startswith("мероприят") or value.startswith("ивент") or value.startswith("событ"):
+        return "мероприятие"
+    if value.startswith("встреч"):
+        return "встреча"
+    return ""
+
+
+def _extract_meeting_kind_from_text(text: Any) -> str:
+    low = str(text or "").strip().lower().replace("ё", "е")
+    if not low:
+        return ""
+    if re.search(r"\bсобран\w*\b", low):
+        return "собрание"
+    if re.search(r"\b(созвон\w*|звонок|колл)\b", low):
+        return "созвон"
+    if re.search(r"\b(мероприят\w*|ивент\w*|событ\w*)\b", low):
+        return "мероприятие"
+    if re.search(r"\bвстреч\w*\b", low):
+        return "встреча"
+    return ""
+
+
+def _meeting_kind_from_entities(intent: str, entities: dict[str, Any]) -> str:
+    intent_norm = _normalize_intent_for_idempotency(intent)
+    explicit = _normalize_meeting_kind(entities.get("meeting_kind") or entities.get("event_kind"))
+    if explicit:
+        return explicit
+    if intent_norm == "meeting.create":
+        return _MEETING_KIND_DEFAULT
+    inferred = _extract_meeting_kind_from_text(entities.get("text") or entities.get("title"))
+    if inferred:
+        return inferred
+    if "meeting" in intent_norm:
+        return _MEETING_KIND_DEFAULT
+    return ""
+
+
+def _meeting_success_text(meeting_kind: Any, action: str) -> str:
+    kind = _normalize_meeting_kind(meeting_kind) or _MEETING_KIND_DEFAULT
+    action_norm = str(action or "").strip().lower()
+    if action_norm == "create":
+        by_kind = {
+            "встреча": "Встреча создана.",
+            "собрание": "Собрание создано.",
+            "созвон": "Созвон создан.",
+            "мероприятие": "Мероприятие создано.",
+        }
+    elif action_norm == "reschedule":
+        by_kind = {
+            "встреча": "Встреча перенесена.",
+            "собрание": "Собрание перенесено.",
+            "созвон": "Созвон перенесён.",
+            "мероприятие": "Мероприятие перенесено.",
+        }
+    else:
+        by_kind = {
+            "встреча": "Встреча обновлена.",
+            "собрание": "Собрание обновлено.",
+            "созвон": "Созвон обновлён.",
+            "мероприятие": "Мероприятие обновлено.",
+        }
+    return by_kind.get(kind, by_kind[_MEETING_KIND_DEFAULT])
+
+
+def _normalize_meeting_title(raw: Any, meeting_kind: str) -> str:
+    kind = _normalize_meeting_kind(meeting_kind) or _MEETING_KIND_DEFAULT
+    text = str(raw or "").strip()
+    if not text:
+        return kind.capitalize()
+    s = text.replace("ё", "е").replace("Ё", "Е")
+    s = re.sub(
+        r"\b(назначь|запланируй|поставь|сделай|создай|добавь|перенеси|сдвинь|поменяй|измени|нужно|надо|хочу)\b",
+        " ",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(r"\b(сегодня|завтра|послезавтра)\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{4})?\b", " ", s)
+    s = re.sub(r"\b(?:в|на|к)\s*\d{1,2}(?::\d{2})?\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bна\s+\d+\s*(?:мин|минута|минуты|минут|час|часа|часов)\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip(" ,.-")
+    if not s:
+        return kind.capitalize()
+    s = re.sub(r"^встреч(?:у|е|и)\b", "встреча", s, flags=re.IGNORECASE)
+    s = re.sub(r"^собрани(?:е|я|ю)\b", "собрание", s, flags=re.IGNORECASE)
+    s = re.sub(r"^(?:созвон(?:а|е)?|звонок|колл)\b", "созвон", s, flags=re.IGNORECASE)
+    s = re.sub(r"^мероприяти(?:е|я)\b", "мероприятие", s, flags=re.IGNORECASE)
+    s = re.sub(
+        r"^(встреча|собрание|созвон|мероприятие)\s+(?:встреч(?:а|у|е|и)|собрани(?:е|я|ю)|созвон(?:а|е)?|звонок|колл|мероприяти(?:е|я))\b",
+        r"\1",
+        s,
+        flags=re.IGNORECASE,
+    ).strip()
+    if re.match(r"^(встреча|собрание|созвон|мероприятие)\b", s, flags=re.IGNORECASE):
+        return s[:1].upper() + s[1:]
+    return f"{kind.capitalize()} {s}".strip()
+
+
+def _runtime_temporal_title(intent: str, entities: dict[str, Any]) -> str:
+    meeting_kind = _meeting_kind_from_entities(intent, entities)
+    intent_norm = _normalize_intent_for_idempotency(intent)
+    if meeting_kind or "meeting" in intent_norm:
+        explicit_title = str(entities.get("title") or "").strip()
+        if explicit_title:
+            return explicit_title
+        source_text = str(entities.get("text") or "").strip()
+        return _normalize_meeting_title(source_text, meeting_kind or _MEETING_KIND_DEFAULT)
+    source_text = str(entities.get("text") or "").strip().lower()
+    if MEETING_HINT_RE.search(source_text):
+        return _normalize_meeting_title(source_text, _MEETING_KIND_DEFAULT)
+    explicit = str(entities.get("title") or "").strip()
+    if explicit:
+        return explicit
+    return "Блок времени"
+
+
+def _runtime_duration_minutes(entities: dict[str, Any]) -> int | None:
+    for key in ("duration_minutes", "duration_min", "duration_mins", "duration"):
+        raw = entities.get(key)
+        if raw is None:
+            continue
+        try:
+            parsed = int(str(raw).strip())
+        except Exception:
+            continue
+        if parsed > 0:
+            return parsed
+    return None
+
+
+def _parse_iso_datetime_to_local(value: Any) -> datetime | None:
+    return _shared_runtime._parse_iso_datetime_to_local(value, tz_offset_min=LOCAL_TZ_OFFSET_MIN)
+
+
+def _parse_date_token_ymd(value: Any) -> date | None:
+    return _shared_runtime._parse_date_token_ymd(value)
+
+
+def _parse_time_token_hhmm(value: Any) -> tuple[int, int] | None:
+    return _shared_runtime._parse_time_token_hhmm(value)
+# SHARED_RUNTIME_HELPERS_END
 
 
 def _require_int_field(value: Any, field_name: str) -> int:
@@ -420,18 +2051,18 @@ def _extract_datetime(text: str, now_local: datetime | None = None) -> datetime 
     Returns timezone-aware datetime in LOCAL_TZ.
 
     Examples:
-      - "встреча завтра в 9" -> ambiguous -> inbox + 06:00
+      - "встреча завтра в 9" -> ambiguous -> inbox + 09:00
       - "встреча завтра в 9 утра" -> active + 09:00
       - "встреча завтра в 19" -> active + 19:00
       - "встреча завтра в 7 вечера" -> active + 19:00
-      - "на следующей неделе" -> marker 06:00 + inbox
+      - "на следующей неделе" -> default 10:00 + inbox
       - "завтра" -> default 10:00 + inbox
       - "в 9 третьего" -> ближайшее 03-е число в 09:00
       - "третьего в 9" -> ближайшее 03-е число в 09:00
       - "четвертого в 3" -> ближайшее 04-е число в 03:00
       - "встреча 3-го в 9.30" -> ближайшее 03-е число в 09:30
       - "4-го в 15:30" -> ближайшее 04-е число в 15:30
-      - "встреча третьего" -> ближайшее 03-е число в 06:00
+      - "встреча третьего" -> ближайшее 03-е число в 10:00
       - "в 9.30 четвертого" -> ближайшее 04-е число в 09:30
     """
     if not text:
@@ -457,11 +2088,6 @@ def _extract_datetime(text: str, now_local: datetime | None = None) -> datetime 
     if now_local is None:
         now_local = datetime.now(tz)
 
-    period_like = any(x in t for x in (
-        "на этой неделе", "на прошлой неделе", "на следующей неделе",
-        "в этом месяце", "в прошлом месяце", "в следующем месяце",
-        "в этом году", "в прошлом году", "в следующем году", "через ",
-    ))
     tm = _parse_time_ru(t)
     time_ambiguous = False
     if tm:
@@ -470,15 +2096,12 @@ def _extract_datetime(text: str, now_local: datetime | None = None) -> datetime 
         if time_ambiguous:
             logging.info("time_ambiguous=True text=%r", text[:200])
     else:
-        hh, mm = (MARKER_HOUR, MARKER_MINUTE) if period_like else (DEFAULT_HOUR, DEFAULT_MINUTE)
+        hh, mm = (DEFAULT_HOUR, DEFAULT_MINUTE)
     time_explicit = tm is not None
 
     rel_date = _resolve_relative_period(t, now_local)
     if rel_date:
-        hh_use, mm_use = (
-            (DT_AMBIGUOUS_MARKER_HOUR, DT_AMBIGUOUS_MARKER_MINUTE) if time_ambiguous else (hh, mm)
-        )
-        return datetime(rel_date.year, rel_date.month, rel_date.day, hh_use, mm_use, tzinfo=tz)
+        return datetime(rel_date.year, rel_date.month, rel_date.day, hh, mm, tzinfo=tz)
 
     # day-of-month without month (e.g., "третьего в 9", "4-го", "4-го в 15:30")
     has_month_name = _parse_month_ru(t) is not None
@@ -506,12 +2129,8 @@ def _extract_datetime(text: str, now_local: datetime | None = None) -> datetime 
                         target_month += 1
                 d = _clamp_day(target_year, target_month, day)
                 if not time_explicit:
-                    return datetime(target_year, target_month, d, MARKER_HOUR, MARKER_MINUTE, tzinfo=tz)
-
-                hh_use, mm_use = (
-                    (DT_AMBIGUOUS_MARKER_HOUR, DT_AMBIGUOUS_MARKER_MINUTE) if time_ambiguous else (hh, mm)
-                )
-                return datetime(target_year, target_month, d, hh_use, mm_use, tzinfo=tz)
+                    return datetime(target_year, target_month, d, DEFAULT_HOUR, DEFAULT_MINUTE, tzinfo=tz)
+                return datetime(target_year, target_month, d, hh, mm, tzinfo=tz)
 
     # explicit date: "3 марта", "12.05", "12/05/2025", etc.
     # month name in RU
@@ -524,12 +2143,9 @@ def _extract_datetime(text: str, now_local: datetime | None = None) -> datetime 
         if mday is None:
             mday = DEFAULT_MONTHDAY
         d = _clamp_day(now_local.year, mon, mday)
-        hh_use, mm_use = (
-            (DT_AMBIGUOUS_MARKER_HOUR, DT_AMBIGUOUS_MARKER_MINUTE) if time_ambiguous else (hh, mm)
-        )
-        dt = datetime(now_local.year, mon, d, hh_use, mm_use, tzinfo=tz)
+        dt = datetime(now_local.year, mon, d, hh, mm, tzinfo=tz)
         if dt <= now_local:
-            dt = datetime(now_local.year + 1, mon, d, hh_use, mm_use, tzinfo=tz)
+            dt = datetime(now_local.year + 1, mon, d, hh, mm, tzinfo=tz)
         return dt
 
     # numeric date with separators
@@ -549,14 +2165,11 @@ def _extract_datetime(text: str, now_local: datetime | None = None) -> datetime 
             abs_date = date(y, mo, d)
         if abs_date is None:
             return None
-        hh_use, mm_use = (
-            (DT_AMBIGUOUS_MARKER_HOUR, DT_AMBIGUOUS_MARKER_MINUTE) if time_ambiguous else (hh, mm)
-        )
-        dt = datetime(abs_date.year, abs_date.month, abs_date.day, hh_use, mm_use, tzinfo=tz)
+        dt = datetime(abs_date.year, abs_date.month, abs_date.day, hh, mm, tzinfo=tz)
         if y_raw is None and time_explicit and dt <= now_local:
             y2 = now_local.year + 1
             d2 = _clamp_day(y2, mo, d)
-            dt = datetime(y2, mo, d2, hh_use, mm_use, tzinfo=tz)
+            dt = datetime(y2, mo, d2, hh, mm, tzinfo=tz)
         return dt
 
     # only weekday reference, no "неделя" word
@@ -568,10 +2181,7 @@ def _extract_datetime(text: str, now_local: datetime | None = None) -> datetime 
         if delta == 0:
             delta = 7
         target = base_date + timedelta(days=delta)
-        hh_use, mm_use = (
-            (DT_AMBIGUOUS_MARKER_HOUR, DT_AMBIGUOUS_MARKER_MINUTE) if time_ambiguous else (hh, mm)
-        )
-        return datetime(target.year, target.month, target.day, hh_use, mm_use, tzinfo=tz)
+        return datetime(target.year, target.month, target.day, hh, mm, tzinfo=tz)
 
     return None
 
@@ -589,15 +2199,12 @@ def _selfcheck_asr_datetime() -> None:
 
 
 def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    return conn
+    return _shared_runtime._get_conn(DB_PATH)
 
 
 def _init_db() -> None:
     with _get_conn() as conn:
+        _command_dedup_init(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS items (
@@ -845,92 +2452,6 @@ def reap_claims(conn: sqlite3.Connection, now_ts: float) -> tuple[int, int]:
     return reclaimed, dead
 
 
-def _queue_reaper() -> None:
-    with _get_conn() as conn:
-        reap_claims(conn, time.time())
-        conn.commit()
-
-
-def _queue_claim() -> dict | None:
-    with _get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        cur = conn.execute(
-            """
-            UPDATE inbox_queue
-            SET status='CLAIMED',
-                claimed_by=?,
-                claimed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-                lease_until=strftime('%Y-%m-%dT%H:%M:%fZ','now', '+' || ? || ' seconds'),
-                attempts=attempts+1,
-                updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            WHERE id = (
-              SELECT id
-              FROM inbox_queue
-              WHERE status='NEW'
-              ORDER BY priority ASC, id ASC
-              LIMIT 1
-            )
-            """,
-            (WORKER_ID, str(B2_CLAIM_LEASE_SEC)),
-        )
-        if cur.rowcount != 1:
-            conn.commit()
-            return None
-        row = conn.execute(
-            """
-            SELECT *
-            FROM inbox_queue
-            WHERE status='CLAIMED' AND claimed_by=?
-            ORDER BY claimed_at DESC
-            LIMIT 1
-            """,
-            (WORKER_ID,),
-        ).fetchone()
-        conn.commit()
-        return dict(row) if row else None
-
-
-def _queue_mark(queue_id: int, status: str, last_error: str | None = None) -> None:
-    with _get_conn() as conn:
-        conn.execute(
-            """
-            UPDATE inbox_queue
-            SET status=?,
-                last_error=?,
-                updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            WHERE id=?
-            """,
-            (status, last_error, queue_id),
-        )
-        conn.commit()
-
-
-def _queue_requeue_failed(limit: int) -> int:
-    """
-    Bounded auto-requeue: FAILED -> NEW for tasks with attempts < B2_MAX_ATTEMPTS
-    """
-    if limit <= 0:
-        return 0
-    with _get_conn() as conn:
-        cur = conn.execute(
-            f"""
-            UPDATE inbox_queue
-            SET status='NEW',
-                updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            WHERE id IN (
-              SELECT id
-              FROM inbox_queue
-              WHERE status='FAILED'
-                AND attempts < ?
-              ORDER BY id ASC
-              LIMIT {int(limit)}
-            )
-            """,
-            (B2_MAX_ATTEMPTS,),
-        )
-        conn.commit()
-        return int(cur.rowcount or 0)
-
 def _tg_download_voice(file_id: str) -> bytes:
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
@@ -949,59 +2470,220 @@ def _tg_download_voice(file_id: str) -> bytes:
     return file_resp.content
 
 
-def _tg_send_message(chat_id: int, text: str) -> bool:
-    """
-    Send message to Telegram user from worker. Best-effort with retries.
-    """
+def _tg_split_chunks(text: str, limit: int = WORKER_TG_TEXT_CHUNK) -> list[str]:
+    raw = str(text or "")
+    if not raw:
+        return [""]
+    max_len = max(100, int(limit))
+    chunks: list[str] = []
+    rest = raw
+    while len(rest) > max_len:
+        cut = rest.rfind("\n", 0, max_len + 1)
+        if cut <= max_len // 2:
+            cut = max_len
+        chunk = rest[:cut].strip()
+        if not chunk:
+            chunk = rest[:max_len]
+            cut = max_len
+        chunks.append(chunk)
+        rest = rest[cut:].lstrip("\n")
+    if rest:
+        chunks.append(rest)
+    return chunks or [raw[:max_len]]
+
+
+def _tg_retry_after_seconds(exc: Exception) -> float | None:
+    if not isinstance(exc, urllib.error.HTTPError):
+        return None
+    if int(getattr(exc, "code", 0)) != 429:
+        return None
+    retry_after = exc.headers.get("Retry-After") if getattr(exc, "headers", None) else None
+    if not retry_after:
+        return None
+    try:
+        return max(0.0, float(str(retry_after).strip()))
+    except Exception:
+        return None
+
+
+def _item_set_last_error(item_id: int, err_text: str) -> None:
+    err = str(err_text or "").strip()
+    if not err:
+        return
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE items
+                SET last_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (err[:500], datetime.now(timezone.utc).isoformat(), int(item_id)),
+            )
+            conn.commit()
+    except Exception:
+        logging.exception("item_last_error_update_failed item_id=%s", item_id)
+
+
+def _item_clear_last_error(item_id: int) -> None:
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE items
+                SET last_error = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (datetime.now(timezone.utc).isoformat(), int(item_id)),
+            )
+            conn.commit()
+    except Exception:
+        logging.exception("item_last_error_clear_failed item_id=%s", item_id)
+
+
+def _tg_send_payload(
+    payload: dict,
+    *,
+    chat_id: int,
+    item_id: int | None,
+    queue_id: int | None,
+    stage: str,
+) -> tuple[bool, int | None, str | None]:
     if not TELEGRAM_BOT_TOKEN:
-        return False
+        return False, None, "telegram_bot_token_missing"
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    last_exc: Exception | None = None
-    for _ in range(max(1, TG_HTTP_RETRIES)):
+    max_attempts = max(1, TG_HTTP_RETRIES) + max(0, TG_HTTP_429_RETRIES)
+    last_error = "unknown"
+    last_tb = ""
+    for attempt in range(1, max_attempts + 1):
         try:
-            payload = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             req = urllib.request.Request(
                 url,
-                data=payload,
+                data=raw,
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=TG_HTTP_READ_TIMEOUT) as resp:
-                _ = resp.read()
-            return True
-        except Exception as exc:
-            last_exc = exc
-            time.sleep(TG_HTTP_RETRY_SLEEP)
-    if last_exc:
-        logging.warning("tg notify failed chat_id=%s err=%s", chat_id, str(last_exc)[:200])
-    return False
-
-
-def _tg_send_message_with_keyboard(chat_id: int, text: str, reply_markup: dict) -> bool:
-    if not TELEGRAM_BOT_TOKEN:
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    last_exc: Exception | None = None
-    for _ in range(max(1, TG_HTTP_RETRIES)):
-        try:
-            payload = json.dumps(
-                {"chat_id": chat_id, "text": text, "reply_markup": reply_markup}
-            ).encode("utf-8")
-            req = urllib.request.Request(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
+                body = resp.read()
+            data = json.loads(body.decode("utf-8")) if body else {}
+            if not isinstance(data, dict) or not data.get("ok"):
+                last_error = f"telegram_api_not_ok:{str(data)[:200]}"
+                if attempt < max_attempts:
+                    time.sleep(TG_HTTP_RETRY_SLEEP)
+                    continue
+                break
+            result = data.get("result") if isinstance(data, dict) else None
+            message_id = _to_int_or_none(result.get("message_id")) if isinstance(result, dict) else None
+            logging.info(
+                "send_result_ok queue_id=%s item_id=%s stage=%s chat_id=%s msg_id=%s",
+                queue_id,
+                item_id,
+                stage,
+                chat_id,
+                message_id,
             )
-            with urllib.request.urlopen(req, timeout=TG_HTTP_READ_TIMEOUT) as resp:
-                _ = resp.read()
-            return True
+            return True, message_id, None
         except Exception as exc:
-            last_exc = exc
-            time.sleep(TG_HTTP_RETRY_SLEEP)
-    if last_exc:
-        logging.warning("tg notify failed chat_id=%s err=%s", chat_id, str(last_exc)[:200])
-    return False
+            last_error = f"{type(exc).__name__}:{str(exc)[:200]}"
+            last_tb = traceback.format_exc()
+            sleep_sec = TG_HTTP_RETRY_SLEEP
+            retry_after = _tg_retry_after_seconds(exc)
+            if retry_after is not None:
+                sleep_sec = max(0.5, retry_after)
+            if attempt < max_attempts:
+                time.sleep(sleep_sec)
+                continue
+            break
+    logging.error(
+        "send_result_fail queue_id=%s item_id=%s stage=%s chat_id=%s err=%s traceback=%s",
+        queue_id,
+        item_id,
+        stage,
+        chat_id,
+        last_error,
+        last_tb[:2000],
+    )
+    return False, None, last_error
+
+
+def _tg_send_text(
+    chat_id: int,
+    text: str,
+    *,
+    item_id: int | None = None,
+    queue_id: int | None = None,
+    stage: str = "notify",
+    reply_markup: dict | None = None,
+) -> tuple[bool, list[int], str | None]:
+    chunks = _tg_split_chunks(text)
+    sent_ids: list[int] = []
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks, start=1):
+        payload: dict[str, Any] = {"chat_id": chat_id, "text": chunk}
+        if idx == 1 and reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        step = f"{stage}:{idx}/{total}" if total > 1 else stage
+        logging.info(
+            "send_result_start queue_id=%s item_id=%s stage=%s chat_id=%s result_len=%s",
+            queue_id,
+            item_id,
+            step,
+            chat_id,
+            len(chunk),
+        )
+        ok, msg_id, err = _tg_send_payload(
+            payload,
+            chat_id=chat_id,
+            item_id=item_id,
+            queue_id=queue_id,
+            stage=step,
+        )
+        if not ok:
+            return False, sent_ids, err
+        if msg_id is not None:
+            sent_ids.append(int(msg_id))
+    return True, sent_ids, None
+
+
+def _tg_send_message(
+    chat_id: int,
+    text: str,
+    *,
+    item_id: int | None = None,
+    queue_id: int | None = None,
+    stage: str = "notify",
+) -> bool:
+    ok, _ids, _err = _tg_send_text(
+        chat_id,
+        text,
+        item_id=item_id,
+        queue_id=queue_id,
+        stage=stage,
+    )
+    return ok
+
+
+def _tg_send_message_with_keyboard(
+    chat_id: int,
+    text: str,
+    reply_markup: dict,
+    *,
+    item_id: int | None = None,
+    queue_id: int | None = None,
+    stage: str = "notify_keyboard",
+) -> bool:
+    ok, _ids, _err = _tg_send_text(
+        chat_id,
+        text,
+        item_id=item_id,
+        queue_id=queue_id,
+        stage=stage,
+        reply_markup=reply_markup,
+    )
+    return ok
 
 
 _TG_RESULT_SUCCESS = 1
@@ -1028,10 +2710,38 @@ def _tg_mark_result_sent(item_id: int, flag: int) -> bool:
         return False
 
 
-def _tg_mark_created_sent(item_id: int) -> bool:
-    return _tg_mark_result_sent(item_id, _TG_RESULT_CREATED)
+def _tg_mark_sent_success(
+    item_id: int,
+    flag: int,
+    *,
+    queue_id: int | None,
+    chat_id: int,
+    stage: str,
+) -> bool:
+    marked = _tg_mark_result_sent(int(item_id), int(flag))
+    if marked:
+        _item_clear_last_error(int(item_id))
+        logging.info(
+            "mark_delivered_ok queue_id=%s item_id=%s stage=%s chat_id=%s flag=%s",
+            queue_id,
+            item_id,
+            stage,
+            chat_id,
+            int(flag),
+        )
+    else:
+        logging.info(
+            "mark_delivered_skip queue_id=%s item_id=%s stage=%s chat_id=%s flag=%s",
+            queue_id,
+            item_id,
+            stage,
+            chat_id,
+            int(flag),
+        )
+    return marked
 
-def _tg_notify_created(item_id: int) -> None:
+
+def _tg_notify_created(item_id: int, queue_id: int | None = None) -> None:
     try:
         with _get_conn() as conn:
             row = conn.execute(
@@ -1045,17 +2755,38 @@ def _tg_notify_created(item_id: int) -> None:
         flags = int(row.get("tg_result_sent") or 0)
         if flags & _TG_RESULT_CREATED:
             return
-        if not _tg_mark_created_sent(int(item_id)):
-            return
         item_type = str(row.get("type") or "task")
         status = str(row.get("status") or "inbox")
-        logging.info("tg_notify created item_id=%s", item_id)
+        logging.info(
+            "result_prepare queue_id=%s item_id=%s stage=created chat_id=%s status=%s",
+            queue_id,
+            item_id,
+            chat_id,
+            status,
+        )
+        text = f"Создано: #{item_id} ({status})."
         if item_type == "meeting":
-            _tg_send_message(chat_id, f"Создано: #{item_id} ({status}). Поставлю в календарь.")
-        else:
-            _tg_send_message(chat_id, f"Создано: #{item_id} ({status}).")
-    except Exception as exc:
-        logging.warning("tg notify created failed item_id=%s err=%s", item_id, str(exc)[:200])
+            text = f"Создано: #{item_id} ({status}). Поставлю в календарь."
+        ok, _ids, err = _tg_send_text(
+            chat_id,
+            text,
+            item_id=int(item_id),
+            queue_id=queue_id,
+            stage="created",
+        )
+        if not ok:
+            _item_set_last_error(int(item_id), f"tg_send_created_failed:{err}")
+            return
+        _tg_mark_sent_success(
+            int(item_id),
+            _TG_RESULT_CREATED,
+            queue_id=queue_id,
+            chat_id=chat_id,
+            stage="created",
+        )
+    except Exception:
+        logging.exception("tg_notify_created_failed item_id=%s queue_id=%s", item_id, queue_id)
+        _item_set_last_error(int(item_id), "tg_notify_created_exception")
 
 
 def _tg_notify_calendar_error(item_id: int) -> None:
@@ -1114,14 +2845,20 @@ def _compute_item_fields_from_text(text: str) -> tuple[str, str, str | None, str
     time_ambiguous = _is_time_ambiguous(text or "")
     has_time = _parse_time_ru(text or "") is not None
     status = "active" if (dt and has_time and not time_ambiguous) else "inbox"
-    start_at = dt.isoformat() if dt else None
-    end_at = (dt + timedelta(minutes=MEETING_DEFAULT_MINUTES)).isoformat() if dt else None
+    # Contract-safe behavior: do not persist implicit marker time (e.g. 06:00/10:00)
+    # as actual schedule when explicit time is missing or ambiguous.
+    start_at = dt.isoformat() if (dt and has_time and not time_ambiguous) else None
+    end_at = (
+        (dt + timedelta(minutes=MEETING_DEFAULT_MINUTES)).isoformat()
+        if (dt and has_time and not time_ambiguous)
+        else None
+    )
     return item_type, status, start_at, end_at, dt, time_ambiguous
 
 
-def _tg_notify_calendar_success(item_id: int) -> None:
+def _tg_notify_calendar_success(item_id: int, queue_id: int | None = None) -> None:
     try:
-        _tg_notify_created(int(item_id))
+        _tg_notify_created(int(item_id), queue_id=queue_id)
         with _get_conn() as conn:
             row = conn.execute(
                 "SELECT tg_chat_id, title, start_at, tg_result_sent, type, status FROM items WHERE id = ?",
@@ -1143,24 +2880,38 @@ def _tg_notify_calendar_success(item_id: int) -> None:
             dead_sent,
         )
         if not created_sent:
-            _tg_notify_created(int(item_id))
+            _tg_notify_created(int(item_id), queue_id=queue_id)
         if success_sent:
-            return
-        if not _tg_mark_result_sent(int(item_id), _TG_RESULT_SUCCESS):
             return
         title = (row.get("title") or "").strip() or "без названия"
         start_at = str(row.get("start_at") or "")
         when_human = _format_start_at_local(start_at) or "без времени"
         text = f"✅ В календаре: {when_human} — {title}"
-        logging.info("tg_notify success item_id=%s", item_id)
-        _tg_send_message(chat_id, text)
-    except Exception as exc:
-        logging.warning("tg notify success failed item_id=%s err=%s", item_id, str(exc)[:200])
+        ok, _ids, err = _tg_send_text(
+            chat_id,
+            text,
+            item_id=int(item_id),
+            queue_id=queue_id,
+            stage="calendar_success",
+        )
+        if not ok:
+            _item_set_last_error(int(item_id), f"tg_send_calendar_success_failed:{err}")
+            return
+        _tg_mark_sent_success(
+            int(item_id),
+            _TG_RESULT_SUCCESS,
+            queue_id=queue_id,
+            chat_id=chat_id,
+            stage="calendar_success",
+        )
+    except Exception:
+        logging.exception("tg_notify_calendar_success_failed item_id=%s queue_id=%s", item_id, queue_id)
+        _item_set_last_error(int(item_id), "tg_notify_calendar_success_exception")
 
 
-def _tg_notify_calendar_dead(item_id: int) -> None:
+def _tg_notify_calendar_dead(item_id: int, queue_id: int | None = None) -> None:
     try:
-        _tg_notify_created(int(item_id))
+        _tg_notify_created(int(item_id), queue_id=queue_id)
         with _get_conn() as conn:
             row = conn.execute(
                 "SELECT tg_chat_id, tg_result_sent, type, status FROM items WHERE id = ?",
@@ -1182,26 +2933,141 @@ def _tg_notify_calendar_dead(item_id: int) -> None:
             dead_sent,
         )
         if not created_sent:
-            _tg_notify_created(int(item_id))
+            _tg_notify_created(int(item_id), queue_id=queue_id)
         if dead_sent:
             return
-        if not _tg_mark_result_sent(int(item_id), _TG_RESULT_DEAD):
-            return
-        logging.info("tg_notify dead item_id=%s", item_id)
-        _tg_send_message(
+        ok, _ids, err = _tg_send_text(
             chat_id,
             "⚠️ Не удалось добавить в календарь. Задача сохранена, верну в Inbox. [CAL-DEAD]",
+            item_id=int(item_id),
+            queue_id=queue_id,
+            stage="calendar_dead",
         )
+        if not ok:
+            _item_set_last_error(int(item_id), f"tg_send_calendar_dead_failed:{err}")
+            return
+        _tg_mark_sent_success(
+            int(item_id),
+            _TG_RESULT_DEAD,
+            queue_id=queue_id,
+            chat_id=chat_id,
+            stage="calendar_dead",
+        )
+    except Exception:
+        logging.exception("tg_notify_calendar_dead_failed item_id=%s queue_id=%s", item_id, queue_id)
+        _item_set_last_error(int(item_id), "tg_notify_calendar_dead_exception")
+
+
+def _extract_ml_summary(data: dict[str, Any]) -> dict[str, Any]:
+    cmd = data.get("command") if isinstance(data, dict) else None
+    intent = str(cmd.get("intent") or "") if isinstance(cmd, dict) else "unknown"
+    trace_id = str(data.get("trace_id") or "-")
+    has_start_at = False
+    duration: int | None = None
+    status = "ok"
+    if isinstance(cmd, dict):
+        has_start_at = bool(str(cmd.get("start_at") or cmd.get("when") or "").strip())
+        dur = cmd.get("duration_minutes")
+        if dur is None:
+            dur = cmd.get("duration_min")
+        try:
+            duration = int(dur) if dur is not None else None
+        except Exception:
+            duration = None
+    if str(data.get("type") or "").strip().lower() == "clarify":
+        status = "clarify"
+    return {
+        "trace_id": trace_id,
+        "intent": intent or "unknown",
+        "has_start_at": has_start_at,
+        "duration": duration,
+        "status": status,
+    }
+
+
+def _log_ml_response(data: dict[str, Any]) -> None:
+    summary = _extract_ml_summary(data)
+    if LOG_ML_RAW:
+        logging.info("ml_raw_response trace_id=%s payload=%s", summary["trace_id"], data)
+        return
+    logging.info(
+        "ml_response_summary trace_id=%s intent=%s has_start_at=%s duration=%s status=%s",
+        summary["trace_id"],
+        summary["intent"],
+        summary["has_start_at"],
+        summary["duration"],
+        summary["status"],
+    )
+
+
+def _normalize_health_services(payload: dict[str, Any]) -> dict[str, str]:
+    services = {"asr": "down", "llm": "down", "embedding": "down"}
+    raw_services = payload.get("services")
+    if isinstance(raw_services, dict):
+        for key in services:
+            val = str(raw_services.get(key) or "").strip().lower()
+            services[key] = "ok" if val == "ok" else "down"
+        return services
+
+    # Backward compatibility with legacy payload format.
+    for key in ("asr", "llm", "embedding"):
+        if key in payload:
+            val = str(payload.get(key) or "").strip().lower()
+            services[key] = "ok" if val in {"ok", "configured", "up"} else "down"
+    return services
+
+
+def _ml_health_check() -> tuple[str, dict[str, str]]:
+    url = f"{ML_GATEWAY_URL.rstrip('/')}/health"
+    fallback = {"asr": "down", "llm": "down", "embedding": "down"}
+    try:
+        resp = requests.get(url, timeout=(3, 10))
+        resp.raise_for_status()
     except Exception as exc:
-        logging.warning("tg notify dead failed item_id=%s err=%s", item_id, str(exc)[:200])
+        logging.warning("ml health check failed url=%s err=%s", url, str(exc)[:200])
+        return "down", fallback
+
+    try:
+        payload = resp.json() if resp.content else {}
+    except Exception as exc:
+        logging.warning("ml health invalid json url=%s err=%s", url, str(exc)[:200])
+        return "down", fallback
+
+    if not isinstance(payload, dict):
+        return "down", fallback
+
+    services = _normalize_health_services(payload)
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in {"ok", "degraded", "down"}:
+        values = list(services.values())
+        if all(v == "ok" for v in values):
+            status = "ok"
+        elif all(v == "down" for v in values):
+            status = "down"
+        else:
+            status = "degraded"
+    return status, services
+
+
+def _ml_asr_transcribe(audio: bytes) -> str:
+    logging.info("voice transcribe fallback via ml_gateway /asr url=%s", f"{ML_GATEWAY_URL.rstrip('/')}/asr")
+    files = {"file": ("voice.ogg", audio, "audio/ogg")}
+    resp = requests.post(f"{ML_GATEWAY_URL.rstrip('/')}/asr", files=files, timeout=(3, ASR_HTTP_READ_TIMEOUT))
+    resp.raise_for_status()
+    data = resp.json() if resp.content else {}
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("text") or data.get("transcript") or "").strip()
 
 
 def _ml_voice_command(audio: bytes) -> str:
-    logging.info("voice transcribe via ml_gateway url=%s", f"{ML_CORE_URL.rstrip('/')}/voice-command")
+    logging.info("voice transcribe via ml_gateway url=%s", f"{ML_GATEWAY_URL.rstrip('/')}/voice-command")
     files = {"file": ("voice.ogg", audio, "audio/ogg")}
-    resp = requests.post(f"{ML_CORE_URL.rstrip('/')}/voice-command", files=files, timeout=(3, ASR_HTTP_READ_TIMEOUT))
+    resp = requests.post(f"{ML_GATEWAY_URL.rstrip('/')}/voice-command", files=files, timeout=(3, ASR_HTTP_READ_TIMEOUT))
     resp.raise_for_status()
     data = resp.json() if resp.content else {}
+    if isinstance(data, dict):
+        _log_ml_response(data)
     if not isinstance(data, dict):
         return ""
     text = (data.get("text") or "").strip()
@@ -1259,18 +3125,6 @@ def _prune_clarify_state(state: dict, now_ts: float) -> None:
             state[cid] = st
         else:
             state.pop(cid, None)
-
-
-def _enqueue_clarify(chat_id: int, item: dict) -> int:
-    state = _load_clarify_state()
-    _prune_clarify_state(state, time.time())
-    st = state.get(str(chat_id)) or {"queue": []}
-    q = st.get("queue") or []
-    q.append(item)
-    st["queue"] = q
-    state[str(chat_id)] = st
-    _save_clarify_state(state)
-    return len(q)
 
 
 def _get_pending_clarify(chat_id: int) -> dict | None:
@@ -1438,6 +3292,7 @@ def _insert_item_from_text(
     ingested_at: str | None,
     tg_chat_id: int | None,
     tg_message_id: int | None,
+    queue_id: int | None = None,
     tg_update_id: int | None = None,
     tg_voice_file_id: str | None = None,
     tg_voice_unique_id: str | None = None,
@@ -1484,7 +3339,7 @@ def _insert_item_from_text(
         if last_id is None:
             raise RuntimeError("insert failed: no rowid")
         item_id = int(last_id)
-        _tg_notify_created(item_id)
+        _tg_notify_created(item_id, queue_id=queue_id)
         return item_id, item_type, status
 
 
@@ -1497,6 +3352,7 @@ def _insert_voice_placeholder(
     tg_voice_file_id: str | None,
     tg_voice_unique_id: str | None,
     tg_voice_duration: int | None,
+    queue_id: int | None = None,
 ) -> int:
     created_at = datetime.now(timezone.utc).isoformat()
     ingested_at = ingested_at or created_at
@@ -1534,7 +3390,7 @@ def _insert_voice_placeholder(
         if last_id is None:
             raise RuntimeError("insert failed: no rowid")
         item_id = int(last_id)
-        _tg_notify_created(item_id)
+        _tg_notify_created(item_id, queue_id=queue_id)
         return item_id
 
 
@@ -2452,377 +4308,12 @@ def cmd_snooze_nudge(user_id: str, nudge_key: str, days: int) -> dict:
     }
 
 
-class _CommandHandler(BaseHTTPRequestHandler):
-    def _send_json(self, status: int, payload: dict) -> None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _read_json(self) -> dict:
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            length = 0
-        raw = self.rfile.read(length) if length > 0 else b"{}"
-        data = json.loads(raw.decode("utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("invalid json body")
-        return data
-
-    def do_GET(self):  # noqa: N802 - stdlib API
-        if self.path == "/health":
-            self._send_json(200, {"ok": True})
-            return
-        self._send_json(404, {"error": "not found"})
-
-    def do_POST(self):  # noqa: N802 - stdlib API
-        try:
-            data = self._read_json()
-            if self.path == "/runtime/command":
-                trace_id = data.get("trace_id")
-                if not isinstance(trace_id, str) or not trace_id.strip():
-                    raise ValueError("trace_id is required")
-                command = data.get("command")
-                if not isinstance(command, dict):
-                    raise ValueError("command is required")
-                intent = command.get("intent")
-                if not isinstance(intent, str) or not intent.strip():
-                    raise ValueError("command.intent is required")
-                entities = command.get("entities")
-                if not isinstance(entities, dict):
-                    raise ValueError("command.entities must be object")
-                res = dispatch_intent(command)
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/create_task":
-                res = cmd_create_task(
-                    data.get("title") or "",
-                    data.get("source_msg_id"),
-                    data.get("parent_type"),
-                    data.get("parent_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/create_direction":
-                if not data.get("title"):
-                    raise ValueError("title is required")
-                res = cmd_create_direction(
-                    data.get("title") or "",
-                    data.get("note"),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/create_project":
-                if not data.get("title"):
-                    raise ValueError("title is required")
-                direction_id = data.get("direction_id")
-                res = cmd_create_project(
-                    data.get("title") or "",
-                    int(direction_id) if direction_id is not None else None,
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/convert_direction_to_project":
-                if data.get("direction_id") is None:
-                    raise ValueError("direction_id is required")
-                res = cmd_convert_direction_to_project(
-                    _require_int_field(data.get("direction_id"), "direction_id"),
-                    data.get("title"),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/start_cycle":
-                if not data.get("type"):
-                    raise ValueError("type is required")
-                res = cmd_start_cycle(
-                    data.get("type") or "",
-                    data.get("period_key"),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/close_cycle":
-                if data.get("cycle_id") is None:
-                    raise ValueError("cycle_id is required")
-                status = data.get("status") or ""
-                status_norm = status.strip().upper()
-                if status_norm not in {"DONE", "SKIPPED"}:
-                    raise ValueError("status must be DONE or SKIPPED")
-                res = cmd_close_cycle(
-                    _require_int_field(data.get("cycle_id"), "cycle_id"),
-                    status_norm,
-                    data.get("summary"),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/add_cycle_outcome":
-                if data.get("cycle_id") is None:
-                    raise ValueError("cycle_id is required")
-                if not data.get("kind"):
-                    raise ValueError("kind is required")
-                if not data.get("text"):
-                    raise ValueError("text is required")
-                res = cmd_add_cycle_outcome(
-                    _require_int_field(data.get("cycle_id"), "cycle_id"),
-                    data.get("kind") or "",
-                    data.get("text") or "",
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/add_cycle_goal":
-                if data.get("cycle_id") is None:
-                    raise ValueError("cycle_id is required")
-                if not data.get("text"):
-                    raise ValueError("text is required")
-                res = cmd_add_cycle_goal(
-                    _require_int_field(data.get("cycle_id"), "cycle_id"),
-                    data.get("text") or "",
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/continue_cycle_goal":
-                if data.get("goal_id") is None:
-                    raise ValueError("goal_id is required")
-                if data.get("target_cycle_id") is None:
-                    raise ValueError("target_cycle_id is required")
-                res = cmd_continue_cycle_goal(
-                    _require_int_field(data.get("goal_id"), "goal_id"),
-                    _require_int_field(data.get("target_cycle_id"), "target_cycle_id"),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/update_cycle_goal_status":
-                if data.get("goal_id") is None:
-                    raise ValueError("goal_id is required")
-                if not data.get("status"):
-                    raise ValueError("status is required")
-                res = cmd_update_cycle_goal_status(
-                    _require_int_field(data.get("goal_id"), "goal_id"),
-                    str(data.get("status")),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/ensure_user_settings":
-                if not data.get("user_id"):
-                    raise ValueError("user_id is required")
-                res = _ensure_user_settings(str(data.get("user_id")))
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/set_signals_enabled":
-                if not data.get("user_id"):
-                    raise ValueError("user_id is required")
-                enabled = data.get("enabled")
-                if enabled is None:
-                    raise ValueError("enabled is required")
-                res = cmd_set_signals_enabled(str(data.get("user_id")), int(enabled))
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/snooze_nudge":
-                if not data.get("user_id"):
-                    raise ValueError("user_id is required")
-                nudge_key = data.get("nudge_key") or NUDGE_SIGNALS_KEY
-                days = int(data.get("days") or 90)
-                res = cmd_snooze_nudge(str(data.get("user_id")), str(nudge_key), days)
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/set_module_enabled":
-                if not data.get("user_id"):
-                    raise ValueError("user_id is required")
-                if not data.get("module"):
-                    raise ValueError("module is required")
-                enabled = data.get("enabled")
-                if enabled is None:
-                    raise ValueError("enabled is required")
-                res = cmd_set_module_enabled(str(data.get("user_id")), str(data.get("module")), int(enabled))
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/set_modules_enabled_bulk":
-                if not data.get("user_id"):
-                    raise ValueError("user_id is required")
-                if data.get("overload_enabled") is None or data.get("drift_enabled") is None:
-                    raise ValueError("overload_enabled and drift_enabled are required")
-                res = cmd_set_modules_enabled_bulk(
-                    str(data.get("user_id")),
-                    _require_int_field(data.get("overload_enabled"), "overload_enabled"),
-                    _require_int_field(data.get("drift_enabled"), "drift_enabled"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/create_subtask":
-                if data.get("task_id") is None:
-                    raise ValueError("task_id is required")
-                res = cmd_create_subtask(
-                    _require_int_field(data.get("task_id"), "task_id"),
-                    data.get("title") or "",
-                    data.get("status") or "NEW",
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/complete_task":
-                if data.get("task_id") is None:
-                    raise ValueError("task_id is required")
-                res = cmd_complete_task(_require_int_field(data.get("task_id"), "task_id"))
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/complete_subtask":
-                if data.get("subtask_id") is None:
-                    raise ValueError("subtask_id is required")
-                res = cmd_complete_subtask(_require_int_field(data.get("subtask_id"), "subtask_id"))
-                self._send_json(200, res)
-                return
-            if self.path == "/p2/commands/plan_task":
-                if data.get("task_id") is None:
-                    raise ValueError("task_id is required")
-                if not data.get("planned_at"):
-                    raise ValueError("planned_at is required")
-                res = cmd_plan_task(_require_int_field(data.get("task_id"), "task_id"), str(data.get("planned_at")))
-                self._send_json(200, res)
-                return
-            if self.path == "/p4/commands/create_regulation":
-                if not data.get("title"):
-                    raise ValueError("title is required")
-                day_val = data.get("day_of_month")
-                res = cmd_create_regulation(
-                    data.get("title") or "",
-                    int(day_val) if day_val is not None else 1,
-                    data.get("note"),
-                    data.get("due_time_local"),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p4/commands/archive_regulation":
-                if data.get("regulation_id") is None:
-                    raise ValueError("regulation_id is required")
-                res = cmd_archive_regulation(
-                    _require_int_field(data.get("regulation_id"), "regulation_id"),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p4/commands/update_regulation_schedule":
-                if data.get("regulation_id") is None:
-                    raise ValueError("regulation_id is required")
-                day_of_month = data.get("day_of_month")
-                res = cmd_update_regulation_schedule(
-                    _require_int_field(data.get("regulation_id"), "regulation_id"),
-                    _require_int_field(day_of_month, "day_of_month") if day_of_month is not None else None,
-                    data.get("due_time_local"),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p4/commands/ensure_regulation_runs":
-                if not data.get("period_key"):
-                    raise ValueError("period_key is required")
-                res = cmd_ensure_regulation_runs(
-                    data.get("user_id"),
-                    str(data.get("period_key")),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p4/commands/mark_regulation_done":
-                if data.get("run_id") is None:
-                    raise ValueError("run_id is required")
-                res = cmd_mark_regulation_done(
-                    _require_int_field(data.get("run_id"), "run_id"),
-                    data.get("done_at"),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p4/commands/complete_reg_run":
-                if data.get("run_id") is None:
-                    raise ValueError("run_id is required")
-                res = cmd_complete_reg_run(
-                    _require_int_field(data.get("run_id"), "run_id"),
-                    data.get("done_at"),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p4/commands/skip_reg_run":
-                if data.get("run_id") is None:
-                    raise ValueError("run_id is required")
-                res = cmd_skip_reg_run(
-                    _require_int_field(data.get("run_id"), "run_id"),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p4/commands/disable_reg":
-                if data.get("regulation_id") is None:
-                    raise ValueError("regulation_id is required")
-                res = cmd_disable_reg(
-                    _require_int_field(data.get("regulation_id"), "regulation_id"),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p7/commands/add_block":
-                if data.get("task_id") is None:
-                    raise ValueError("task_id is required")
-                if not data.get("start_at"):
-                    raise ValueError("start_at is required")
-                if not data.get("end_at"):
-                    raise ValueError("end_at is required")
-                res = cmd_add_block(
-                    _require_int_field(data.get("task_id"), "task_id"),
-                    str(data.get("start_at")),
-                    str(data.get("end_at")),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p7/commands/move_block":
-                if data.get("block_id") is None:
-                    raise ValueError("block_id is required")
-                if data.get("delta_minutes") is None:
-                    raise ValueError("delta_minutes is required")
-                res = cmd_move_block(
-                    _require_int_field(data.get("block_id"), "block_id"),
-                    _require_int_field(data.get("delta_minutes"), "delta_minutes"),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            if self.path == "/p7/commands/delete_block":
-                if data.get("block_id") is None:
-                    raise ValueError("block_id is required")
-                res = cmd_delete_block(
-                    _require_int_field(data.get("block_id"), "block_id"),
-                    data.get("source_msg_id"),
-                )
-                self._send_json(200, res)
-                return
-            self._send_json(404, {"error": "not found"})
-        except ValueError as exc:
-            self._send_json(400, {"error": str(exc)[:200]})
-        except Exception as exc:
-            self._send_json(500, {"error": str(exc)[:200]})
-
-    def log_message(self, format, *args):  # noqa: A003 - stdlib API
-        return
+_CommandHandler = _runtime_server_module.make_command_handler(_runtime_server_deps)
 
 
 def _start_command_server() -> None:
-    server = HTTPServer(("0.0.0.0", WORKER_COMMAND_PORT), _CommandHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    logging.info("worker_cmd_server started port=%s", WORKER_COMMAND_PORT)
+    _runtime_server_module.start_command_server(WORKER_COMMAND_PORT, _CommandHandler)
+# ACTIVE_RUNTIME_END
 
 
 def validate_task_status(item: dict, new_status: str, open_subtasks: int) -> None:
@@ -2850,142 +4341,22 @@ def validate_task_status(item: dict, new_status: str, open_subtasks: int) -> Non
         raise ValueError("cannot complete task with open subtasks")
 
 
-def _update_item_status(item_id: int, new_status: str) -> None:
-    with _get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT id, type, status, parent_id, parent_id_int
-            FROM items
-            WHERE id = ?
-            """,
-            (int(item_id),),
-        ).fetchone()
-        row = as_dict(row)
-        if not row:
-            raise ValueError("item not found")
-        if P2_ENFORCE_STATUS:
-            open_subtasks = conn.execute(
-                """
-                SELECT COUNT(*) AS cnt
-                FROM items
-                WHERE (parent_id_int = ? OR parent_id = ?)
-                  AND status != 'done'
-                """,
-                (int(item_id), int(item_id)),
-            ).fetchone()
-            open_cnt = int(as_dict(open_subtasks).get("cnt") or 0)
-            validate_task_status(row, new_status, open_cnt)
-        conn.execute(
-            """
-            UPDATE items
-            SET status = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (new_status, datetime.now(timezone.utc).isoformat(), int(item_id)),
-        )
-        conn.commit()
-
-
-def create_task(
-    title: str,
-    *,
-    status: str = "inbox",
-    from_inbox_item_id: int | None = None,
-) -> int:
-    if from_inbox_item_id is not None:
-        with _get_conn() as conn:
-            row = conn.execute(
-                """
-                SELECT id, status, parent_id, parent_id_int
-                FROM items
-                WHERE id = ?
-                """,
-                (int(from_inbox_item_id),),
-            ).fetchone()
-            row = as_dict(row)
-            if not row:
-                raise ValueError("inbox item not found")
-            if _get_parent_id_from_row(row) is not None:
-                raise ValueError("cannot promote a subtask to task")
-            if str(row.get("status") or "") != "inbox":
-                raise ValueError("only inbox items can be promoted to task")
-            if P2_ENFORCE_STATUS:
-                validate_task_status(row, status, 0)
-            conn.execute(
-                """
-                UPDATE items
-                SET type = 'task',
-                    status = ?,
-                    title = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (status, title, datetime.now(timezone.utc).isoformat(), int(from_inbox_item_id)),
-            )
-            conn.commit()
-        return int(from_inbox_item_id)
-
-    if status not in {"inbox", "active"}:
-        raise ValueError("task status must be inbox or active on create")
-    with _get_conn() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO items (
-                type, title, status, parent_id, parent_id_int, created_at
-            )
-            VALUES ('task', ?, ?, NULL, NULL, ?)
-            """,
-            (title, status, datetime.now(timezone.utc).isoformat()),
-        )
-        conn.commit()
-        return _require_lastrowid(cur)
-
-
-def create_subtask(
-    parent_id: int,
-    title: str,
-    *,
-    status: str = "todo",
-) -> int:
-    with _get_conn() as conn:
-        parent = conn.execute(
-            """
-            SELECT id, type, status, parent_id, parent_id_int
-            FROM items
-            WHERE id = ?
-            """,
-            (int(parent_id),),
-        ).fetchone()
-        parent = as_dict(parent)
-        if not parent:
-            raise ValueError("parent not found")
-        if _get_parent_id_from_row(parent) is not None:
-            raise ValueError("cannot create subtask under subtask")
-        if str(parent.get("type") or "") != "task":
-            raise ValueError("parent must be task")
-        if str(parent.get("status") or "") == "done":
-            raise ValueError("cannot add subtask to done task")
-        if status not in {"todo", "done"}:
-            raise ValueError("subtask status must be todo or done")
-
-        cur = conn.execute(
-            """
-            INSERT INTO items (
-                type, title, status, parent_id, parent_id_int, created_at
-            )
-            VALUES ('task', ?, ?, ?, ?, ?)
-            """,
-            (title, status, int(parent_id), int(parent_id), datetime.now(timezone.utc).isoformat()),
-        )
-        conn.commit()
-        return _require_lastrowid(cur)
+# LEGACY_CANDIDATE: queue/items flow below is not part of runtime_core_direct request routing.
+# Active production write path is /runtime/command; verify before removal or extraction.
 def _process_queue_item(row: dict) -> None:
     row = as_dict(row)
     queue_id = row["id"]
     chat_id = int(row.get("tg_chat_id") or 0)
     message_id = row.get("tg_message_id")
     attempts = int(row.get("attempts") or 0)
+    logging.info(
+        "queue_process_start queue_id=%s kind=%s status=%s attempts=%s chat_id=%s",
+        queue_id,
+        row.get("kind"),
+        row.get("status"),
+        attempts,
+        chat_id,
+    )
     try:
         payload = json.loads(row.get("payload_json") or "{}")
         kind = row.get("kind")
@@ -3020,7 +4391,8 @@ def _process_queue_item(row: dict) -> None:
                 ingested_at,
                 int(chat_id) if chat_id else None,
                 int(message_id) if message_id is not None else None,
-                _to_int_or_none(row.get("tg_update_id")),
+                queue_id=int(queue_id),
+                tg_update_id=_to_int_or_none(row.get("tg_update_id")),
             )
             logging.info("tg meta kind=%s item_id=%s tg_chat_id=%s", kind, item_id, chat_id)
             try:
@@ -3042,7 +4414,7 @@ def _process_queue_item(row: dict) -> None:
                 logging.warning("calendar sync failed item_id=%s err=%s", rid, str(exc)[:200])
             _queue_mark(queue_id, "DONE", None)
             logging.info("queue done id=%s kind=text attempts=%s", queue_id, attempts)
-            _tg_notify_created(int(item_id))
+            _tg_notify_created(int(item_id), queue_id=int(queue_id))
             if item_type == "meeting" and row_item:
                 _sync_calendar_for_item(row_item)
             if chat_id and item_type == "meeting" and dt is None:
@@ -3204,10 +4576,11 @@ def _process_queue_item(row: dict) -> None:
                 ingested_at,
                 int(chat_id) if chat_id else None,
                 int(tg_message_id) if tg_message_id is not None else None,
-                int(tg_update_id) if tg_update_id is not None else None,
-                str(file_id) if file_id else None,
-                str(voice_unique_id) if voice_unique_id else None,
-                int(voice_duration) if voice_duration is not None else None,
+                queue_id=int(queue_id),
+                tg_update_id=int(tg_update_id) if tg_update_id is not None else None,
+                tg_voice_file_id=str(file_id) if file_id else None,
+                tg_voice_unique_id=str(voice_unique_id) if voice_unique_id else None,
+                tg_voice_duration=int(voice_duration) if voice_duration is not None else None,
             )
             _log_voice_meta(
                 "voice_meta",
@@ -3252,11 +4625,30 @@ def _process_queue_item(row: dict) -> None:
                     )
                 return
 
+        health_status, health_services = _ml_health_check()
+        logging.info(
+            "ml health snapshot status=%s asr=%s llm=%s embedding=%s",
+            health_status,
+            health_services.get("asr", "down"),
+            health_services.get("llm", "down"),
+            health_services.get("embedding", "down"),
+        )
+        if health_services.get("asr") != "ok":
+            _queue_mark(queue_id, "DONE", None)
+            if chat_id:
+                _tg_send_message(chat_id, "⚠️ Голосовой ввод недоступен (ASR не запущен)")
+            return
+
+        llm_is_down = health_services.get("llm") != "ok"
         if existing_asr_text:
             text = existing_asr_text
         else:
             audio = _tg_download_voice(file_id)
-            text = _ml_voice_command(audio)
+            if llm_is_down:
+                logging.warning("ml health llm=down; using canonical parser fallback via /asr")
+                text = _ml_asr_transcribe(audio)
+            else:
+                text = _ml_voice_command(audio)
         if not text or len(text.strip()) < 3:
             raise RuntimeError("empty text")
         pending = _get_pending_clarify(chat_id)
@@ -3359,7 +4751,7 @@ def _process_queue_item(row: dict) -> None:
                 sa = r.get("start_at")
             except Exception:
                 st, sa = "inbox", None
-            _tg_notify_created(int(item_id))
+            _tg_notify_created(int(item_id), queue_id=int(queue_id))
             if item_type == "meeting" and dt is None:
                 reply_markup = {
                     "inline_keyboard": [
@@ -3435,7 +4827,7 @@ def _process_queue_item(row: dict) -> None:
                     )
             else:
                 if item_type != "meeting":
-                    _tg_notify_created(int(item_id))
+                    _tg_notify_created(int(item_id), queue_id=int(queue_id))
                     if sa:
                         _tg_send_message(chat_id, f"Время: {sa}")
                     else:
@@ -3450,6 +4842,143 @@ def _process_queue_item(row: dict) -> None:
                 chat_id,
                 "⚠️ Не удалось добавить в календарь. Задача сохранена, верну в Inbox. [CAL-DEAD]",
             )
+
+
+def _find_item_for_queue_delivery(queue_row: dict) -> dict:
+    queue_id = _to_int_or_none(queue_row.get("id"))
+    chat_id = _to_int_or_none(queue_row.get("tg_chat_id"))
+    tg_update_id = _to_int_or_none(queue_row.get("tg_update_id"))
+    tg_message_id = _to_int_or_none(queue_row.get("tg_message_id"))
+    if chat_id is None:
+        return {}
+    with _get_conn() as conn:
+        row = None
+        if tg_update_id is not None:
+            row = conn.execute(
+                """
+                SELECT id, tg_chat_id, tg_update_id, tg_message_id, title, type, status, start_at,
+                       calendar_event_id, tg_result_sent, last_error
+                FROM items
+                WHERE tg_chat_id = ? AND tg_update_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (int(chat_id), int(tg_update_id)),
+            ).fetchone()
+        if row is None and tg_message_id is not None:
+            row = conn.execute(
+                """
+                SELECT id, tg_chat_id, tg_update_id, tg_message_id, title, type, status, start_at,
+                       calendar_event_id, tg_result_sent, last_error
+                FROM items
+                WHERE tg_chat_id = ? AND tg_message_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (int(chat_id), int(tg_message_id)),
+            ).fetchone()
+    item = as_dict(row)
+    if item:
+        logging.info(
+            "re_deliver_item_resolved queue_id=%s item_id=%s chat_id=%s",
+            queue_id,
+            item.get("id"),
+            chat_id,
+        )
+    return item
+
+
+def re_deliver_done_items(limit: int = 50) -> dict:
+    batch = max(1, int(limit))
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, kind, status, tg_chat_id, tg_update_id, tg_message_id
+            FROM inbox_queue
+            WHERE status = 'DONE'
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (batch,),
+        ).fetchall()
+    scanned = 0
+    resolved = 0
+    resent = 0
+    unchanged = 0
+    for raw in rows:
+        q = as_dict(raw)
+        queue_id = _to_int_or_none(q.get("id"))
+        if queue_id is None:
+            continue
+        scanned += 1
+        item = _find_item_for_queue_delivery(q)
+        if not item:
+            logging.info("re_deliver_skip queue_id=%s reason=item_not_found", queue_id)
+            unchanged += 1
+            continue
+        item_id = _to_int_or_none(item.get("id"))
+        if item_id is None:
+            unchanged += 1
+            continue
+        resolved += 1
+        flags_before = int(item.get("tg_result_sent") or 0)
+        item_type = str(item.get("type") or "")
+        calendar_state = str(item.get("calendar_event_id") or "")
+        logging.info(
+            "re_deliver_check queue_id=%s item_id=%s type=%s flags_before=%s calendar_state=%s",
+            queue_id,
+            item_id,
+            item_type,
+            flags_before,
+            calendar_state or "-",
+        )
+        if not (flags_before & _TG_RESULT_CREATED):
+            _tg_notify_created(int(item_id), queue_id=int(queue_id))
+        if item_type == "meeting":
+            if calendar_state == "FAILED" and not (flags_before & _TG_RESULT_DEAD):
+                _tg_notify_calendar_dead(int(item_id), queue_id=int(queue_id))
+            elif calendar_state and calendar_state not in {"PENDING", "FAILED"} and not (flags_before & _TG_RESULT_SUCCESS):
+                _tg_notify_calendar_success(int(item_id), queue_id=int(queue_id))
+        with _get_conn() as conn:
+            row_after = conn.execute(
+                "SELECT tg_result_sent FROM items WHERE id = ?",
+                (int(item_id),),
+            ).fetchone()
+        flags_after = int((as_dict(row_after)).get("tg_result_sent") or 0)
+        if flags_after != flags_before:
+            resent += 1
+            logging.info(
+                "re_deliver_marked queue_id=%s item_id=%s flags_before=%s flags_after=%s",
+                queue_id,
+                item_id,
+                flags_before,
+                flags_after,
+            )
+        else:
+            unchanged += 1
+            logging.info(
+                "re_deliver_unchanged queue_id=%s item_id=%s flags=%s",
+                queue_id,
+                item_id,
+                flags_after,
+            )
+    result = {
+        "ok": True,
+        "scanned": scanned,
+        "resolved": resolved,
+        "resent": resent,
+        "unchanged": unchanged,
+        "limit": batch,
+    }
+    logging.info(
+        "re_deliver_summary scanned=%s resolved=%s resent=%s unchanged=%s limit=%s",
+        scanned,
+        resolved,
+        resent,
+        unchanged,
+        batch,
+    )
+    return result
 
 
 # === P3: Task Domain (pure-ish) =============================================
@@ -3551,67 +5080,6 @@ def _smoke_check_google_calendar_deps() -> None:
         _disable_calendar_sync("config_error_missing_google_deps", msg)
 
 
-def _get_calendar_service():
-    global _CAL_NOT_CONFIGURED_REASON
-    _CAL_NOT_CONFIGURED_REASON = None
-    if not GOOGLE_SERVICE_ACCOUNT_FILE:
-        logging.warning("calendar_not_configured: missing_file")
-        _CAL_NOT_CONFIGURED_REASON = "missing_file"
-        return None
-    if os.path.isdir(GOOGLE_SERVICE_ACCOUNT_FILE):
-        logging.warning("calendar_not_configured: file_is_directory")
-        _CAL_NOT_CONFIGURED_REASON = "file_is_directory"
-        return None
-    if not os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE):
-        logging.warning("calendar_not_configured: missing_file")
-        _CAL_NOT_CONFIGURED_REASON = "missing_file"
-        return None
-    if not GOOGLE_CALENDAR_ID:
-        logging.warning("calendar_not_configured: missing_calendar_id")
-        _CAL_NOT_CONFIGURED_REASON = "missing_calendar_id"
-        return None
-    try:
-        creds_mod = importlib.import_module("google.oauth2.service_account")
-        discovery_mod = importlib.import_module("googleapiclient.discovery")
-        Credentials = getattr(creds_mod, "Credentials", None)
-        build = getattr(discovery_mod, "build", None)
-        if Credentials is None or build is None:
-            logging.error(
-                "calendar_config_error: google api deps missing or broken; "
-                "install google api deps (google-auth, google-auth-oauthlib, "
-                "google-api-python-client, googleapis-common-protos, httplib2)"
-            )
-            _CAL_NOT_CONFIGURED_REASON = "config_error_missing_google_deps"
-            return None
-    except Exception as exc:
-        logging.error(
-            "calendar_config_error: google api deps import failed err=%s; "
-            "install google api deps (google-auth, google-auth-oauthlib, "
-            "google-api-python-client, googleapis-common-protos, httplib2)",
-            str(exc)[:200],
-        )
-        _CAL_NOT_CONFIGURED_REASON = "config_error_missing_google_deps"
-        return None
-
-    creds = Credentials.from_service_account_file(
-        GOOGLE_SERVICE_ACCOUNT_FILE,
-        scopes=["https://www.googleapis.com/auth/calendar"],
-    )
-    service = build("calendar", "v3", credentials=creds, cache_discovery=False)
-    if CALENDAR_DEBUG:
-        try:
-            data = service.calendarList().list().execute()
-            for cal in (data.get("items") or []):
-                logging.info(
-                    "calendar_list id=%s summary=%s",
-                    cal.get("id"),
-                    cal.get("summary"),
-                )
-        except Exception as exc:
-            logging.warning("calendar_list failed err=%s", str(exc)[:200])
-    return service
-
-
 def _env_flag_enabled(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -3655,56 +5123,6 @@ def _calendar_title_description_from_item(item: dict[str, Any]) -> tuple[str, st
             parts.append(part_norm)
     description = f"Path: {' / '.join(parts)}" if parts else None
     return event_title, description
-
-
-def _create_event(
-    item_id: int | str,
-    title: str,
-    start: datetime,
-    end: datetime,
-    description: str | None = None,
-    existing_event_id: str | None = None,
-) -> str | None:
-    service = _get_calendar_service()
-    if service is None:
-        logging.warning("calendar service not configured; skipping")
-        return None
-    if existing_event_id and existing_event_id not in {"PENDING", "FAILED"}:
-        patch_res = _patch_event(str(existing_event_id), start, end)
-        if patch_res == "ok":
-            logging.info(
-                "calendar_idempotent item_id=%s iCalUID=%s action=update google_event_id=%s",
-                item_id,
-                build_item_ical_uid(item_id),
-                existing_event_id,
-            )
-            return str(existing_event_id)
-        if patch_res in {"error", "no_service"}:
-            return None
-
-    event = {
-        "summary": title,
-        "start": {"dateTime": start.isoformat(), "timeZone": TIMEZONE_NAME},
-        "end": {"dateTime": end.isoformat(), "timeZone": TIMEZONE_NAME},
-    }
-    if description:
-        event["description"] = description
-    ical_uid = build_item_ical_uid(item_id)
-    event_id, action = create_or_reuse_event(
-        service,
-        calendar_id=GOOGLE_CALENDAR_ID,
-        item_id=item_id,
-        event=event,
-    )
-    if event_id:
-        logging.info(
-            "calendar_idempotent item_id=%s iCalUID=%s action=%s google_event_id=%s",
-            item_id,
-            ical_uid,
-            action,
-            event_id,
-        )
-    return event_id
 
 
 def _calendar_error_info(exc: Exception) -> tuple[str, bool]:
@@ -3778,31 +5196,6 @@ def _calendar_smoke_test() -> None:
         logging.warning("calendar_smoke failed err=%s", str(exc)[:200])
 
 
-def _patch_event(event_id: str, start: datetime, end: datetime) -> str:
-    service = _get_calendar_service()
-    if service is None:
-        return "no_service"
-    body = {
-        "start": {"dateTime": start.isoformat(), "timeZone": TIMEZONE_NAME},
-        "end": {"dateTime": end.isoformat(), "timeZone": TIMEZONE_NAME},
-    }
-    try:
-        service.events().patch(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id, body=body).execute()
-        return "ok"
-    except Exception as exc:
-        try:
-            err_mod = importlib.import_module("googleapiclient.errors")
-            HttpError = getattr(err_mod, "HttpError", None)
-        except Exception:
-            HttpError = None
-        if HttpError is not None and isinstance(exc, HttpError):
-            status = getattr(getattr(exc, "resp", None), "status", None)
-            if status == 404:
-                return "not_found"
-            return "error"
-        return "error"
-
-
 def _calendar_http_status(exc: Exception) -> int | None:
     resp = getattr(exc, "resp", None)
     status = getattr(resp, "status", None) if resp is not None else None
@@ -3828,6 +5221,102 @@ def _calendar_result(
     }
 
 
+def _set_calendar_not_configured_reason(value: str | None) -> None:
+    global _CAL_NOT_CONFIGURED_REASON
+    _CAL_NOT_CONFIGURED_REASON = value
+
+
+def _runtime_calendar_deps() -> dict[str, Any]:
+    return {
+        "set_calendar_not_configured_reason": _set_calendar_not_configured_reason,
+        "google_service_account_file": GOOGLE_SERVICE_ACCOUNT_FILE,
+        "google_calendar_id": GOOGLE_CALENDAR_ID,
+        "calendar_debug": CALENDAR_DEBUG,
+        "timezone_name": TIMEZONE_NAME,
+        "local_tz": _local_tz,
+        "build_item_ical_uid": build_item_ical_uid,
+        "create_or_reuse_event": create_or_reuse_event,
+        "patch_event": _patch_event,
+        "patch_event_description": _patch_event_description,
+        "get_calendar_service": _get_calendar_service,
+        "parse_iso_datetime_to_local": _parse_iso_datetime_to_local,
+        "parse_date_token_ymd": _parse_date_token_ymd,
+        "parse_time_token_hhmm": _parse_time_token_hhmm,
+        "runtime_duration_minutes": _runtime_duration_minutes,
+        "meeting_kind_from_entities": _meeting_kind_from_entities,
+        "runtime_temporal_title": _runtime_temporal_title,
+        "meeting_success_text": _meeting_success_text,
+        "meeting_kind_default": _MEETING_KIND_DEFAULT,
+        "default_duration_min": DEFAULT_DURATION_MIN,
+        "calendar_get_event": _calendar_get_event,
+        "runtime_sync_conflict_get": _runtime_sync_conflict_get,
+        "runtime_trace_conflict_restore_from_snapshot": _runtime_trace_conflict_restore_from_snapshot,
+        "calendar_patch_event": _calendar_patch_event,
+        "calendar_patch_event_description": _calendar_patch_event_description,
+        "create_event": _create_event,
+        "re": re,
+    }
+
+
+def _get_calendar_service():
+    return _runtime_calendar_module._get_calendar_service(
+        deps=_runtime_calendar_deps(),
+    )
+
+
+def _calendar_normalize_local_dt(value: datetime) -> datetime:
+    return _runtime_calendar_module._calendar_normalize_local_dt(
+        value,
+        deps=_runtime_calendar_deps(),
+    )
+
+
+def _calendar_datetime_payload(start: datetime, end: datetime) -> tuple[dict[str, str], dict[str, str]]:
+    return _runtime_calendar_module._calendar_datetime_payload(
+        start,
+        end,
+        deps=_runtime_calendar_deps(),
+    )
+
+
+def _create_event(
+    item_id: int | str,
+    title: str,
+    start: datetime,
+    end: datetime,
+    description: str | None = None,
+    existing_event_id: str | None = None,
+    flow_id: str | None = None,
+) -> str | None:
+    return _runtime_calendar_module._create_event(
+        item_id,
+        title,
+        start,
+        end,
+        description=description,
+        existing_event_id=existing_event_id,
+        flow_id=flow_id,
+        deps=_runtime_calendar_deps(),
+    )
+
+
+def _patch_event(event_id: str, start: datetime, end: datetime) -> str:
+    return _runtime_calendar_module._patch_event(
+        event_id,
+        start,
+        end,
+        deps=_runtime_calendar_deps(),
+    )
+
+
+def _patch_event_description(event_id: str, description: str) -> str:
+    return _runtime_calendar_module._patch_event_description(
+        event_id,
+        description,
+        deps=_runtime_calendar_deps(),
+    )
+
+
 def _calendar_create_event(
     item_id: int | str,
     title: str,
@@ -3835,73 +5324,107 @@ def _calendar_create_event(
     end: datetime,
     description: str | None = None,
 ) -> dict:
-    # TODO(P4): store calendar_etag when schema allows.
-    try:
-        event_id = _create_event(item_id, title, start, end, description=description)
-    except Exception as exc:
-        status = _calendar_http_status(exc)
-        return _calendar_result(False, None, status, f"exception:{type(exc).__name__}", None)
-    if not event_id:
-        return _calendar_result(False, None, None, "no_event_id", None)
-    return _calendar_result(True, str(event_id), None, None, None)
+    return _runtime_calendar_module._calendar_create_event(
+        item_id,
+        title,
+        start,
+        end,
+        description=description,
+        deps=_runtime_calendar_deps(),
+    )
 
 
 def _calendar_patch_event(event_id: str, start: datetime, end: datetime) -> dict:
-    # TODO(P4): store calendar_etag when schema allows.
-    try:
-        res = _patch_event(event_id, start, end)
-    except Exception as exc:
-        status = _calendar_http_status(exc)
-        return _calendar_result(False, None, status, f"exception:{type(exc).__name__}", None)
-    if res == "ok":
-        return _calendar_result(True, event_id, None, None, None)
-    if res == "not_found":
-        return _calendar_result(False, None, 404, "not_found", None)
-    if res == "no_service":
-        return _calendar_result(False, None, None, "no_service", None)
-    return _calendar_result(False, None, None, "error", None)
+    return _runtime_calendar_module._calendar_patch_event(
+        event_id,
+        start,
+        end,
+        deps=_runtime_calendar_deps(),
+    )
+
+
+def _calendar_patch_event_description(event_id: str, description: str) -> dict:
+    return _runtime_calendar_module._calendar_patch_event_description(
+        event_id,
+        description,
+        deps=_runtime_calendar_deps(),
+    )
+
+
+def _calendar_delete_event(event_id: str) -> dict:
+    return _runtime_calendar_module._calendar_delete_event(
+        event_id,
+        deps=_runtime_calendar_deps(),
+    )
 
 
 def _calendar_cancel_event(event_id: str) -> dict:
-    service = _get_calendar_service()
-    if service is None:
-        return _calendar_result(False, None, None, "no_service", None)
-    try:
-        service.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id).execute()
-        return _calendar_result(True, None, 204, None, None)
-    except Exception as exc:
-        status = _calendar_http_status(exc)
-        if status == 404:
-            return _calendar_result(True, None, 404, "not_found", None)
-        return _calendar_result(False, None, status, f"exception:{type(exc).__name__}", None)
+    return _calendar_delete_event(event_id)
 
 
 def _calendar_get_event(event_id: str) -> dict:
-    service = _get_calendar_service()
-    if service is None:
-        return _calendar_result(False, None, None, "no_service", None)
-    try:
-        event = service.events().get(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id).execute()
-        start = (event or {}).get("start") or {}
-        start_dt = start.get("dateTime") or start.get("date")
-        return {
-            "ok": True,
-            "event_id": event_id,
-            "http_status": None,
-            "err": None,
-            "event_start": start_dt,
-        }
-    except Exception as exc:
-        status = _calendar_http_status(exc)
-        if status == 404:
-            return {"ok": False, "event_id": None, "http_status": 404, "err": "not_found", "event_start": None}
-        return {
-            "ok": False,
-            "event_id": None,
-            "http_status": status,
-            "err": f"exception:{type(exc).__name__}",
-            "event_start": None,
-        }
+    return _runtime_calendar_module._calendar_get_event(
+        event_id,
+        deps=_runtime_calendar_deps(),
+    )
+
+
+def _runtime_temporal_window_local(
+    entities: dict[str, Any],
+    *,
+    fallback_minutes: int,
+) -> tuple[datetime | None, datetime | None, int]:
+    return _runtime_calendar_module._runtime_temporal_window_local(
+        entities,
+        fallback_minutes=fallback_minutes,
+        deps=_runtime_calendar_deps(),
+    )
+
+
+def _runtime_commit_temporal_calendar(
+    *,
+    flow_id: str,
+    intent: str,
+    entities: dict[str, Any],
+    execution_result: dict[str, Any],
+    source_timezone: str,
+) -> dict[str, Any]:
+    return _runtime_calendar_module._runtime_commit_temporal_calendar(
+        flow_id=flow_id,
+        intent=intent,
+        entities=entities,
+        execution_result=execution_result,
+        source_timezone=source_timezone,
+        deps=_runtime_calendar_deps(),
+    )
+
+
+def _runtime_commit_meeting_update_calendar(
+    *,
+    flow_id: str,
+    entities: dict[str, Any],
+    execution_result: dict[str, Any],
+) -> dict[str, Any]:
+    return _runtime_calendar_module._runtime_commit_meeting_update_calendar(
+        flow_id=flow_id,
+        entities=entities,
+        execution_result=execution_result,
+        deps=_runtime_calendar_deps(),
+    )
+
+
+def _runtime_commit_meeting_comment_update_calendar(
+    *,
+    flow_id: str,
+    entities: dict[str, Any],
+    execution_result: dict[str, Any],
+) -> dict[str, Any]:
+    return _runtime_calendar_module._runtime_commit_meeting_comment_update_calendar(
+        flow_id=flow_id,
+        entities=entities,
+        execution_result=execution_result,
+        deps=_runtime_calendar_deps(),
+    )
 
 
 # === P3: Sync Ticks ==========================================================
@@ -4964,6 +6487,123 @@ def _retry_pending_events() -> None:
                 )
                 conn.commit()
                 logging.info("marked FAILED item_id=%s", item_id)
+# LEGACY_QUEUE_ITEMS_END
+
+
+_legacy_process_queue_item_impl = _process_queue_item
+_legacy_find_item_for_queue_delivery_impl = _find_item_for_queue_delivery
+_legacy_re_deliver_done_items_impl = re_deliver_done_items
+_legacy_sync_calendar_for_item_impl = _sync_calendar_for_item
+_legacy_process_items_impl = _process_items
+_legacy_retry_pending_events_impl = _retry_pending_events
+
+
+def _legacy_queue_deps() -> dict[str, Any]:
+    return {
+        "get_conn": _get_conn,
+        "as_dict": as_dict,
+        "reap_claims": reap_claims,
+        "is_stale_queue_row": _is_stale_queue_row,
+        "worker_id": WORKER_ID,
+        "b2_replay_scan_limit": B2_REPLAY_SCAN_LIMIT,
+        "b2_replay_max_age_sec": B2_REPLAY_MAX_AGE_SEC,
+        "b2_claim_lease_sec": B2_CLAIM_LEASE_SEC,
+        "b2_max_attempts": B2_MAX_ATTEMPTS,
+        "load_clarify_state": _load_clarify_state,
+        "save_clarify_state": _save_clarify_state,
+        "prune_clarify_state": _prune_clarify_state,
+        "validate_task_status": validate_task_status,
+        "p2_enforce_status": P2_ENFORCE_STATUS,
+        "get_parent_id_from_row": _get_parent_id_from_row,
+        "require_lastrowid": _require_lastrowid,
+        "impl_process_queue_item": _legacy_process_queue_item_impl,
+        "impl_find_item_for_queue_delivery": _legacy_find_item_for_queue_delivery_impl,
+        "impl_re_deliver_done_items": _legacy_re_deliver_done_items_impl,
+        "impl_sync_calendar_for_item": _legacy_sync_calendar_for_item_impl,
+        "impl_process_items": _legacy_process_items_impl,
+        "impl_retry_pending_events": _legacy_retry_pending_events_impl,
+    }
+
+
+def _queue_reaper() -> None:
+    _legacy_queue_module._queue_reaper(deps=_legacy_queue_deps())
+
+
+def _queue_claim() -> dict | None:
+    return _legacy_queue_module._queue_claim(deps=_legacy_queue_deps())
+
+
+def _queue_mark(queue_id: int, status: str, last_error: str | None = None) -> None:
+    _legacy_queue_module._queue_mark(queue_id, status, last_error, deps=_legacy_queue_deps())
+
+
+def _queue_requeue_failed(limit: int) -> int:
+    return _legacy_queue_module._queue_requeue_failed(limit, deps=_legacy_queue_deps())
+
+
+def _enqueue_clarify(chat_id: int, item: dict) -> int:
+    return _legacy_queue_module._enqueue_clarify(chat_id, item, deps=_legacy_queue_deps())
+
+
+def _update_item_status(item_id: int, new_status: str) -> None:
+    _legacy_queue_module._update_item_status(item_id, new_status, deps=_legacy_queue_deps())
+
+
+def create_task(
+    title: str,
+    *,
+    status: str = "inbox",
+    from_inbox_item_id: int | None = None,
+) -> int:
+    return _legacy_queue_module.create_task(
+        title,
+        status=status,
+        from_inbox_item_id=from_inbox_item_id,
+        deps=_legacy_queue_deps(),
+    )
+
+
+def create_subtask(
+    parent_id: int,
+    title: str,
+    *,
+    status: str = "todo",
+) -> int:
+    return _legacy_queue_module.create_subtask(
+        parent_id,
+        title,
+        status=status,
+        deps=_legacy_queue_deps(),
+    )
+
+
+def _process_queue_item(row: dict) -> None:
+    _legacy_queue_module._process_queue_item(row, deps=_legacy_queue_deps())
+
+
+def _find_item_for_queue_delivery(queue_row: dict) -> dict:
+    return _legacy_queue_module._find_item_for_queue_delivery(queue_row, deps=_legacy_queue_deps())
+
+
+def re_deliver_done_items(limit: int = 50) -> dict:
+    return _legacy_queue_module.re_deliver_done_items(limit=limit, deps=_legacy_queue_deps())
+
+
+def _sync_calendar_for_item(item: dict) -> None:
+    _legacy_queue_module._sync_calendar_for_item(item, deps=_legacy_queue_deps())
+
+
+def _process_items() -> None:
+    _legacy_queue_module._process_items(deps=_legacy_queue_deps())
+
+
+def _retry_pending_events() -> None:
+    _legacy_queue_module._retry_pending_events(deps=_legacy_queue_deps())
+
+
+def _legacy_worker_queue_enabled() -> bool:
+    value = str(os.getenv("ALLOW_LEGACY_WORKER_QUEUE", "") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def main() -> None:
@@ -4972,7 +6612,7 @@ def main() -> None:
     os.makedirs("/tmp", exist_ok=True)
     with open("/tmp/worker.ok", "w", encoding="utf-8") as marker:
         marker.write("ok\n")
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), force=True)
     logging.info("organizer-worker started")
     _validate_calendar_service_account_on_startup()
     _smoke_check_google_calendar_deps()
@@ -4984,20 +6624,21 @@ def main() -> None:
     _start_command_server()
     if ASR_DT_SELF_CHECK:
         _selfcheck_asr_datetime()
+    legacy_queue_enabled = _legacy_worker_queue_enabled()
+    if legacy_queue_enabled:
+        logging.warning("legacy_worker_queue_enabled")
+    else:
+        logging.warning("legacy_worker_queue_disabled active_runtime_only=true")
 
     last_heartbeat = 0.0
     last_requeue = 0.0
     last_reg_nudge = 0.0
     last_p5_tick = 0.0
+    last_drift_fast = 0.0
+    last_drift_full_day = ""
     while True:
         try:
-            _queue_reaper()
             now = time.time()
-            if B2_REQUEUE_FAILED_EVERY_SEC > 0 and (now - last_requeue) >= B2_REQUEUE_FAILED_EVERY_SEC:
-                moved = _queue_requeue_failed(limit=B2_REQUEUE_FAILED_BATCH)
-                if moved:
-                    logging.info("requeued FAILED->NEW: %s", moved)
-                last_requeue = now
             if REG_NUDGES_INTERVAL_SEC > 0 and (now - last_reg_nudge) >= REG_NUDGES_INTERVAL_SEC:
                 _p4_reg_nudge_tick()
                 last_reg_nudge = now
@@ -5012,17 +6653,41 @@ def main() -> None:
                     _P5_OVERLOAD_COUNT_TODAY += int(overload_count)
                 _p5_nudge_emit_if_needed(day_str)
                 last_p5_tick = now
-            row = _queue_claim()
-            if row:
-                _process_queue_item(row)
-            else:
-                time.sleep(B2_IDLE_SLEEP_SEC)
-            _process_items()
-            if CALENDAR_SYNC_MODE != "off":
-                _p3_calendar_create_tick()
-                if CALENDAR_SYNC_MODE == "full":
-                    _p3_calendar_update_tick()
-                    _p4_calendar_cancel_tick()
+            if CALENDAR_DRIFT_FAST_CHECK_SEC > 0 and (now - last_drift_fast) >= CALENDAR_DRIFT_FAST_CHECK_SEC:
+                now_local = datetime.now(_local_tz())
+                fast_from = (now_local - timedelta(days=CALENDAR_DRIFT_FAST_LOOKBACK_DAYS)).isoformat()
+                fast_to = (now_local + timedelta(days=CALENDAR_DRIFT_FAST_LOOKAHEAD_DAYS)).isoformat()
+                _runtime_check_calendar_drift(from_value=fast_from, to_value=fast_to, notify=True)
+                last_drift_fast = now
+            now_local = datetime.now(_local_tz())
+            full_day = now_local.date().isoformat()
+            full_due = (
+                now_local.hour > CALENDAR_DRIFT_FULL_HOUR
+                or (now_local.hour == CALENDAR_DRIFT_FULL_HOUR and now_local.minute >= CALENDAR_DRIFT_FULL_MINUTE)
+            )
+            if full_due and last_drift_full_day != full_day:
+                full_from = (now_local - timedelta(days=CALENDAR_DRIFT_FULL_LOOKBACK_DAYS)).isoformat()
+                full_to = (now_local + timedelta(days=CALENDAR_DRIFT_FULL_LOOKAHEAD_DAYS)).isoformat()
+                _runtime_check_calendar_drift(from_value=full_from, to_value=full_to, notify=True)
+                last_drift_full_day = full_day
+            if legacy_queue_enabled:
+                _queue_reaper()
+                if B2_REQUEUE_FAILED_EVERY_SEC > 0 and (now - last_requeue) >= B2_REQUEUE_FAILED_EVERY_SEC:
+                    moved = _queue_requeue_failed(limit=B2_REQUEUE_FAILED_BATCH)
+                    if moved:
+                        logging.info("requeued FAILED->NEW: %s", moved)
+                    last_requeue = now
+                row = _queue_claim()
+                if row:
+                    _process_queue_item(row)
+                else:
+                    time.sleep(B2_IDLE_SLEEP_SEC)
+                _process_items()
+                if CALENDAR_SYNC_MODE != "off":
+                    _p3_calendar_create_tick()
+                    if CALENDAR_SYNC_MODE == "full":
+                        _p3_calendar_update_tick()
+                        _p4_calendar_cancel_tick()
         except Exception as exc:
             logging.exception("worker error: %s", exc)
         now = time.time()
@@ -5037,4 +6702,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Organizer worker runtime")
+    parser.add_argument("--re-deliver", action="store_true", help="Re-send undelivered Telegram results for recent DONE queue rows")
+    parser.add_argument("--limit", type=int, default=50, help="Max DONE queue rows to inspect for re-delivery")
+    args = parser.parse_args()
+    if args.re_deliver:
+        _init_db()
+        summary = re_deliver_done_items(limit=max(1, int(args.limit)))
+        print(json.dumps(summary, ensure_ascii=False))
+    else:
+        main()

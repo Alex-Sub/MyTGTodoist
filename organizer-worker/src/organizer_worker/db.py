@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -9,6 +10,7 @@ from typing import Any, Iterator
 
 
 DB_PATH = os.getenv("DB_PATH", "/data/organizer.db")
+LOG = logging.getLogger(__name__)
 
 
 def _now_iso_utc() -> str:
@@ -68,6 +70,108 @@ def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool
     return False
 
 
+def _ensure_task_hierarchy_schema(conn: sqlite3.Connection) -> None:
+    if not _table_has_column(conn, "tasks", "parent_task_id"):
+        conn.execute("ALTER TABLE tasks ADD COLUMN parent_task_id INTEGER NULL REFERENCES tasks(id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_tasks_parent_task_id ON tasks(parent_task_id)")
+
+
+def _safe_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _normalize_duplicate_task_title(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("ё", "е")
+    if not text:
+        return ""
+    prefixes = (
+        "создай задачу",
+        "поставь задачу",
+        "добавь задачу",
+    )
+    for prefix in prefixes:
+        if text.startswith(prefix):
+            text = text[len(prefix) :].strip()
+            break
+    text = " ".join(text.split())
+    return text
+
+
+def _normalize_parent_scope_token(value: Any) -> str:
+    raw = str(value or "").strip()
+    return raw if raw else ""
+
+
+def _planned_day_iso(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        dt = _parse_iso_utc(raw)
+        return dt.date().isoformat()
+    except Exception:
+        if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+            return raw[:10]
+    return ""
+
+
+def _is_active_task_status(status: Any, state: Any) -> bool:
+    terminal = {"DONE", "CANCELLED", "CANCELED", "ARCHIVED"}
+    status_norm = str(status or "").strip().upper()
+    state_norm = str(state or "").strip().upper()
+    return status_norm not in terminal and state_norm not in terminal
+
+
+def _is_undated_task(value: Any) -> bool:
+    return not str(value or "").strip()
+
+
+def _task_parent_task_id(conn: sqlite3.Connection, task_id: int) -> int | None:
+    _ensure_task_hierarchy_schema(conn)
+    row = conn.execute("SELECT parent_task_id FROM tasks WHERE id = ?", (int(task_id),)).fetchone()
+    if row is None:
+        return None
+    return _safe_int(row["parent_task_id"])
+
+
+def _validate_parent_task_assignment(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int | None,
+    parent_task_id: int | None,
+) -> None:
+    _ensure_task_hierarchy_schema(conn)
+    if parent_task_id is None:
+        return
+    parent_id = int(parent_task_id)
+    if task_id is not None and int(task_id) == parent_id:
+        raise ValueError("task cannot be its own parent")
+
+    parent_row = conn.execute(
+        "SELECT id, parent_task_id, title FROM tasks WHERE id = ?",
+        (parent_id,),
+    ).fetchone()
+    if parent_row is None:
+        raise ValueError("parent task not found")
+
+    if task_id is not None:
+        seen: set[int] = set()
+        cur_id = parent_id
+        while cur_id not in seen:
+            if cur_id == int(task_id):
+                raise ValueError("task hierarchy cycle is not allowed")
+            seen.add(cur_id)
+            cur_parent = _task_parent_task_id(conn, cur_id)
+            if cur_parent is None:
+                break
+            cur_id = int(cur_parent)
+
+
 @dataclass(frozen=True, slots=True)
 class StateSnapshot:
     tasks_total: int
@@ -106,14 +210,52 @@ def create_task(
     source_msg_id: str | None = None,
     parent_type: str | None = None,
     parent_id: int | None = None,
+    parent_task_id: int | None = None,
+    comment: str | None = None,
 ) -> int:
+    if parent_task_id is not None and (parent_type is not None or parent_id is not None):
+        raise ValueError("parent_task_id cannot be combined with parent_type/parent_id")
+    _ensure_task_hierarchy_schema(conn)
+    _validate_parent_task_assignment(conn, task_id=None, parent_task_id=parent_task_id)
+    if comment is not None and not _table_has_column(conn, "tasks", "comment"):
+        conn.execute("ALTER TABLE tasks ADD COLUMN comment TEXT NULL")
+    has_comment = _table_has_column(conn, "tasks", "comment")
     now = _now_iso_utc()
+    fields = [
+        "title",
+        "status",
+        "state",
+        "planned_at",
+        "source_msg_id",
+        "parent_type",
+        "parent_id",
+        "parent_task_id",
+        "created_at",
+        "updated_at",
+    ]
+    placeholders = ["?"] * len(fields)
+    params: list[Any] = [
+        title,
+        status,
+        state,
+        planned_at,
+        source_msg_id,
+        parent_type,
+        parent_id,
+        parent_task_id,
+        now,
+        now,
+    ]
+    if has_comment:
+        fields.append("comment")
+        placeholders.append("?")
+        params.append(comment)
     cur = conn.execute(
-        """
-        INSERT INTO tasks (title, status, state, planned_at, source_msg_id, parent_type, parent_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        f"""
+        INSERT INTO tasks ({', '.join(fields)})
+        VALUES ({', '.join(placeholders)})
         """,
-        (title, status, state, planned_at, source_msg_id, parent_type, parent_id, now, now),
+        params,
     )
     conn.commit()
     return int(cur.lastrowid)
@@ -129,8 +271,10 @@ def update_task(
     planned_at: str | None = None,
     parent_type: str | None = None,
     parent_id: int | None = None,
+    comment: str | None = None,
 ) -> None:
     now = _now_iso_utc()
+    _ensure_task_hierarchy_schema(conn)
     existing = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if existing is None:
         raise ValueError("task not found")
@@ -156,9 +300,29 @@ def update_task(
     if parent_id is not None:
         fields.append("parent_id = ?")
         params.append(parent_id)
+    if comment is not None:
+        # Runtime-safe schema extension: add task comment column on first use.
+        if not _table_has_column(conn, "tasks", "comment"):
+            conn.execute("ALTER TABLE tasks ADD COLUMN comment TEXT NULL")
+        fields.append("comment = ?")
+        params.append(comment)
 
     params.append(task_id)
     conn.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?", params)
+    conn.commit()
+
+
+def update_task_parent(conn: sqlite3.Connection, *, task_id: int, parent_task_id: int | None) -> None:
+    _ensure_task_hierarchy_schema(conn)
+    existing = conn.execute("SELECT id FROM tasks WHERE id = ?", (int(task_id),)).fetchone()
+    if existing is None:
+        raise ValueError("task not found")
+    target_parent = _safe_int(parent_task_id)
+    _validate_parent_task_assignment(conn, task_id=int(task_id), parent_task_id=target_parent)
+    conn.execute(
+        "UPDATE tasks SET parent_task_id = ?, updated_at = ? WHERE id = ?",
+        (target_parent, _now_iso_utc(), int(task_id)),
+    )
     conn.commit()
 
 
@@ -180,6 +344,119 @@ def find_task_candidates(conn: sqlite3.Connection, *, task_ref: str, limit: int 
         (ref, f"%{ref}%", ref, limit),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def find_duplicate_active_task_create_candidate(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    planned_at: str | None,
+    parent_task_id: int | None,
+) -> dict[str, Any] | None:
+    result = inspect_duplicate_active_task_create_candidate(
+        conn,
+        title=title,
+        planned_at=planned_at,
+        parent_task_id=parent_task_id,
+    )
+    duplicate = result.get("duplicate")
+    return dict(duplicate) if isinstance(duplicate, dict) else None
+
+
+def inspect_duplicate_active_task_create_candidate(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    planned_at: str | None,
+    parent_task_id: int | None,
+) -> dict[str, Any]:
+    normalized_title = _normalize_duplicate_task_title(title)
+    planned_day = _planned_day_iso(planned_at)
+    undated_scope = _is_undated_task(planned_at)
+    if not normalized_title:
+        return {
+            "normalized_title": normalized_title,
+            "planned_day": (planned_day or None),
+            "parent_scope": _normalize_parent_scope_token(parent_task_id),
+            "undated_scope": undated_scope,
+            "candidate_count": 0,
+            "duplicate_found": False,
+            "duplicate": None,
+        }
+
+    _ensure_task_hierarchy_schema(conn)
+    if parent_task_id is None:
+        rows = conn.execute(
+            """
+            SELECT id, title, status, state, planned_at, parent_task_id, created_at
+            FROM tasks
+            WHERE COALESCE(TRIM(CAST(parent_task_id AS TEXT)), '') = ''
+            ORDER BY created_at ASC, id ASC
+            """
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT id, title, status, state, planned_at, parent_task_id, created_at
+            FROM tasks
+            WHERE parent_task_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (int(parent_task_id),),
+        ).fetchall()
+
+    candidate_count = 0
+    first_duplicate: dict[str, Any] | None = None
+    for row in rows:
+        item = dict(row)
+        if not _is_active_task_status(item.get("status"), item.get("state")):
+            continue
+        if _normalize_duplicate_task_title(item.get("title")) != normalized_title:
+            continue
+        existing_is_undated = _is_undated_task(item.get("planned_at"))
+        if undated_scope:
+            if not existing_is_undated:
+                continue
+        else:
+            if existing_is_undated:
+                continue
+            if _planned_day_iso(item.get("planned_at")) != planned_day:
+                continue
+        candidate_count += 1
+        if first_duplicate is None:
+            first_duplicate = item
+        LOG.info(
+            "task_duplicate_precheck_candidate",
+            extra={
+                "candidate_id": item.get("id"),
+                "candidate_title": item.get("title"),
+                "candidate_planned_at": item.get("planned_at"),
+                "candidate_parent_task_id": item.get("parent_task_id"),
+                "normalized_title": normalized_title,
+                "planned_day": (planned_day or None),
+                "undated_scope": undated_scope,
+                "parent_task_id": _normalize_parent_scope_token(parent_task_id),
+            },
+        )
+    if first_duplicate is not None:
+        return {
+            "normalized_title": normalized_title,
+            "planned_day": (planned_day or None),
+            "parent_scope": _normalize_parent_scope_token(parent_task_id),
+            "undated_scope": undated_scope,
+            "candidate_count": candidate_count,
+            "duplicate_found": True,
+            "duplicate": first_duplicate,
+        }
+    return {
+        "normalized_title": normalized_title,
+        "planned_day": (planned_day or None),
+        "parent_scope": _normalize_parent_scope_token(parent_task_id),
+        "undated_scope": undated_scope,
+        "candidate_count": candidate_count,
+        "duplicate_found": False,
+        "duplicate": None,
+    }
 
 
 def complete_task(conn: sqlite3.Connection, *, task_id: int) -> None:
@@ -232,17 +509,45 @@ def create_time_block(
     task_id: int,
     start_at: str,
     end_at: str,
+    user_id: str | None = None,
+    comment: str | None = None,
 ) -> int:
     now = _now_iso_utc()
+    has_user_id = _table_has_column(conn, "time_blocks", "user_id")
+    if comment is not None and not _table_has_column(conn, "time_blocks", "comment"):
+        conn.execute("ALTER TABLE time_blocks ADD COLUMN comment TEXT NULL")
+    has_comment = _table_has_column(conn, "time_blocks", "comment")
+    if has_user_id:
+        uid = str(user_id or "").strip()
+        if not uid:
+            raise ValueError("user_id is required")
+    fields = ["task_id"]
+    placeholders = ["?"]
+    params: list[Any] = [task_id]
+    if has_user_id:
+        fields.append("user_id")
+        placeholders.append("?")
+        params.append(uid)
+    fields.extend(["start_at", "end_at", "created_at"])
+    placeholders.extend(["?", "?", "?"])
+    params.extend([start_at, end_at, now])
+    if has_comment:
+        fields.append("comment")
+        placeholders.append("?")
+        params.append(comment)
     cur = conn.execute(
-        """
-        INSERT INTO time_blocks (task_id, start_at, end_at, created_at)
-        VALUES (?, ?, ?, ?)
+        f"""
+        INSERT INTO time_blocks ({', '.join(fields)})
+        VALUES ({', '.join(placeholders)})
         """,
-        (task_id, start_at, end_at, now),
+        params,
     )
     conn.commit()
     return int(cur.lastrowid)
+
+
+def time_blocks_require_user_id(conn: sqlite3.Connection) -> bool:
+    return _table_has_column(conn, "time_blocks", "user_id")
 
 
 def move_time_block(
@@ -252,6 +557,7 @@ def move_time_block(
     start_at: str | None = None,
     end_at: str | None = None,
     task_id: int | None = None,
+    comment: str | None = None,
 ) -> None:
     row = conn.execute("SELECT id FROM time_blocks WHERE id = ?", (time_block_id,)).fetchone()
     if row is None:
@@ -268,6 +574,11 @@ def move_time_block(
     if end_at is not None:
         fields.append("end_at = ?")
         params.append(end_at)
+    if comment is not None:
+        if not _table_has_column(conn, "time_blocks", "comment"):
+            conn.execute("ALTER TABLE time_blocks ADD COLUMN comment TEXT NULL")
+        fields.append("comment = ?")
+        params.append(comment)
 
     if not fields:
         return
@@ -827,9 +1138,10 @@ def list_goals_at_risk(conn: sqlite3.Connection, *, today: str, limit: int = 20)
 
 
 def list_tasks_today(conn: sqlite3.Connection, *, today: str, limit: int = 50) -> list[dict[str, Any]]:
+    _ensure_task_hierarchy_schema(conn)
     rows = conn.execute(
         """
-        SELECT id, title, planned_at, status, state, goal_id, parent_id, parent_type
+        SELECT id, title, planned_at, status, state, goal_id, parent_id, parent_type, parent_task_id
         FROM tasks
         WHERE substr(COALESCE(planned_at,''), 1, 10) = ?
         ORDER BY planned_at ASC, id ASC
@@ -841,9 +1153,10 @@ def list_tasks_today(conn: sqlite3.Connection, *, today: str, limit: int = 50) -
 
 
 def list_tasks_tomorrow(conn: sqlite3.Connection, *, tomorrow: str, limit: int = 50) -> list[dict[str, Any]]:
+    _ensure_task_hierarchy_schema(conn)
     rows = conn.execute(
         """
-        SELECT id, title, planned_at, status, state, goal_id, parent_id, parent_type
+        SELECT id, title, planned_at, status, state, goal_id, parent_id, parent_type, parent_task_id
         FROM tasks
         WHERE substr(COALESCE(planned_at,''), 1, 10) = ?
         ORDER BY planned_at ASC, id ASC
@@ -855,9 +1168,10 @@ def list_tasks_tomorrow(conn: sqlite3.Connection, *, tomorrow: str, limit: int =
 
 
 def list_tasks_active(conn: sqlite3.Connection, *, limit: int = 100) -> list[dict[str, Any]]:
+    _ensure_task_hierarchy_schema(conn)
     rows = conn.execute(
         """
-        SELECT id, title, planned_at, status, state, goal_id, parent_id, parent_type
+        SELECT id, title, planned_at, status, state, goal_id, parent_id, parent_type, parent_task_id
         FROM tasks
         WHERE UPPER(COALESCE(status, '')) NOT IN ('DONE', 'ARCHIVED', 'CANCELED', 'CANCELLED')
         ORDER BY
@@ -872,49 +1186,48 @@ def list_tasks_active(conn: sqlite3.Connection, *, limit: int = 100) -> list[dic
 
 
 def _with_task_levels(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    def _safe_int(value: Any) -> int | None:
-        if value is None:
-            return None
-        try:
-            return int(value)
-        except Exception:
-            return None
+    _ensure_task_hierarchy_schema(conn)
 
-    cache: dict[int, tuple[str | None, int | None]] = {}
+    cache: dict[int, int | None] = {}
 
-    def _task_parent(task_id: int) -> tuple[str | None, int | None]:
+    def _task_parent(task_id: int) -> int | None:
         if task_id in cache:
             return cache[task_id]
         row = conn.execute(
-            "SELECT parent_type, parent_id FROM tasks WHERE id = ?",
+            "SELECT parent_task_id, parent_type, parent_id FROM tasks WHERE id = ?",
             (int(task_id),),
         ).fetchone()
         if row is None:
-            cache[task_id] = (None, None)
+            cache[task_id] = None
             return cache[task_id]
-        ptype = str(row["parent_type"]).strip().lower() if row["parent_type"] is not None else None
-        pid = _safe_int(row["parent_id"])
-        cache[task_id] = (ptype, pid)
+        direct_parent = _safe_int(row["parent_task_id"])
+        if direct_parent is not None:
+            cache[task_id] = direct_parent
+            return cache[task_id]
+        ptype = str(row["parent_type"]).strip().lower() if row["parent_type"] is not None else ""
+        cache[task_id] = _safe_int(row["parent_id"]) if ptype == "task" else None
         return cache[task_id]
 
     out: list[dict[str, Any]] = []
     for item in rows:
         row = dict(item)
         task_id = _safe_int(row.get("id"))
-        level = 0
+        parent_task_id = _safe_int(row.get("parent_task_id"))
+        if parent_task_id is None and task_id is not None:
+            parent_task_id = _task_parent(task_id)
+        level = 1
         seen: set[int] = set()
-        cur_id = task_id
-        for _ in range(4):
+        cur_id = parent_task_id
+        while cur_id is not None and cur_id not in seen and level < 64:
             if cur_id is None or cur_id in seen:
                 break
             seen.add(cur_id)
-            ptype, pid = _task_parent(cur_id)
-            if ptype != "task" or pid is None:
-                break
             level += 1
-            cur_id = pid
+            cur_id = _task_parent(cur_id)
         row["parent_id"] = _safe_int(row.get("parent_id"))
-        row["level"] = min(level, 3)
+        row["parent_task_id"] = parent_task_id
+        row["depth"] = level
+        row["level"] = level
         row.pop("parent_type", None)
         out.append(row)
     return out

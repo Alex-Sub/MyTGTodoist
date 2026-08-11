@@ -60,3 +60,10 @@ secrets/
 !/scripts/diag_voice_bundle.ps1
 
 /_diag/
+
+# --- local runtime state ---
+/.codex_tmp/
+/MCP/runtime/run/*.pid
+/tmp_test_runtime/
+~*.tmp
+/Фото 1.jpg

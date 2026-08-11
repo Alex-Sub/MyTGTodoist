@@ -117,8 +117,8 @@ Get-Content (Join-Path $BundleDir "logs/organizer-worker.log") -ErrorAction Sile
     ForEach-Object { $_.Line } |
     Out-File -FilePath (Join-Path $BundleDir "focus/organizer-worker_focus.log") -Encoding UTF8
 
-Write-Capture -Path (Join-Path $BundleDir "snapshots/telegram-bot_ml_timeouts.txt") -Command "$ComposePrefix exec -T telegram-bot sh -lc 'echo ML_CORE_URL=\$ML_CORE_URL; echo TG_LONGPOLL_SEC=\$TG_LONGPOLL_SEC; echo TG_HTTP_READ_TIMEOUT=\$TG_HTTP_READ_TIMEOUT'" | Out-Null
-Write-Capture -Path (Join-Path $BundleDir "snapshots/organizer-worker_ml_canon.txt") -Command "$ComposePrefix exec -T organizer-worker sh -lc 'echo ML_CORE_URL=\$ML_CORE_URL; ls -la /canon/intents_v2.yml'" | Out-Null
+Write-Capture -Path (Join-Path $BundleDir "snapshots/telegram-bot_ml_timeouts.txt") -Command "$ComposePrefix exec -T telegram-bot sh -lc 'echo ML_GATEWAY_URL=\$ML_GATEWAY_URL; echo TG_LONGPOLL_SEC=\$TG_LONGPOLL_SEC; echo TG_HTTP_READ_TIMEOUT=\$TG_HTTP_READ_TIMEOUT'" | Out-Null
+Write-Capture -Path (Join-Path $BundleDir "snapshots/organizer-worker_ml_canon.txt") -Command "$ComposePrefix exec -T organizer-worker sh -lc 'echo ML_GATEWAY_URL=\$ML_GATEWAY_URL; ls -la /canon/intents_v2.yml'" | Out-Null
 
 $asrUnavailable = (Select-String -Path (Join-Path $BundleDir "logs/telegram-bot.log") -Pattern "asr_unavailable" -AllMatches -ErrorAction SilentlyContinue).Count
 $asrTimeout = (Select-String -Path (Join-Path $BundleDir "logs/telegram-bot.log") -Pattern "asr_timeout" -AllMatches -ErrorAction SilentlyContinue).Count

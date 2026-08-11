@@ -3,13 +3,33 @@ services:
     build:
       context: .
       dockerfile: ./google-sync/Dockerfile
+      args:
+        SERVICE_NAME: google-sync
+        BUILD_GIT_SHA: ${BUILD_GIT_SHA:-unknown}
+        BUILD_TIMESTAMP_UTC: ${BUILD_TIMESTAMP_UTC:-unknown}
+        BUILD_SOURCE_MARKER: ${GOOGLE_SYNC_SOURCE_MARKER:-runtime-google-sync}
+        BUILD_ROUTE_RULES_VERSION: ${GOOGLE_SYNC_ROUTE_RULES_VERSION:-}
+        BUILD_HANDLER_SHA256: ${GOOGLE_SYNC_HANDLER_SHA256:-}
+        BUILD_DOCKERFILE_PATH: ./google-sync/Dockerfile
+        BUILD_CONTEXT_PATH: .
+        BUILD_ENTRYPOINT_MODULE: src.google.scheduler
     env_file:
       - deploy/tenants/.env.alexey
     environment:
       TZ: ${TZ:-Europe/Moscow}
       APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
       SQLITE_PATH: ${SQLITE_PATH:-${DB_PATH:-/data/organizer.db}}
-      GOOGLE_SYNC_MODE: ${GOOGLE_SYNC_MODE:-sheets_push}
+      GOOGLE_SYNC_MODE: ${GOOGLE_SYNC_MODE:-full_bidir}
+      GOOGLE_SHEETS_SYNC_ENABLED: ${GOOGLE_SHEETS_SYNC_ENABLED:-0}
+      GOOGLE_SHEETS_SYNC_INTERVAL_SEC: ${GOOGLE_SHEETS_SYNC_INTERVAL_SEC:-300}
+      GOOGLE_SHEETS_SYNC_DRY_RUN: ${GOOGLE_SHEETS_SYNC_DRY_RUN:-0}
+      GOOGLE_SHEETS_SYNC_USER_ID: ${GOOGLE_SHEETS_SYNC_USER_ID:-}
+      GOOGLE_SHEETS_CALENDAR_PAST_DAYS: ${GOOGLE_SHEETS_CALENDAR_PAST_DAYS:-30}
+      GOOGLE_SHEETS_CALENDAR_FUTURE_DAYS: ${GOOGLE_SHEETS_CALENDAR_FUTURE_DAYS:-60}
+      GOOGLE_SHEETS_SPREADSHEET_ID: ${GOOGLE_SHEETS_SPREADSHEET_ID:-}
+      GOOGLE_SYNC_HTTP_PORT: ${GOOGLE_SYNC_HTTP_PORT:-8010}
+      CALENDAR_PULL_ENABLED: ${CALENDAR_PULL_ENABLED:-1}
+      SHEETS_PUSH_ENABLED: ${SHEETS_PUSH_ENABLED:-1}
       GOOGLE_SERVICE_ACCOUNT_FILE: /data/google_sa.json
       SYNC_POLL_ACTIVE_SEC: ${SYNC_POLL_ACTIVE_SEC:-30}
       SYNC_POLL_IDLE_SEC: ${SYNC_POLL_IDLE_SEC:-21600}
@@ -28,10 +48,27 @@ services:
         condition: service_healthy
     command: ["python", "-m", "src.google.scheduler"]
     restart: unless-stopped
+    # NOTE: Docker log rotation enabled to prevent disk overflow on VPS
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   organizer-api:
     build:
-      context: ./organizer-api
+      context: .
+      dockerfile: ./organizer-api/Dockerfile
+      args:
+        SERVICE_NAME: organizer-api
+        BUILD_GIT_SHA: ${BUILD_GIT_SHA:-unknown}
+        BUILD_TIMESTAMP_UTC: ${BUILD_TIMESTAMP_UTC:-unknown}
+        BUILD_SOURCE_MARKER: ${ORGANIZER_API_SOURCE_MARKER:-runtime-organizer-api}
+        BUILD_ROUTE_RULES_VERSION: ${ORGANIZER_API_ROUTE_RULES_VERSION:-}
+        BUILD_HANDLER_SHA256: ${ORGANIZER_API_HANDLER_SHA256:-}
+        BUILD_DOCKERFILE_PATH: ./organizer-api/Dockerfile
+        BUILD_CONTEXT_PATH: .
+        BUILD_ENTRYPOINT_MODULE: app:app
     env_file:
       - deploy/tenants/.env.alexey
     environment:
@@ -41,9 +78,18 @@ services:
       LOCAL_TZ_OFFSET_MIN: ${LOCAL_TZ_OFFSET_MIN:-180}
       DT_MARKER_HOUR: ${DT_MARKER_HOUR:-6}
       DT_MARKER_MINUTE: ${DT_MARKER_MINUTE:-0}
+      GOOGLE_CALENDAR_ID: ${GOOGLE_CALENDAR_ID}
+      GOOGLE_SERVICE_ACCOUNT_FILE: /data/google_sa.json
     volumes:
       - db_data:/data:ro
       - ./migrations:/app/migrations:ro
+      - ./secrets:/secrets:ro
+      - type: bind
+        source: ${GOOGLE_SA_FILE_HOST:-./secrets/alexey/google_sa.json}
+        target: /data/google_sa.json
+        read_only: true
+        bind:
+          create_host_path: false
     ports:
       - "8101:8000"
     depends_on:
@@ -56,10 +102,26 @@ services:
       retries: 5
       start_period: 10s
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   organizer-worker:
     build:
-      context: ./organizer-worker
+      context: .
+      dockerfile: ./organizer-worker/Dockerfile
+      args:
+        SERVICE_NAME: organizer-worker
+        BUILD_GIT_SHA: ${BUILD_GIT_SHA:-unknown}
+        BUILD_TIMESTAMP_UTC: ${BUILD_TIMESTAMP_UTC:-unknown}
+        BUILD_SOURCE_MARKER: ${ORGANIZER_WORKER_SOURCE_MARKER:-runtime-worker}
+        BUILD_ROUTE_RULES_VERSION: ${ORGANIZER_WORKER_ROUTE_RULES_VERSION:-}
+        BUILD_HANDLER_SHA256: ${ORGANIZER_WORKER_HANDLER_SHA256:-}
+        BUILD_DOCKERFILE_PATH: ./organizer-worker/Dockerfile
+        BUILD_CONTEXT_PATH: .
+        BUILD_ENTRYPOINT_MODULE: worker-runtime
     env_file:
       - deploy/tenants/.env.alexey
     environment:
@@ -72,10 +134,8 @@ services:
       TIMEZONE: ${TIMEZONE:-Europe/Moscow}
       WORKER_INTERVAL_SEC: 5
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-      # ML gateway is external.
-      ML_CORE_URL: ${ML_CORE_URL:-http://host.docker.internal:19000}
-      # Legacy (unused): ASR_SERVICE_URL
-      ASR_SERVICE_URL: ${ASR_SERVICE_URL:-}
+      # ML gateway is external (canonical runtime var).
+      ML_GATEWAY_URL: ${ML_GATEWAY_URL:-http://host.docker.internal:19000}
       WORKER_TG_HTTP_READ_TIMEOUT: ${WORKER_TG_HTTP_READ_TIMEOUT:-90}
       WORKER_TG_SEND_MAX_RETRIES: ${WORKER_TG_SEND_MAX_RETRIES:-2}
       WORKER_NOTIFY_ON_DEAD: ${WORKER_NOTIFY_ON_DEAD:-1}
@@ -84,6 +144,8 @@ services:
       TG_HTTP_READ_TIMEOUT: ${TG_HTTP_READ_TIMEOUT:-90}
       TG_HTTP_RETRIES: ${TG_HTTP_RETRIES:-3}
       TG_HTTP_RETRY_SLEEP: ${TG_HTTP_RETRY_SLEEP:-1.0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_ML_RAW: ${LOG_ML_RAW:-0}
       ASR_HTTP_READ_TIMEOUT: ${ASR_HTTP_READ_TIMEOUT:-180}
       DT_DEFAULT_HOUR: ${DT_DEFAULT_HOUR:-10}
       DT_DEFAULT_MINUTE: ${DT_DEFAULT_MINUTE:-0}
@@ -105,12 +167,12 @@ services:
       B2_MAX_ATTEMPTS: ${B2_MAX_ATTEMPTS:-5}
       B2_REQUEUE_FAILED_EVERY_SEC: ${B2_REQUEUE_FAILED_EVERY_SEC:-15}
       B2_REQUEUE_FAILED_BATCH: ${B2_REQUEUE_FAILED_BATCH:-10}
+      B2_REPLAY_MAX_AGE_SEC: ${B2_REPLAY_MAX_AGE_SEC:-900}
+      B2_REPLAY_SCAN_LIMIT: ${B2_REPLAY_SCAN_LIMIT:-200}
       B2_IDLE_SLEEP_SEC: ${B2_IDLE_SLEEP_SEC:-0.5}
       B2_SCHEMA_PATH: /app/migrations/001_inbox_queue.sql
     volumes:
       - ./migrations:/app/migrations:ro
-      - ./organizer-worker/worker.py:/app/worker.py:ro
-      - ./organizer-worker/src:/app/src:ro
       - ./canon:/canon:ro
       - db_data:/data
       - ./secrets:/secrets:ro
@@ -132,32 +194,65 @@ services:
       timeout: 3s
       retries: 5
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      default:
+        aliases:
+          - organizer-worker
 
   telegram-bot:
     build:
-      context: ./telegram-bot
+      context: .
+      dockerfile: ./telegram-bot/Dockerfile
+      args:
+        SERVICE_NAME: telegram-bot
+        BUILD_GIT_SHA: ${BUILD_GIT_SHA:-unknown}
+        BUILD_TIMESTAMP_UTC: ${BUILD_TIMESTAMP_UTC:-unknown}
+        BUILD_SOURCE_MARKER: ${TELEGRAM_BOT_SOURCE_MARKER:-stage67-hardguard-v2}
+        BUILD_ROUTE_RULES_VERSION: ${TELEGRAM_BOT_ROUTE_RULES_VERSION:-}
+        BUILD_HANDLER_SHA256: ${TELEGRAM_BOT_HANDLER_SHA256:-}
+        BUILD_DOCKERFILE_PATH: ./telegram-bot/Dockerfile
+        BUILD_CONTEXT_PATH: .
+        BUILD_ENTRYPOINT_MODULE: src.integrations.telegram.bot_main
     env_file:
       - deploy/tenants/.env.alexey
     environment:
       PYTHONUNBUFFERED: "1"
       TZ: ${TZ:-Europe/Moscow}
       APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
+      APP_ID: ${APP_ID:-telegram-adapter}
+      APP_VERSION: ${APP_VERSION:-2026.03.09}
+      APP_ENV: ${APP_ENV:-prod}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       GOOGLE_CALENDAR_ID: ${GOOGLE_CALENDAR_ID}
       ML_GATEWAY_URL: ${ML_GATEWAY_URL:-http://host.docker.internal:19000}
-      # ML gateway is external.
-      ML_CORE_URL: ${ML_CORE_URL:-http://host.docker.internal:19000}
-      # Legacy (unused): ASR_SERVICE_URL
-      ASR_SERVICE_URL: ${ASR_SERVICE_URL:-}
       ORGANIZER_API_URL: http://organizer-api:8000
-      WORKER_COMMAND_URL: http://organizer-worker:8002
-      STATE_PATH: /data/bot.offset
+      GOOGLE_SYNC_REVIEW_URL: ${GOOGLE_SYNC_REVIEW_URL:-http://google-sync:8010/review}
+      TELEGRAM_ADAPTER_MODE: ${TELEGRAM_ADAPTER_MODE:-runtime_core_direct}
+      WORKER_COMMAND_URL: ${WORKER_COMMAND_URL:-http://organizer-worker:8002/runtime/command}
+      STATE_PATH: ${STATE_PATH:-/data/telegram_adapter_state.json}
+      HEALTH_PORT: ${HEALTH_PORT:-8082}
+      LOCAL_DB_PATH: ${LOCAL_DB_PATH:-/data/runtime_local.db}
+      CLOUD_BUFFER_DSN: ${CLOUD_BUFFER_DSN:-sqlite:////data/runtime_cloud.db}
+      APP_DICT_PATH: ${APP_DICT_PATH:-/app/app-integration/src/dictionaries/app_dict.yaml}
+      QUEUE_REPLAY_TTL_SECONDS: ${QUEUE_REPLAY_TTL_SECONDS:-600}
+      CLARIFICATION_TTL_SEC: ${CLARIFICATION_TTL_SEC:-300}
+      COMMAND_DEDUP_RESERVATION_TTL_SEC: ${COMMAND_DEDUP_RESERVATION_TTL_SEC:-120}
+      TELEGRAM_HTTP_TIMEOUT_SEC: ${TELEGRAM_HTTP_TIMEOUT_SEC:-20}
+      TELEGRAM_HTTP_RETRIES: ${TELEGRAM_HTTP_RETRIES:-3}
+      TELEGRAM_POLL_TIMEOUT_SEC: ${TELEGRAM_POLL_TIMEOUT_SEC:-25}
+      TELEGRAM_POLL_INTERVAL_SEC: ${TELEGRAM_POLL_INTERVAL_SEC:-1.0}
       TG_DRAIN_ON_START: "0"
       TG_LONGPOLL_SEC: "25"
       TG_HTTP_CONNECT_TIMEOUT: ${TG_HTTP_CONNECT_TIMEOUT:-10}
       TG_HTTP_READ_TIMEOUT: ${TG_HTTP_READ_TIMEOUT:-20}
       TG_HTTP_RETRIES: ${TG_HTTP_RETRIES:-3}
       TG_HTTP_RETRY_SLEEP: ${TG_HTTP_RETRY_SLEEP:-1.0}
+      LOG_ML_RAW: ${LOG_ML_RAW:-0}
       LOCAL_TZ_OFFSET_MIN: ${LOCAL_TZ_OFFSET_MIN:-180}
       MEETING_DEFAULT_MINUTES: ${MEETING_DEFAULT_MINUTES:-30}
       CLARIFY_STATE_PATH: ${CLARIFY_STATE_PATH:-/data/bot.clarify.json}
@@ -174,7 +269,7 @@ services:
       organizer-api:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "test -f /tmp/bot.ok"]
+      test: ["CMD-SHELL", "test -f /tmp/bot.ok && test -s /app/build-info.json && grep -q 'route_rules_version' /app/build-info.json"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -184,7 +279,16 @@ services:
       - db_data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Canonical entrypoint: bot_main (runtime_core_direct by default).
+    # Legacy bot.py entrypoint is deprecated/archived and not part of active contour.
+    command: ["python", "-m", "src.integrations.telegram.bot_main"]
     restart: unless-stopped
-
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - default
 volumes:
   db_data:

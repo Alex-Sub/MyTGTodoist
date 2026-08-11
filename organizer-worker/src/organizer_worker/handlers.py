@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+from common.date_resolver import normalize_temporal_fields, resolve_date_phrase
 
 from organizer_worker import db
 from organizer_worker import canon
@@ -10,9 +13,37 @@ from organizer_worker.time_legacy.aliases import TASK_STATUS_NORMALIZATION
 
 HandlerResult = dict[str, Any]
 HandlerFn = Callable[[dict[str, Any]], HandlerResult]
+LOG = logging.getLogger(__name__)
 
 EXECUTE_CONFIDENCE = 0.75
 CLARIFY_CONFIDENCE = 0.40
+DEFAULT_MEETING_DURATION_MINUTES = int(os.getenv("DEFAULT_MEETING_DURATION_MINUTES", "30"))
+_MEETING_KIND_DEFAULT = "встреча"
+
+INTENT_ALIAS_TO_CANON = {
+    "task_create": "task.create",
+    "task_complete": "task.complete",
+    "task_update": "task.update",
+    "task_parent_update": "task.parent.update",
+    "task_move_under_parent": "task.parent.update",
+    "task_move": "task.move",
+    "task_set_status": "task.set_status",
+    "task_reschedule": "task.reschedule",
+    "timeblock_create": "timeblock.create",
+    "timeblock_move": "timeblock.move",
+    "timeblock_update": "timeblock.update",
+    "timeblock_delete": "timeblock.delete",
+    "meeting_create": "meeting.create",
+    "schedule_meeting": "meeting.create",
+    "create_event": "meeting.create",
+    "meeting_update": "meeting.update",
+    "reschedule_meeting": "meeting.update",
+    "move_meeting": "meeting.update",
+    "meeting_comment_update": "meeting.comment.update",
+    "task_comment_update": "task.comment.update",
+    "subtask_create": "subtask.create",
+    "subtask_complete": "subtask.complete",
+}
 
 
 def build_clarification(
@@ -70,6 +101,48 @@ def _safe_fail(**debug: Any) -> HandlerResult:
     return out
 
 
+def _normalize_meeting_kind(value: Any) -> str:
+    raw = str(value or "").strip().lower().replace("ё", "е")
+    if not raw:
+        return ""
+    if raw.startswith("собран"):
+        return "собрание"
+    if raw.startswith("созвон") or raw.startswith("звон"):
+        return "созвон"
+    if raw.startswith("мероприят") or raw.startswith("ивент") or raw.startswith("событ"):
+        return "мероприятие"
+    if raw.startswith("встреч"):
+        return "встреча"
+    return ""
+
+
+def _meeting_success_text(meeting_kind: Any, action: str) -> str:
+    kind = _normalize_meeting_kind(meeting_kind) or _MEETING_KIND_DEFAULT
+    action_norm = str(action or "").strip().lower()
+    if action_norm == "create":
+        by_kind = {
+            "встреча": "Встреча создана.",
+            "собрание": "Собрание создано.",
+            "созвон": "Созвон создан.",
+            "мероприятие": "Мероприятие создано.",
+        }
+    elif action_norm == "reschedule":
+        by_kind = {
+            "встреча": "Встреча перенесена.",
+            "собрание": "Собрание перенесено.",
+            "созвон": "Созвон перенесён.",
+            "мероприятие": "Мероприятие перенесено.",
+        }
+    else:
+        by_kind = {
+            "встреча": "Встреча обновлена.",
+            "собрание": "Собрание обновлено.",
+            "созвон": "Созвон обновлён.",
+            "мероприятие": "Мероприятие обновлено.",
+        }
+    return by_kind.get(kind, by_kind[_MEETING_KIND_DEFAULT])
+
+
 def _parse_iso_utc(value: str) -> datetime:
     v = value.strip()
     if v.endswith("Z"):
@@ -100,6 +173,56 @@ def _normalized_datetime_value(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _format_duplicate_day_ru(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        dt = _parse_iso_utc(raw)
+        return dt.strftime("%d.%m.%Y")
+    except Exception:
+        if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+            try:
+                return datetime.fromisoformat(f"{raw[:10]}T00:00:00+00:00").strftime("%d.%m.%Y")
+            except Exception:
+                return raw[:10]
+    return raw
+
+
+def _task_duplicate_question(existing_task: dict[str, Any], fallback_title: str) -> str:
+    duplicate_title = str(existing_task.get("title") or "").strip() or fallback_title
+    duplicate_id = str(existing_task.get("id") or "").strip() or "-"
+    duplicate_date = _format_duplicate_day_ru(existing_task.get("planned_at"))
+    duplicate_parent = str(existing_task.get("parent_task_id") or "").strip()
+    if duplicate_date:
+        lead_text = f"Похоже, такая задача уже есть на {duplicate_date}"
+    elif duplicate_parent:
+        lead_text = "Такая задача уже есть без срока"
+    else:
+        lead_text = "Такая задача уже есть в InBox"
+    return (
+        f"{lead_text}:\n"
+        f"№ {duplicate_id} — {duplicate_title}\n\n"
+        "Создать ещё одну?"
+    )
+
+
+def _duplicate_scope_label(*, planned_day: Any, undated_scope: bool, parent_scope: Any) -> str:
+    if planned_day:
+        return "dated"
+    if undated_scope:
+        return "subtask_undated" if str(parent_scope or "").strip() else "inbox"
+    return "dated"
+
+
+def _is_truthy_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _resolve_task_id_or_question(e: dict[str, Any], conn: Any) -> tuple[int | None, HandlerResult | None]:
@@ -154,6 +277,56 @@ def _resolve_task_id_or_question(e: dict[str, Any], conn: Any) -> tuple[int | No
             debug={"missing": "task_ref.chosen_id", "candidates_top": top},
         )
     return int(candidates[0]["id"]), None
+
+
+def _resolve_optional_task_id_for_timeblock(e: dict[str, Any], conn: Any) -> tuple[int | None, HandlerResult | None]:
+    task_id = e.get("task_id")
+    if task_id is not None:
+        try:
+            return int(task_id), None
+        except Exception:
+            return None, _need("task_id", "Нужен номер задачи.")
+
+    task_ref = e.get("task_ref")
+    if task_ref is None:
+        return None, None
+
+    if not _is_truthy_flag(e.get("task_ref_optional")):
+        return _resolve_task_id_or_question(e, conn)
+
+    if isinstance(task_ref, dict):
+        chosen_id = task_ref.get("chosen_id") or task_ref.get("task_id") or task_ref.get("id")
+        if chosen_id is not None:
+            try:
+                return int(chosen_id), None
+            except Exception:
+                return None, _need("task_ref.chosen_id", "Нужен корректный номер задачи.")
+        task_ref = task_ref.get("text") or task_ref.get("query") or ""
+
+    if not isinstance(task_ref, str) or not task_ref.strip():
+        return None, None
+
+    if task_ref.strip().isdigit():
+        return int(task_ref.strip()), None
+
+    top_k = canon.get_disambiguation_top_k()
+    candidates = db.find_task_candidates(conn, task_ref=task_ref.strip(), limit=top_k)
+    if len(candidates) == 1:
+        return int(candidates[0]["id"]), None
+    return None, None
+
+
+def _timeblock_fallback_task_title(e: dict[str, Any], comment_text: str) -> str:
+    candidates = [
+        comment_text,
+        e.get("task_ref"),
+        e.get("title"),
+        e.get("task_title"),
+    ]
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "Блок времени"
 
 
 def _resolve_goal_id_or_question(e: dict[str, Any], conn: Any) -> tuple[int | None, HandlerResult | None]:
@@ -303,20 +476,7 @@ def _choices_if_any(entities: dict[str, Any]) -> list[dict[str, Any]] | None:
 
 def _normalize_intent_alias(intent: str) -> str:
     raw = (intent or "").strip()
-    aliases = {
-        "task_create": "task.create",
-        "task_complete": "task.complete",
-        "task_update": "task.update",
-        "task_move": "task.move",
-        "task_set_status": "task.set_status",
-        "task_reschedule": "task.reschedule",
-        "timeblock_create": "timeblock.create",
-        "timeblock_move": "timeblock.move",
-        "timeblock_delete": "timeblock.delete",
-        "subtask_create": "subtask.create",
-        "subtask_complete": "subtask.complete",
-    }
-    return aliases.get(raw, raw)
+    return INTENT_ALIAS_TO_CANON.get(raw, raw)
 
 
 def _intent_allowlist_choices() -> list[dict[str, Any]]:
@@ -334,13 +494,138 @@ def task_create(payload: dict[str, Any]) -> HandlerResult:
     title = (e.get("title") or "").strip()
     if not title:
         return _need("title", "Как назвать задачу?")
-    planned_at = e.get("planned_at")  # ISO string (optional)
+    planned_at = e.get("planned_at")
+    if planned_at in (None, ""):
+        for fallback_key in ("due_date", "due_at", "date", "when"):
+            fallback_value = e.get(fallback_key)
+            if fallback_value not in (None, ""):
+                planned_at = fallback_value
+                break
     source_msg_id = e.get("source_msg_id")
+    comment_text = str(
+        e.get("comment_text")
+        or e.get("comment")
+        or e.get("description")
+        or e.get("notes")
+        or ""
+    ).strip()
+    parent_task_id = e.get("parent_task_id")
+    parent_task_explicit_raw = e.get("parent_task_explicit")
+    has_parent_task_explicit = "parent_task_explicit" in e
+    parent_type = e.get("parent_type")
+    parent_id = e.get("parent_id")
+    duplicate_check_override = _is_truthy_flag(e.get("duplicate_check_override"))
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    parent_source = str(source.get("channel") or source.get("adapter") or "manual").strip() or "manual"
+    normalized_planned_at = str(planned_at).strip() if planned_at is not None else None
+    if parent_task_id is not None and has_parent_task_explicit and not _is_truthy_flag(parent_task_explicit_raw):
+        LOG.info(
+            "task_parent_resolution",
+            extra={
+                "source": parent_source,
+                "title": title,
+                "parent_task_id": str(parent_task_id),
+                "parent_task_explicit": False,
+                "action": "cleared_non_explicit_parent",
+            },
+        )
+        parent_task_id = None
+    else:
+        LOG.info(
+            "task_parent_resolution",
+            extra={
+                "source": parent_source,
+                "title": title,
+                "parent_task_id": str(parent_task_id or ""),
+                "parent_task_explicit": bool(_is_truthy_flag(parent_task_explicit_raw)) if has_parent_task_explicit else None,
+                "action": "keep_parent" if parent_task_id is not None else "root_task",
+            },
+        )
+    if parent_task_id is not None and (parent_type is not None or parent_id is not None):
+        return _fail("Нельзя одновременно указать родительскую задачу и структурного родителя.")
 
     try:
         with db.connect() as conn:
-            task_id = db.create_task(conn, title=title, planned_at=planned_at, source_msg_id=source_msg_id)
-        return _ok(f"Задача создана: #{task_id}.", task_id=task_id)
+            duplicate_probe = db.inspect_duplicate_active_task_create_candidate(
+                conn,
+                title=title,
+                planned_at=normalized_planned_at,
+                parent_task_id=(int(parent_task_id) if parent_task_id is not None else None),
+            )
+            LOG.info(
+                "task_duplicate_precheck_result",
+                extra={
+                    "normalized_title": duplicate_probe.get("normalized_title"),
+                    "planned_at": normalized_planned_at,
+                    "planned_day": duplicate_probe.get("planned_day"),
+                    "undated_scope": bool(duplicate_probe.get("undated_scope")),
+                    "duplicate_scope": _duplicate_scope_label(
+                        planned_day=duplicate_probe.get("planned_day"),
+                        undated_scope=bool(duplicate_probe.get("undated_scope")),
+                        parent_scope=duplicate_probe.get("parent_scope"),
+                    ),
+                    "parent_task_id": duplicate_probe.get("parent_scope"),
+                    "candidate_count": int(duplicate_probe.get("candidate_count") or 0),
+                    "duplicate_found": bool(duplicate_probe.get("duplicate_found")),
+                    "source": "worker_commit_guard",
+                },
+            )
+            duplicate = duplicate_probe.get("duplicate") if isinstance(duplicate_probe.get("duplicate"), dict) else None
+            if duplicate is not None and not duplicate_check_override:
+                question = _task_duplicate_question(duplicate, title)
+                return {
+                    "ok": False,
+                    "outcome": "needs_clarification",
+                    "needs_clarification": True,
+                    "missing_field": "task_create_duplicate_confirm",
+                    "clarifying_question": question,
+                    "user_message": question,
+                    "debug": {
+                        "duplicate_found": True,
+                        "requires_confirmation": True,
+                        "existing_task": {
+                            "id": duplicate.get("id"),
+                            "title": duplicate.get("title"),
+                            "planned_at": duplicate.get("planned_at"),
+                            "parent_task_id": duplicate.get("parent_task_id"),
+                        },
+                    },
+                }
+            task_id = db.create_task(
+                conn,
+                title=title,
+                planned_at=normalized_planned_at,
+                source_msg_id=source_msg_id,
+                parent_type=(str(parent_type) if parent_type is not None else None),
+                parent_id=(int(parent_id) if parent_id is not None else None),
+                parent_task_id=(int(parent_task_id) if parent_task_id is not None else None),
+                comment=(comment_text or None),
+            )
+        LOG.info(
+            "task_create_date_resolution",
+            extra={
+                "source": parent_source,
+                "intent": "task.create",
+                "raw_text": str(e.get("text") or ""),
+                "raw_due_date": str(e.get("due_date") or e.get("date") or e.get("when") or ""),
+                "extracted_date": str(e.get("due_date") or e.get("date") or e.get("when") or ""),
+                "resolved_planned_at": normalized_planned_at or "",
+                "planned_at": normalized_planned_at or "",
+                "summary_planned_at": normalized_planned_at or "",
+                "persisted_planned_at": normalized_planned_at or "",
+                "task_id": task_id,
+            },
+        )
+        if comment_text:
+            LOG.info(
+                "task_create_comment_persisted",
+                extra={
+                    "task_id": task_id,
+                    "comment_length": len(comment_text),
+                    "source": parent_source,
+                },
+            )
+        return _ok(f"Задача создана: #{task_id}.", task_id=task_id, parent_task_id=parent_task_id)
     except Exception as exc:
         return _fail("Не получилось создать задачу. Попробуйте еще раз.", error=str(exc))
 
@@ -443,9 +728,11 @@ def task_update(payload: dict[str, Any]) -> HandlerResult:
     state = e.get("state")
     parent_type = e.get("parent_type")
     parent_id = e.get("parent_id")
+    has_parent_task_field = "parent_task_id" in e
+    parent_task_id = e.get("parent_task_id")
 
     # If nothing to update, ask.
-    if all(v is None for v in (title, planned_at, status, state, parent_type, parent_id)):
+    if all(v is None for v in (title, planned_at, status, state, parent_type, parent_id)) and not has_parent_task_field:
         return _need("fields", "Что именно обновить в задаче?")
 
     try:
@@ -464,9 +751,35 @@ def task_update(payload: dict[str, Any]) -> HandlerResult:
                 parent_type=(str(parent_type) if parent_type is not None else None),
                 parent_id=(int(parent_id) if parent_id is not None else None),
             )
+            if has_parent_task_field:
+                db.update_task_parent(
+                    conn,
+                    task_id=task_id,
+                    parent_task_id=(int(parent_task_id) if parent_task_id is not None else None),
+                )
         return _ok("Готово. Обновил задачу.", task_id=task_id)
     except Exception as exc:
         return _fail("Не получилось обновить задачу. Проверьте данные.", error=str(exc))
+
+
+def task_parent_update(payload: dict[str, Any]) -> HandlerResult:
+    e = _entities(payload)
+    if "parent_task_id" not in e:
+        return _need("parent_task_id", "Под какую родительскую задачу перенести?")
+    try:
+        with db.connect() as conn:
+            task_id, question = _resolve_task_id_or_question(e, conn)
+            if question is not None:
+                return question
+            assert task_id is not None
+            db.update_task_parent(
+                conn,
+                task_id=task_id,
+                parent_task_id=(int(e.get("parent_task_id")) if e.get("parent_task_id") is not None else None),
+            )
+        return _ok("Готово. Обновил родительскую задачу.", task_id=task_id, parent_task_id=e.get("parent_task_id"))
+    except Exception as exc:
+        return _fail("Не получилось обновить родительскую задачу. Проверьте данные.", error=str(exc))
 
 
 def subtask_create(payload: dict[str, Any]) -> HandlerResult:
@@ -500,10 +813,142 @@ def subtask_complete(payload: dict[str, Any]) -> HandlerResult:
         return _fail("Не получилось завершить подзадачу. Проверьте номер.", error=str(exc), subtask_id=subtask_id)
 
 
+def meeting_create(payload: dict[str, Any]) -> HandlerResult:
+    e = _entities(payload)
+    start_at = _normalized_datetime_value(e.get("start_at"))
+    duration_min = e.get("duration_minutes")
+    if duration_min is None:
+        duration_min = e.get("duration_min")
+    user_id = str(e.get("user_id") or "").strip()
+
+    meeting_kind = _normalize_meeting_kind(e.get("meeting_kind") or e.get("event_kind"))
+    if duration_min is None:
+        duration_min = int(DEFAULT_MEETING_DURATION_MINUTES)
+        e["duration_minutes"] = int(DEFAULT_MEETING_DURATION_MINUTES)
+    if not start_at:
+        return _need("start_at", "На какое время запланировать встречу?")
+    if not user_id:
+        return _need("user_id", "Не удалось определить пользователя для создания встречи.")
+
+    try:
+        duration_value = int(duration_min)
+    except Exception:
+        return _need("duration_minutes", "На сколько минут запланировать встречу?")
+    if duration_value <= 0:
+        return _need("duration_minutes", "На сколько минут запланировать встречу?")
+
+    LOG.info(
+        "creating_meeting",
+        extra={
+            "user_id": user_id,
+            "start_at": str(start_at),
+            "duration": duration_value,
+        },
+    )
+    return _ok(
+        _meeting_success_text(meeting_kind, "create"),
+        start_at=str(start_at),
+        duration_minutes=duration_value,
+        user_id=user_id,
+        comment_text=str(
+            e.get("comment_text")
+            or e.get("comment")
+            or e.get("description")
+            or e.get("notes")
+            or ""
+        ).strip(),
+    )
+
+
+def meeting_update(payload: dict[str, Any]) -> HandlerResult:
+    e = _entities(payload)
+    meeting_kind = _normalize_meeting_kind(e.get("meeting_kind") or e.get("event_kind"))
+    user_id = str(e.get("user_id") or "").strip()
+    if not user_id:
+        return _need("user_id", "Не удалось определить пользователя для изменения встречи.")
+
+    has_any_change = any(
+        [
+            bool(str(e.get("start_at") or "").strip()),
+            bool(str(e.get("start_at_date") or e.get("date") or "").strip()),
+            bool(str(e.get("start_at_time") or e.get("time") or "").strip()),
+            e.get("duration_minutes") is not None,
+            e.get("duration_min") is not None,
+        ]
+    )
+    if not has_any_change:
+        return _need("start_at_time", "Что изменить во встрече: дату, время или длительность?")
+
+    return _ok(
+        _meeting_success_text(meeting_kind, "reschedule"),
+        user_id=user_id,
+        start_at=str(e.get("start_at") or ""),
+        duration_minutes=e.get("duration_minutes") if e.get("duration_minutes") is not None else e.get("duration_min"),
+        calendar_event_id=str(e.get("calendar_event_id") or ""),
+    )
+
+
+def meeting_comment_update(payload: dict[str, Any]) -> HandlerResult:
+    e = _entities(payload)
+    user_id = str(e.get("user_id") or "").strip()
+    if not user_id:
+        return _need("user_id", "Не удалось определить пользователя для изменения встречи.")
+    calendar_event_id = str(e.get("calendar_event_id") or "").strip()
+    if not calendar_event_id:
+        return _need("calendar_event_id", "Уточните, какую встречу нужно изменить.")
+    comment_text = str(
+        e.get("comment_text")
+        or e.get("comment")
+        or e.get("description")
+        or e.get("notes")
+        or ""
+    ).strip()
+    if not comment_text:
+        return _need("comment_text", "Какой комментарий добавить во встречу?")
+    return _ok(
+        "Комментарий встречи обновлён.",
+        user_id=user_id,
+        calendar_event_id=calendar_event_id,
+        comment_text=comment_text,
+    )
+
+
+def task_comment_update(payload: dict[str, Any]) -> HandlerResult:
+    e = _entities(payload)
+    comment_text = str(
+        e.get("comment_text")
+        or e.get("comment")
+        or e.get("description")
+        or e.get("notes")
+        or ""
+    ).strip()
+    if not comment_text:
+        return _need("comment_text", "Какой комментарий добавить к задаче?")
+
+    try:
+        with db.connect() as conn:
+            task_id, question = _resolve_task_id_or_question(e, conn)
+            if question is not None:
+                return question
+            assert task_id is not None
+            db.update_task(conn, task_id=task_id, comment=comment_text)
+        return _ok("Комментарий задачи обновлён.", task_id=task_id, comment_text=comment_text)
+    except Exception as exc:
+        return _fail("Не получилось обновить комментарий задачи. Проверьте данные.", error=str(exc))
+
+
 def timeblock_create(payload: dict[str, Any]) -> HandlerResult:
     e = _entities(payload)
     start_at = _normalized_datetime_value(e.get("start_at"))
     duration_min = e.get("duration_minutes")
+    user_id = str(e.get("user_id") or "").strip()
+    comment_text = str(
+        e.get("comment_text")
+        or e.get("comment")
+        or e.get("description")
+        or e.get("notes")
+        or ""
+    ).strip()
     if duration_min is None:
         duration_min = e.get("duration_min")
     # Deterministic question order: duration first, then start_at.
@@ -514,13 +959,44 @@ def timeblock_create(payload: dict[str, Any]) -> HandlerResult:
 
     try:
         with db.connect() as conn:
-            task_id, question = _resolve_task_id_or_question(e, conn)
+            task_id, question = _resolve_optional_task_id_for_timeblock(e, conn)
             if question is not None:
                 return question
-            assert task_id is not None
+            created_fallback_task_id: int | None = None
+            if task_id is None:
+                fallback_title = _timeblock_fallback_task_title(e, comment_text)
+                created_fallback_task_id = db.create_task(conn, title=fallback_title)
+                task_id = created_fallback_task_id
+            LOG.info(
+                "creating_timeblock",
+                extra={
+                    "user_id": user_id,
+                    "start_at": str(start_at),
+                    "duration": int(duration_min),
+                },
+            )
+            if db.time_blocks_require_user_id(conn) and not user_id:
+                LOG.error(
+                    "creating_timeblock_missing_user_id",
+                    extra={"start_at": str(start_at), "duration": int(duration_min)},
+                )
+                return _fail(
+                    "Не получилось создать блок времени: не найден пользователь.",
+                    reason="missing_user_id",
+                )
             end_value = _with_minutes_iso(str(start_at), int(duration_min))
-            tb_id = db.create_time_block(conn, task_id=task_id, start_at=str(start_at), end_at=str(end_value))
-        return _ok("Блок времени создан.", time_block_id=tb_id, task_id=task_id)
+            tb_id = db.create_time_block(
+                conn,
+                task_id=task_id,
+                start_at=str(start_at),
+                end_at=str(end_value),
+                user_id=(user_id or None),
+                comment=(comment_text or None),
+            )
+        debug: dict[str, Any] = {"time_block_id": tb_id, "task_id": task_id}
+        if created_fallback_task_id is not None:
+            debug["created_fallback_task_id"] = created_fallback_task_id
+        return _ok("Блок времени создан.", **debug)
     except Exception as exc:
         return _fail("Не получилось создать блок времени. Проверьте данные.", error=str(exc))
 
@@ -534,7 +1010,14 @@ def timeblock_move(payload: dict[str, Any]) -> HandlerResult:
     start_at = _normalized_datetime_value(e.get("start_at"))
     end_at = _normalized_datetime_value(e.get("end_at"))
     task_id = e.get("task_id")
-    if start_at is None and end_at is None and task_id is None:
+    comment_text = str(
+        e.get("comment_text")
+        or e.get("comment")
+        or e.get("description")
+        or e.get("notes")
+        or ""
+    ).strip()
+    if start_at is None and end_at is None and task_id is None and not comment_text:
         return _need("fields", "Что изменить в блоке времени?")
 
     try:
@@ -545,6 +1028,7 @@ def timeblock_move(payload: dict[str, Any]) -> HandlerResult:
                 start_at=(str(start_at) if start_at is not None else None),
                 end_at=(str(end_at) if end_at is not None else None),
                 task_id=(int(task_id) if task_id is not None else None),
+                comment=(comment_text or None),
             )
         return _ok("Готово. Обновил блок времени.", time_block_id=int(tb_id))
     except Exception as exc:
@@ -934,12 +1418,18 @@ INTENT_HANDLERS: dict[str, HandlerFn] = {
     "task.move": task_move,
     "task.set_status": task_set_status,
     "task.reschedule": task_reschedule,
+    "task.parent.update": task_parent_update,
     "task.move_to": task_move_to,
     "task.update": task_update,
     "subtask.create": subtask_create,
     "subtask.complete": subtask_complete,
+    "meeting.create": meeting_create,
+    "meeting.update": meeting_update,
+    "meeting.comment.update": meeting_comment_update,
+    "task.comment.update": task_comment_update,
     "timeblock.create": timeblock_create,
     "timeblock.move": timeblock_move,
+    "timeblock.update": timeblock_move,
     "timeblock.delete": timeblock_delete,
     "reg.run": reg_run,
     "reg.status": reg_status,
@@ -993,7 +1483,73 @@ def dispatch_intent(cmd: dict[str, Any]) -> HandlerResult:
             choices=_intent_allowlist_choices(),
             debug={"reason": "unknown_intent", "intent": intent_norm},
         )
+    payload = normalize_temporal_fields(payload, now=datetime.now()) if isinstance(payload, dict) else payload
     entities = _entities(payload)
+    if intent_norm == "task.create":
+        for field in ("planned_at", "due_date", "date", "when"):
+            raw_value = str(
+                entities.get(field)
+                or payload.get(field)
+                or entities.get(f"__raw_{field}")
+                or payload.get(f"__raw_{field}")
+                or ""
+            ).strip()
+            if not raw_value:
+                continue
+            resolution = resolve_date_phrase(raw_value, now=datetime.now())
+            if resolution.ok:
+                break
+            if resolution.needs_clarification:
+                return {
+                    "ok": False,
+                    "outcome": "needs_clarification",
+                    "needs_clarification": True,
+                    "missing_field": "task_create_due_date",
+                    "clarifying_question": "На какую дату поставить задачу?",
+                    "user_message": "На какую дату поставить задачу?",
+                    "debug": {"date_resolution_reason": resolution.reason or "unresolved_date_phrase", "field": field},
+                }
+    if intent_norm in {"timeblock.create", "meeting.create"}:
+        LOG.info(
+            "runtime_temporal_validation_probe",
+            extra={
+                "incoming_intent": str(intent or ""),
+                "incoming_start_at": str(entities.get("start_at") or ""),
+                "incoming_start_at_date": str(entities.get("start_at_date") or entities.get("date") or ""),
+                "incoming_start_time": str(entities.get("start_at_time") or entities.get("start_time") or ""),
+                "incoming_duration_minutes": str(entities.get("duration_minutes") or entities.get("duration_min") or ""),
+            },
+        )
+        # Contract assert (ML CONTRACT v2.2): start_at must be explicitly provided.
+        start_at = _normalized_datetime_value(entities.get("start_at"))
+        if not start_at:
+            LOG.info(
+                "runtime_temporal_validation_result",
+                extra={
+                    "incoming_intent": str(intent or ""),
+                    "validation_result": "missing",
+                    "missing_fields": "entities.start_at",
+                },
+            )
+            return build_clarification(
+                question=(
+                    "На какое время запланировать встречу?"
+                    if intent_norm == "meeting.create"
+                    else "На какое время поставить блок?"
+                ),
+                debug={
+                    "missing": "entities.start_at",
+                    "contract": "ML CONTRACT v2.2",
+                    "intent": "meeting_create" if intent_norm == "meeting.create" else "timeblock_create",
+                },
+            )
+    if intent_norm == "meeting.create":
+        duration_missing = (
+            entities.get("duration_minutes") is None
+            and entities.get("duration_min") is None
+        )
+        if duration_missing:
+            entities["duration_minutes"] = int(DEFAULT_MEETING_DURATION_MINUTES)
     confidence = _read_confidence(cmd, payload)
     rejected = _is_rejected(cmd, payload)
 
@@ -1011,6 +1567,21 @@ def dispatch_intent(cmd: dict[str, Any]) -> HandlerResult:
 
     # Canon v2: centralized required-field validation and one-question clarification.
     missing = canon.validate_required(intent_norm, entities)
+    if intent_norm == "timeblock.create" and missing:
+        missing = [
+            item
+            for item in missing
+            if str(item).strip() not in {"entities.task_id|entities.task_ref", "entities.task_ref|entities.task_id"}
+        ]
+    if intent_norm in {"timeblock.create", "meeting.create"}:
+        LOG.info(
+            "runtime_temporal_validation_result",
+            extra={
+                "incoming_intent": str(intent or ""),
+                "validation_result": ("missing" if missing else "ok"),
+                "missing_fields": ",".join(str(x) for x in missing),
+            },
+        )
     if missing:
         question = canon.build_one_question(intent_norm, entities) or "Нужны уточнения."
         return build_clarification(question=question, debug={"missing": missing})

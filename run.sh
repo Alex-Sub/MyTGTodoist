@@ -2,9 +2,36 @@
 set -euo pipefail
 
 PROJECT_NAME="${PROJECT_NAME:-deploy}"
-ENV_FILE="${ENV_FILE:-.env.prod}"
+ENV_FILE="${ENV_FILE:-deploy/tenants/.env.alexey}"
 COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.vps.override.yml)
 EXPECTED_DATA_VOLUME="${EXPECTED_DATA_VOLUME:-${PROJECT_NAME}_db_data}"
+
+check_env_file_ready() {
+  local path="$1"
+  echo "[INFO] Using env file: $path"
+  if [[ ! -f "$path" ]]; then
+    echo "[FAIL] Env file is missing: $path" >&2
+    exit 1
+  fi
+
+  local key line value
+  for key in TELEGRAM_BOT_TOKEN GOOGLE_CALENDAR_ID; do
+    line="$(grep -E "^[[:space:]]*${key}=" "$path" | head -n 1 || true)"
+    if [[ -z "$line" ]]; then
+      echo "[FAIL] ${key} is missing in $path" >&2
+      exit 1
+    fi
+    value="${line#*=}"
+    value="${value//$'\r'/}"
+    value="${value//[[:space:]]/}"
+    if [[ -z "$value" ]]; then
+      echo "[FAIL] ${key} is empty in $path" >&2
+      exit 1
+    fi
+    echo "[OK] ${key} is set in $path"
+  done
+  echo "[OK] env file exists: $path"
+}
 
 compose() {
   docker compose -p "${PROJECT_NAME}" --env-file "${ENV_FILE}" "${COMPOSE_FILES[@]}" "$@"
@@ -69,14 +96,17 @@ USAGE
 cmd="${1:-}"
 case "${cmd}" in
   up)
+    check_env_file_ready "${ENV_FILE}"
     check_no_duplicate_stacks
     compose up -d --build
     health_check_single_worker
     ;;
   ps)
+    check_env_file_ready "${ENV_FILE}"
     compose ps
     ;;
   logs)
+    check_env_file_ready "${ENV_FILE}"
     compose logs --tail=200 organizer-worker telegram-bot organizer-api
     ;;
   health)
@@ -87,4 +117,3 @@ case "${cmd}" in
     exit 1
     ;;
 esac
-

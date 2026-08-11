@@ -121,11 +121,158 @@ def test_voice_timeblock_create_with_duration_only_asks_time_not_inbox(runtime_d
     )
     assert res["ok"] is False
     assert res.get("clarifying_question") == "На какое время поставить блок?"
+    assert res.get("debug", {}).get("contract") == "ML CONTRACT v2.2"
 
     with sqlite3.connect(str(runtime_db)) as conn:
         cnt = conn.execute("SELECT COUNT(*) FROM time_blocks WHERE task_id = ?", (task_id,)).fetchone()
     assert cnt is not None
     assert int(cnt[0]) == 0
+
+
+def test_timeblock_create_with_start_and_duration_executes(runtime_db: Path) -> None:
+    created = handlers.dispatch_intent({"intent": "task.create", "entities": {"title": "Контрактный блок"}})
+    assert created["ok"] is True
+    task_id = int(created["debug"]["task_id"])
+
+    res = handlers.dispatch_intent(
+        {
+            "intent": "timeblock.create",
+            "entities": {
+                "task_id": task_id,
+                "start_at": "2026-02-18T10:00:00Z",
+                "duration_minutes": 45,
+            },
+        }
+    )
+    assert res["ok"] is True
+    tb_id = int(res["debug"]["time_block_id"])
+
+    with sqlite3.connect(str(runtime_db)) as conn:
+        row = conn.execute(
+            "SELECT task_id, start_at, end_at FROM time_blocks WHERE id = ?",
+            (tb_id,),
+        ).fetchone()
+    assert row is not None
+    assert int(row[0]) == task_id
+    assert str(row[1]).startswith("2026-02-18T10:00:00")
+    assert str(row[2]).startswith("2026-02-18T10:45:00")
+
+
+def test_meeting_create_with_start_and_duration_does_not_require_task(runtime_db: Path) -> None:
+    res = handlers.dispatch_intent(
+        {
+            "intent": "meeting.create",
+            "entities": {
+                "user_id": "u-1001",
+                "start_at": "2026-02-18T10:00:00Z",
+                "duration_minutes": 45,
+            },
+        }
+    )
+    assert res["ok"] is True
+    assert str(res.get("user_message") or "").strip() == "Встреча создана."
+    assert str(res.get("debug", {}).get("user_id") or "") == "u-1001"
+
+
+def test_meeting_create_without_duration_uses_default_30(runtime_db: Path) -> None:
+    res = handlers.dispatch_intent(
+        {
+            "intent": "meeting.create",
+            "entities": {
+                "user_id": "u-1001",
+                "start_at": "2026-02-18T10:00:00Z",
+            },
+        }
+    )
+    assert res["ok"] is True
+    assert int(res.get("debug", {}).get("duration_minutes") or 0) == 30
+
+
+def test_meeting_update_accepts_partial_temporal_change(runtime_db: Path) -> None:
+    res = handlers.dispatch_intent(
+        {
+            "intent": "meeting.update",
+            "entities": {
+                "user_id": "u-1001",
+                "start_at_time": "16:00",
+            },
+        }
+    )
+    assert res["ok"] is True
+    message = str(res.get("user_message") or "").strip().lower()
+    assert "встреча" in message
+    assert ("обнов" in message) or ("перенес" in message)
+
+
+def test_timeblock_create_allows_creation_without_task_linkage(runtime_db: Path) -> None:
+    res = handlers.dispatch_intent(
+        {
+            "intent": "timeblock.create",
+            "entities": {
+                "user_id": "u-1002",
+                "start_at": "2026-02-18T10:00:00Z",
+                "duration_minutes": 30,
+            },
+        }
+    )
+    assert res["ok"] is True
+    tb_id = int(res["debug"]["time_block_id"])
+    task_id = int(res["debug"]["task_id"])
+    with sqlite3.connect(str(runtime_db)) as conn:
+        row = conn.execute(
+            "SELECT task_id, start_at, end_at FROM time_blocks WHERE id = ?",
+            (tb_id,),
+        ).fetchone()
+        task_row = conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert row is not None
+    assert int(row[0]) == task_id
+    assert str(row[1]).startswith("2026-02-18T10:00:00")
+    assert str(row[2]).startswith("2026-02-18T10:30:00")
+    assert task_row is not None
+    assert str(task_row[0]) == "Блок времени"
+
+
+def test_timeblock_create_with_optional_unmatched_task_ref_creates_unlinked_block(runtime_db: Path) -> None:
+    res = handlers.dispatch_intent(
+        {
+            "intent": "timeblock.create",
+            "entities": {
+                "user_id": "u-1003",
+                "start_at": "2026-02-18T12:00:00Z",
+                "duration_minutes": 30,
+                "task_ref": "несуществующая задача",
+                "task_ref_optional": True,
+                "comment_text": "купить молоко",
+            },
+        }
+    )
+    assert res["ok"] is True
+    tb_id = int(res["debug"]["time_block_id"])
+    task_id = int(res["debug"]["task_id"])
+    with sqlite3.connect(str(runtime_db)) as conn:
+        row = conn.execute("SELECT task_id, comment FROM time_blocks WHERE id = ?", (tb_id,)).fetchone()
+        task_row = conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert row is not None
+    assert int(row[0]) == task_id
+    assert str(row[1]) == "купить молоко"
+    assert task_row is not None
+    assert str(task_row[0]) == "купить молоко"
+
+
+def test_timeblock_create_with_explicit_unmatched_task_ref_still_returns_not_found(runtime_db: Path) -> None:
+    res = handlers.dispatch_intent(
+        {
+            "intent": "timeblock.create",
+            "entities": {
+                "user_id": "u-1004",
+                "start_at": "2026-02-18T13:00:00Z",
+                "duration_minutes": 30,
+                "task_ref": "несуществующая задача",
+            },
+        }
+    )
+    assert res["ok"] is False
+    assert str(res.get("user_message") or "").strip() == "Не нашел подходящую задачу."
 
 
 def test_timeblock_move_empty_datetimes_returns_clarification_no_changes(runtime_db: Path) -> None:
@@ -162,6 +309,46 @@ def test_timeblock_move_empty_datetimes_returns_clarification_no_changes(runtime
         after = conn.execute("SELECT start_at, end_at FROM time_blocks WHERE id = ?", (tb_id,)).fetchone()
     assert after is not None
     assert tuple(after) == tuple(before)
+
+
+def test_timeblock_update_alias_updates_existing_block(runtime_db: Path) -> None:
+    t = handlers.dispatch_intent({"intent": "task.create", "entities": {"title": "ТБ задача alias update"}})
+    assert t["ok"] is True
+    task_id = int(t["debug"]["task_id"])
+    create_tb = handlers.dispatch_intent(
+        {
+            "intent": "timeblock.create",
+            "entities": {
+                "task_id": task_id,
+                "start_at": "2026-02-18T10:00:00Z",
+                "duration_min": 30,
+                "comment_text": "старый комментарий",
+            },
+        }
+    )
+    assert create_tb["ok"] is True
+    tb_id = int(create_tb["debug"]["time_block_id"])
+
+    res = handlers.dispatch_intent(
+        {
+            "intent": "timeblock.update",
+            "entities": {
+                "time_block_id": tb_id,
+                "start_at": "2026-02-18T11:00:00Z",
+                "end_at": "2026-02-18T11:45:00Z",
+                "comment_text": "новый комментарий",
+            },
+        }
+    )
+    assert res["ok"] is True
+    assert int(res["debug"]["time_block_id"]) == tb_id
+
+    with sqlite3.connect(str(runtime_db)) as conn:
+        row = conn.execute("SELECT start_at, end_at, comment FROM time_blocks WHERE id = ?", (tb_id,)).fetchone()
+    assert row is not None
+    assert str(row[0]).startswith("2026-02-18T11:00:00")
+    assert str(row[1]).startswith("2026-02-18T11:45:00")
+    assert str(row[2] or "") == "новый комментарий"
 
 
 def test_task_ref_disambiguation_returns_candidates(runtime_db: Path) -> None:
@@ -297,3 +484,87 @@ def test_unknown_intent_returns_clarify_and_never_writes_db(runtime_db: Path) ->
 
     assert after_tasks == before_tasks
     assert after_blocks == before_blocks
+
+
+def _recreate_time_blocks_with_user_id_not_null(db_path: Path) -> None:
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("ALTER TABLE time_blocks RENAME TO time_blocks_old")
+        conn.execute(
+            """
+            CREATE TABLE time_blocks (
+                id INTEGER PRIMARY KEY,
+                task_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                start_at TEXT NOT NULL,
+                end_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES tasks(id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_time_blocks_task_id ON time_blocks(task_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_time_blocks_start_at ON time_blocks(start_at)")
+        conn.execute("DROP TABLE time_blocks_old")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.commit()
+
+
+def test_timeblock_create_with_user_id_column_uses_user_id(runtime_db: Path) -> None:
+    _recreate_time_blocks_with_user_id_not_null(runtime_db)
+
+    task = handlers.dispatch_intent({"intent": "task.create", "entities": {"title": "ТБ c user_id"}})
+    assert task["ok"] is True
+    task_id = int(task["debug"]["task_id"])
+
+    res = handlers.dispatch_intent(
+        {
+            "intent": "timeblock.create",
+            "entities": {
+                "task_id": task_id,
+                "user_id": "u-777",
+                "start_at": "2026-02-18T10:00:00Z",
+                "duration_minutes": 30,
+            },
+        }
+    )
+    assert res["ok"] is True
+    tb_id = int(res["debug"]["time_block_id"])
+
+    with sqlite3.connect(str(runtime_db)) as conn:
+        row = conn.execute(
+            "SELECT task_id, user_id, start_at, end_at FROM time_blocks WHERE id = ?",
+            (tb_id,),
+        ).fetchone()
+    assert row is not None
+    assert int(row[0]) == task_id
+    assert str(row[1]) == "u-777"
+    assert str(row[2]).startswith("2026-02-18T10:00:00")
+    assert str(row[3]).startswith("2026-02-18T10:30:00")
+
+
+def test_timeblock_create_with_user_id_column_missing_user_id_returns_meaningful_error(runtime_db: Path) -> None:
+    _recreate_time_blocks_with_user_id_not_null(runtime_db)
+
+    task = handlers.dispatch_intent({"intent": "task.create", "entities": {"title": "ТБ без user_id"}})
+    assert task["ok"] is True
+    task_id = int(task["debug"]["task_id"])
+
+    res = handlers.dispatch_intent(
+        {
+            "intent": "timeblock.create",
+            "entities": {
+                "task_id": task_id,
+                "start_at": "2026-02-18T10:00:00Z",
+                "duration_minutes": 30,
+            },
+        }
+    )
+    assert res["ok"] is False
+    assert "не найден пользователь" in str(res.get("user_message") or "").lower()
+    assert str(res.get("debug", {}).get("reason") or "") == "missing_user_id"
+
+    with sqlite3.connect(str(runtime_db)) as conn:
+        cnt = conn.execute("SELECT COUNT(*) FROM time_blocks").fetchone()
+    assert cnt is not None
+    assert int(cnt[0]) == 0

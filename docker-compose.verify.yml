@@ -1,5 +1,11 @@
 services:
   organizer-worker:
+    # NOTE: Docker log rotation enabled to prevent disk overflow on VPS
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - ./migrations:/app/migrations:ro
       - ./organizer-worker/worker.py:/app/worker.py:ro
@@ -67,3 +73,8 @@ services:
       timeout: 3s
       retries: 5
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

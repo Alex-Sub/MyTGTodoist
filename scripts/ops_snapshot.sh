@@ -5,10 +5,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 PROJECT_NAME="${PROJECT_NAME:-deploy}"
-COMPOSE_FILE="${COMPOSE_FILE:-${ROOT_DIR}/deploy/docker-compose.prod.yml}"
+COMPOSE_FILE="${COMPOSE_FILE:-${ROOT_DIR}/docker-compose.yml}"
+COMPOSE_FILE_OVERRIDE="${COMPOSE_FILE_OVERRIDE:-${ROOT_DIR}/docker-compose.vps.override.yml}"
 ENV_FILE="${ENV_FILE:-${ROOT_DIR}/.env.prod}"
 LOG_TAIL="${LOG_TAIL:-120}"
 REQUIRED_BRANCH="${REQUIRED_BRANCH:-runtime-stable}"
+
+compose_args=(-p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}")
+if [ -n "${COMPOSE_FILE_OVERRIDE}" ] && [ -f "${COMPOSE_FILE_OVERRIDE}" ]; then
+  compose_args=(-p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" -f "${COMPOSE_FILE_OVERRIDE}" --env-file "${ENV_FILE}")
+fi
 
 if command -v git >/dev/null 2>&1 && git -C "${ROOT_DIR}" rev-parse --git-dir >/dev/null 2>&1; then
   current_branch="$(git -C "${ROOT_DIR}" rev-parse --abbrev-ref HEAD)"
@@ -38,6 +44,14 @@ if [ -f "${COMPOSE_FILE}" ]; then
 else
   echo "compose_file: missing (${COMPOSE_FILE})"
 fi
+if [ -n "${COMPOSE_FILE_OVERRIDE}" ]; then
+  if [ -f "${COMPOSE_FILE_OVERRIDE}" ]; then
+    echo "compose_override_file: ${COMPOSE_FILE_OVERRIDE}"
+    echo "compose_override_sha256: $(sha256sum "${COMPOSE_FILE_OVERRIDE}" | awk '{print $1}')"
+  else
+    echo "compose_override_file: missing (${COMPOSE_FILE_OVERRIDE})"
+  fi
+fi
 
 echo
 echo "--- ENV keys (.env.prod, values hidden) ---"
@@ -49,12 +63,12 @@ fi
 
 echo
 echo "--- docker compose ps ---"
-docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" ps
+docker compose "${compose_args[@]}" ps
 
 echo
 echo "--- recent logs: organizer-worker ---"
-docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" logs --tail="${LOG_TAIL}" organizer-worker
+docker compose "${compose_args[@]}" logs --tail="${LOG_TAIL}" organizer-worker
 
 echo
 echo "--- recent logs: telegram-bot ---"
-docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" logs --tail="${LOG_TAIL}" telegram-bot
+docker compose "${compose_args[@]}" logs --tail="${LOG_TAIL}" telegram-bot

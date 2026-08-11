@@ -1,29 +1,17 @@
 services:
-  google-sync:
-    environment:
-      TZ: ${TZ:-Europe/Moscow}
-      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
-
-  organizer-api:
-    environment:
-      DB_PATH: ${DB_PATH:-/data/organizer.db}
-      TZ: ${TZ:-Europe/Moscow}
-      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
-
-  organizer-worker:
-    environment:
-      DB_PATH: ${DB_PATH:-/data/organizer.db}
-      TZ: ${TZ:-Europe/Moscow}
-      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
-
   telegram-bot:
+    # NOTE: Docker log rotation enabled to prevent disk overflow on VPS
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Primary production override: keep telegram adapter on canonical direct runtime path.
     environment:
-      DB_PATH: ${DB_PATH:-/data/organizer.db}
-      TZ: ${TZ:-Europe/Moscow}
-      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
-      ML_GATEWAY_URL: ${ML_GATEWAY_URL:-http://host.docker.internal:19000}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
-volumes:
-  db_data:
+      TELEGRAM_ADAPTER_MODE: "runtime_core_direct"
+      DIRECT_VOICE_ENABLED: "true"
+      DIRECT_ASR_TIMEOUT_SEC: ${DIRECT_ASR_TIMEOUT_SEC:-45}
+      DIRECT_ASR_RETRIES: ${DIRECT_ASR_RETRIES:-1}
+      WORKER_COMMAND_URL: "http://organizer-worker:8002/runtime/command"
+      TELEGRAM_POLL_TIMEOUT_SEC: "25"
+      TELEGRAM_HTTP_TIMEOUT_SEC: "40"

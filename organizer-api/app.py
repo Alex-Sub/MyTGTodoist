@@ -3,6 +3,7 @@ import io
 import os
 import sqlite3
 import zipfile
+from contextlib import closing
 from datetime import date, datetime, timezone, timedelta
 from typing import Any
 
@@ -12,6 +13,9 @@ from fastapi.responses import Response
 DB_PATH = os.getenv("DB_PATH", "/data/organizer.db")
 P7_MODE = (os.getenv("P7_MODE", "off") or "off").strip().lower()
 LOCAL_TZ_OFFSET_MIN = int(os.getenv("LOCAL_TZ_OFFSET_MIN", "180"))
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_CALENDAR_API = "https://www.googleapis.com/calendar/v3"
+GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar"
 
 app = FastAPI()
 
@@ -23,8 +27,15 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
+def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(str(row["name"] if isinstance(row, sqlite3.Row) else row[1]) == column for row in rows)
+
+
 def _normalize_status(status: str | None) -> str | None:
     if not status:
+        return None
+    if not isinstance(status, str):
         return None
     s = status.strip().upper()
     if s == "INBOX" or s == "TODO":
@@ -73,6 +84,78 @@ TASK_COLUMNS = [
     "updated_at",
     "completed_at",
 ]
+
+
+def _task_select_sql(conn: sqlite3.Connection) -> str:
+    parent_task_col = "parent_task_id" if _table_has_column(conn, "tasks", "parent_task_id") else "NULL AS parent_task_id"
+    return f"""
+        SELECT id, title, status, state, planned_at, calendar_event_id, source_msg_id,
+               parent_type, parent_id, {parent_task_col},
+               created_at, updated_at, completed_at
+        FROM tasks
+    """
+
+
+def _enrich_task_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    has_parent_task_id = _table_has_column(conn, "tasks", "parent_task_id")
+    parent_cache: dict[int, tuple[int | None, str | None]] = {}
+
+    def _safe_int(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def _parent_info(task_id: int) -> tuple[int | None, str | None]:
+        if task_id in parent_cache:
+            return parent_cache[task_id]
+        if has_parent_task_id:
+            row = conn.execute(
+                """
+                SELECT t.parent_task_id, p.title AS parent_title
+                FROM tasks t
+                LEFT JOIN tasks p ON p.id = t.parent_task_id
+                WHERE t.id = ?
+                """,
+                (int(task_id),),
+            ).fetchone()
+            if row is not None:
+                parent_cache[task_id] = (_safe_int(row["parent_task_id"]), str(row["parent_title"] or "").strip() or None)
+                return parent_cache[task_id]
+        row = conn.execute("SELECT parent_type, parent_id FROM tasks WHERE id = ?", (int(task_id),)).fetchone()
+        if row is None:
+            parent_cache[task_id] = (None, None)
+            return parent_cache[task_id]
+        parent_type = str(row["parent_type"] or "").strip().lower()
+        parent_cache[task_id] = (_safe_int(row["parent_id"]) if parent_type == "task" else None, None)
+        return parent_cache[task_id]
+
+    out: list[dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        task_id = _safe_int(row.get("id"))
+        parent_task_id = _safe_int(row.get("parent_task_id"))
+        parent_title: str | None = None
+        if task_id is not None:
+            stored_parent_task_id, stored_parent_title = _parent_info(task_id)
+            if parent_task_id is None:
+                parent_task_id = stored_parent_task_id
+            parent_title = stored_parent_title
+        depth = 1
+        seen: set[int] = set()
+        cur_id = parent_task_id
+        while cur_id is not None and cur_id not in seen and depth < 8:
+            seen.add(cur_id)
+            depth += 1
+            cur_id, _ = _parent_info(cur_id)
+        row["parent_task_id"] = parent_task_id
+        row["parent_title"] = parent_title
+        row["level"] = depth
+        row["depth"] = depth
+        out.append(row)
+    return out
 
 SUBTASK_COLUMNS = [
     "id",
@@ -186,6 +269,189 @@ def _export_zip(payloads: dict[str, str]) -> bytes:
     return out.getvalue()
 
 
+def _google_calendar_id() -> str:
+    return str(
+        os.getenv("GOOGLE_CALENDAR_ID")
+        or os.getenv("GOOGLE_CALENDAR_ID_DEFAULT")
+        or "primary"
+    ).strip() or "primary"
+
+
+def _google_probe_payload() -> dict[str, Any]:
+    start = datetime.now(timezone.utc) + timedelta(minutes=3)
+    end = start + timedelta(minutes=5)
+    marker = os.urandom(5).hex()
+    return {
+        "summary": f"[health-probe] TGTodoist {marker}",
+        "description": "auto health probe; event should be cancelled immediately",
+        "start": {"dateTime": start.replace(microsecond=0).isoformat().replace("+00:00", "Z")},
+        "end": {"dateTime": end.replace(microsecond=0).isoformat().replace("+00:00", "Z")},
+    }
+
+
+def _google_http_post_form(url: str, data: dict[str, Any]) -> dict[str, Any]:
+    import httpx
+
+    with httpx.Client(timeout=10.0) as client:
+        response = client.post(url, data=data)
+        response.raise_for_status()
+        return response.json()
+
+
+def _google_api_request(method: str, url: str, access_token: str, json_body: dict[str, Any] | None = None) -> dict[str, Any]:
+    import httpx
+
+    with httpx.Client(timeout=10.0) as client:
+        response = client.request(
+            method=method,
+            url=url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+            },
+            json=json_body,
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+def _service_account_access_token() -> str | None:
+    sa_path = str(os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "") or "").strip()
+    if not sa_path or not os.path.exists(sa_path):
+        return None
+
+    from google.auth.transport.requests import Request
+    from google.oauth2 import service_account
+
+    credentials = service_account.Credentials.from_service_account_file(
+        sa_path,
+        scopes=[GOOGLE_CALENDAR_SCOPE],
+    )
+    credentials.refresh(Request())
+    token = str(credentials.token or "").strip()
+    return token or None
+
+
+def _read_google_oauth_token_row() -> sqlite3.Row | None:
+    with closing(_get_conn()) as conn:
+        return conn.execute(
+            """
+            SELECT access_token, refresh_token, expiry_ts
+            FROM oauth_tokens
+            WHERE provider = 'google'
+            LIMIT 1
+            """
+        ).fetchone()
+
+
+def _refresh_google_access_token(refresh_token: str) -> str:
+    client_id = str(os.getenv("GOOGLE_CLIENT_ID", "") or "").strip()
+    client_secret = str(os.getenv("GOOGLE_CLIENT_SECRET", "") or "").strip()
+    if not client_id or not client_secret:
+        raise RuntimeError("google_oauth_refresh_not_configured")
+    payload = _google_http_post_form(
+        GOOGLE_TOKEN_URL,
+        {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        },
+    )
+    token = str(payload.get("access_token") or "").strip()
+    if not token:
+        raise RuntimeError("google_oauth_refresh_missing_access_token")
+    return token
+
+
+def _google_access_token() -> str:
+    try:
+        row = _read_google_oauth_token_row()
+    except sqlite3.Error:
+        row = None
+    if row:
+        access_token = str(row["access_token"] or "").strip()
+        refresh_token = str(row["refresh_token"] or "").strip()
+        expiry_ts = int(row["expiry_ts"] or 0)
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        if access_token and expiry_ts > now_ts + 30:
+            return access_token
+        if refresh_token:
+            return _refresh_google_access_token(refresh_token)
+
+    service_account_token = _service_account_access_token()
+    if service_account_token:
+        return service_account_token
+    raise RuntimeError("google_access_token_unavailable")
+
+
+def _google_calendar_write_health() -> dict[str, Any]:
+    calendar_id = _google_calendar_id()
+    access_token = _google_access_token()
+    probe_event_id = ""
+    err = ""
+    calendar_write = "down"
+
+    try:
+        created = _google_api_request(
+            "POST",
+            f"{GOOGLE_CALENDAR_API}/calendars/{calendar_id}/events",
+            access_token,
+            json_body=_google_probe_payload(),
+        )
+        probe_event_id = str(created.get("id") or created.get("event_id") or "").strip()
+        if not probe_event_id:
+            raise RuntimeError("calendar_probe_missing_event_id")
+        _google_api_request(
+            "PATCH",
+            f"{GOOGLE_CALENDAR_API}/calendars/{calendar_id}/events/{probe_event_id}",
+            access_token,
+            json_body={"status": "cancelled"},
+        )
+        calendar_write = "ok"
+    except Exception as exc:
+        err = f"{type(exc).__name__}:{str(exc)[:200]}"
+
+    out: dict[str, Any] = {
+        "status": "ok" if calendar_write == "ok" else "down",
+        "services": {"calendar_write": calendar_write},
+        "calendar_write": calendar_write,
+        "calendar_id": calendar_id,
+    }
+    if probe_event_id:
+        out["probe_event_id"] = probe_event_id
+    if err:
+        out["error"] = err
+    return out
+
+
+def _list_open_sync_conflicts(*, limit: int = 20) -> list[dict[str, Any]]:
+    safe_limit = max(1, min(int(limit), 100))
+    with _get_conn() as conn:
+        exists = conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'sync_conflicts'
+            LIMIT 1
+            """
+        ).fetchone()
+        if not exists:
+            return []
+
+        rows = conn.execute(
+            """
+            SELECT id, item_id, db_payload_json, sheet_payload_json, calendar_payload_json, created_at
+            FROM sync_conflicts
+            WHERE status = 'open'
+            ORDER BY created_at ASC, id ASC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def _detect_overload(conn: sqlite3.Connection) -> bool:
     unplanned = conn.execute(
         """
@@ -277,6 +543,17 @@ def health() -> dict[str, Any]:
     return {"ok": True}
 
 
+@app.get("/google/health")
+def google_health() -> dict[str, Any]:
+    return _google_calendar_write_health()
+
+
+@app.get("/sync/conflicts")
+def get_sync_conflicts(limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
+    items = _list_open_sync_conflicts(limit=limit)
+    return {"ok": True, "items": items, "count": len(items)}
+
+
 @app.get("/p2/state")
 def get_p2_state(
     user_id: str | None = Query(default=None),
@@ -335,44 +612,28 @@ def list_tasks(
     source_msg_id: str | None = Query(default=None),
 ) -> list[dict[str, Any]]:
     status_norm = _normalize_status(status)
+    source_msg_id_norm = source_msg_id.strip() if isinstance(source_msg_id, str) and source_msg_id.strip() else None
     with _get_conn() as conn:
         where = []
         params: list[Any] = []
         if status_norm:
             where.append("status = ?")
             params.append(status_norm)
-        if source_msg_id:
+        if source_msg_id_norm:
             where.append("source_msg_id = ?")
-            params.append(source_msg_id)
+            params.append(source_msg_id_norm)
         where_sql = " WHERE " + " AND ".join(where) if where else ""
-        rows = conn.execute(
-            f"""
-            SELECT id, title, status, state, planned_at, calendar_event_id, source_msg_id,
-                   parent_type, parent_id,
-                   created_at, updated_at, completed_at
-            FROM tasks
-            {where_sql}
-            ORDER BY id ASC
-            """,
-            params,
-        ).fetchall()
-    return [dict(r) for r in rows]
+        rows = conn.execute(f"{_task_select_sql(conn)} {where_sql} ORDER BY id ASC", params).fetchall()
+        result = _enrich_task_rows(conn, [dict(r) for r in rows])
+    return result
 
 
 @app.get("/p2/tasks/{task_id}")
 def get_task(task_id: int) -> dict[str, Any]:
     with _get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT id, title, status, state, planned_at, calendar_event_id, source_msg_id,
-                   parent_type, parent_id,
-                   created_at, updated_at, completed_at
-            FROM tasks
-            WHERE id = ?
-            """,
-            (int(task_id),),
-        ).fetchone()
-    data = _row_dict(row)
+        row = conn.execute(f"{_task_select_sql(conn)} WHERE id = ?", (int(task_id),)).fetchone()
+        rows = _enrich_task_rows(conn, [dict(row)]) if row is not None else []
+    data = rows[0] if rows else {}
     if not data:
         raise HTTPException(status_code=404, detail="task not found")
     return data
@@ -480,17 +741,11 @@ def get_project(project_id: int) -> dict[str, Any]:
 def list_project_tasks(project_id: int) -> list[dict[str, Any]]:
     with _get_conn() as conn:
         rows = conn.execute(
-            """
-            SELECT id, title, status, state, planned_at, calendar_event_id, source_msg_id,
-                   parent_type, parent_id,
-                   created_at, updated_at, completed_at
-            FROM tasks
-            WHERE parent_type = 'project' AND parent_id = ?
-            ORDER BY id ASC
-            """,
+            f"{_task_select_sql(conn)} WHERE parent_type = 'project' AND parent_id = ? ORDER BY id ASC",
             (int(project_id),),
         ).fetchall()
-    return [dict(r) for r in rows]
+        result = _enrich_task_rows(conn, [dict(r) for r in rows])
+    return result
 
 
 @app.get("/p2/cycles")
@@ -544,17 +799,11 @@ def list_cycle_outcomes(cycle_id: int) -> list[dict[str, Any]]:
 def list_cycle_tasks(cycle_id: int) -> list[dict[str, Any]]:
     with _get_conn() as conn:
         rows = conn.execute(
-            """
-            SELECT id, title, status, state, planned_at, calendar_event_id, source_msg_id,
-                   parent_type, parent_id,
-                   created_at, updated_at, completed_at
-            FROM tasks
-            WHERE parent_type = 'cycle' AND parent_id = ?
-            ORDER BY id ASC
-            """,
+            f"{_task_select_sql(conn)} WHERE parent_type = 'cycle' AND parent_id = ? ORDER BY id ASC",
             (int(cycle_id),),
         ).fetchall()
-    return [dict(r) for r in rows]
+        result = _enrich_task_rows(conn, [dict(r) for r in rows])
+    return result
 
 
 @app.get("/p2/cycles/{cycle_id}/previous_goals")
@@ -756,9 +1005,11 @@ def get_p7_day(
         raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
     start_utc, end_utc = _local_day_bounds_utc(day)
     with _get_conn() as conn:
+        has_comment = _table_has_column(conn, "time_blocks", "comment")
+        select_comment = ", comment" if has_comment else ", '' AS comment"
         rows = conn.execute(
-            """
-            SELECT id, task_id, start_at, end_at, created_at
+            f"""
+            SELECT id, task_id, start_at, end_at, created_at{select_comment}
             FROM time_blocks
             WHERE start_at < ? AND end_at > ?
             ORDER BY start_at ASC, id ASC

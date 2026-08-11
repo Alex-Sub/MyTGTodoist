@@ -25,3 +25,4 @@ Execution order is lexical by filename.
 - `029_goal_reschedule_events.sql` - History of goal deadline changes.
 - `030_nudge_ack.sql` - User acknowledgements for strategic nudges.
 - `031_tasks_goal_id.sql` - Adds `tasks.goal_id` link to goals.
+- `032_tasks_parent_task_id.sql` - Adds `tasks.parent_task_id` for active runtime root/subtask hierarchy.

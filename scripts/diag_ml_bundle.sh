@@ -37,12 +37,12 @@ run_capture "$BUNDLE_DIR/system/uname.txt" uname -a || true
 run_capture "$BUNDLE_DIR/system/uptime.txt" uptime || true
 
 if have_cmd curl; then
-  if curl -fsS "http://127.0.0.1:9000/health" >"$BUNDLE_DIR/health/gateway_health_9000.json" 2>"$BUNDLE_DIR/health/gateway_health_9000.err"; then
+  if curl -fsS "http://127.0.0.1:19000/health" >"$BUNDLE_DIR/health/gateway_health_19000.json" 2>"$BUNDLE_DIR/health/gateway_health_19000.err"; then
     status_gateway_health="OK"
   else
     status_gateway_health="FAIL"
   fi
-  if curl -fsS "http://127.0.0.1:9000/diag/upstreams" >"$BUNDLE_DIR/health/gateway_diag_upstreams_9000.json" 2>"$BUNDLE_DIR/health/gateway_diag_upstreams_9000.err"; then
+  if curl -fsS "http://127.0.0.1:19000/diag/upstreams" >"$BUNDLE_DIR/health/gateway_diag_upstreams_19000.json" 2>"$BUNDLE_DIR/health/gateway_diag_upstreams_19000.err"; then
     status_gateway_upstreams="OK"
   else
     status_gateway_upstreams="FAIL"
@@ -53,8 +53,8 @@ if have_cmd curl; then
     status_asr_health="FAIL"
   fi
 else
-  printf "SKIPPED: curl not installed\n" >"$BUNDLE_DIR/health/gateway_health_9000.err"
-  printf "SKIPPED: curl not installed\n" >"$BUNDLE_DIR/health/gateway_diag_upstreams_9000.err"
+  printf "SKIPPED: curl not installed\n" >"$BUNDLE_DIR/health/gateway_health_19000.err"
+  printf "SKIPPED: curl not installed\n" >"$BUNDLE_DIR/health/gateway_diag_upstreams_19000.err"
   printf "SKIPPED: curl not installed\n" >"$BUNDLE_DIR/health/asr_health_8020.err"
 fi
 
@@ -111,7 +111,7 @@ fi
 
 if [ -f "$TEST_WAV" ] && have_cmd curl; then
   curl -sS -X POST "http://127.0.0.1:8020/asr" -F "file=@$TEST_WAV" | head -c 500 >"$BUNDLE_DIR/probes/asr_direct_probe.txt" 2>"$BUNDLE_DIR/probes/asr_direct_probe.err" || true
-  curl -sS -X POST "http://127.0.0.1:9000/voice-command?profile=organizer" \
+  curl -sS -X POST "http://127.0.0.1:19000/voice-command?profile=organizer" \
     -H "X-Timezone: Europe/Amsterdam" \
     -F "file=@$TEST_WAV" | head -c 800 >"$BUNDLE_DIR/probes/gateway_voice_command_probe.txt" 2>"$BUNDLE_DIR/probes/gateway_voice_command_probe.err" || true
 else
@@ -123,7 +123,7 @@ hypothesis1="- Недостаточно фактов: проверьте health 
 hypothesis2="- Недостаточно фактов: проверьте логи gateway/asr."
 
 if [ "$status_gateway_health" = "FAIL" ]; then
-  hypothesis1="- Вероятный первичный сбой: ML-Gateway на 9000 не отвечает (/health FAIL)."
+  hypothesis1="- Вероятный первичный сбой: ML-Gateway на 19000 не отвечает (/health FAIL)."
 elif [ "$status_gateway_upstreams" = "FAIL" ]; then
   hypothesis1="- Вероятный первичный сбой: /diag/upstreams FAIL, upstream ASR/LLM неготов."
 elif [ "$status_asr_health" = "FAIL" ]; then
@@ -146,8 +146,8 @@ cat >"$SUMMARY_PATH" <<EOF
 - [x] Probe: gateway /voice-command
 
 ## Health status
-- Gateway 9000 /health: **$status_gateway_health**
-- Gateway 9000 /diag/upstreams: **$status_gateway_upstreams**
+- Gateway 19000 /health: **$status_gateway_health**
+- Gateway 19000 /diag/upstreams: **$status_gateway_upstreams**
 - ASR 8020 /health: **$status_asr_health**
 
 ## Likeliest breakage (fact-based)

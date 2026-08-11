@@ -20,3 +20,19 @@ CREATE TABLE IF NOT EXISTS inbox_queue (
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_inbox_queue_source_chat_update
 ON inbox_queue(source, tg_chat_id, tg_update_id);
+
+CREATE TABLE IF NOT EXISTS clarification_sessions (
+    user_id TEXT PRIMARY KEY,
+    intent TEXT,
+    payload_json TEXT,
+    missing_field TEXT,
+    created_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS command_dedup (
+    idempotency_key TEXT PRIMARY KEY,
+    intent TEXT NOT NULL,
+    entity_type TEXT,
+    entity_id TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

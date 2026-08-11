@@ -107,12 +107,12 @@ if run_capture "$BUNDLE_DIR/snapshots/telegram-bot_python_env_masked.txt" "${COM
 else
   status_exec_bot_env="FAIL"
 fi
-if run_capture "$BUNDLE_DIR/snapshots/telegram-bot_ml_timeouts.txt" "${COMPOSE_CMD[@]}" exec -T telegram-bot sh -lc "echo ML_CORE_URL=\$ML_CORE_URL; echo TG_LONGPOLL_SEC=\$TG_LONGPOLL_SEC; echo TG_HTTP_READ_TIMEOUT=\$TG_HTTP_READ_TIMEOUT"; then
+if run_capture "$BUNDLE_DIR/snapshots/telegram-bot_ml_timeouts.txt" "${COMPOSE_CMD[@]}" exec -T telegram-bot sh -lc "echo ML_GATEWAY_URL=\$ML_GATEWAY_URL; echo TG_LONGPOLL_SEC=\$TG_LONGPOLL_SEC; echo TG_HTTP_READ_TIMEOUT=\$TG_HTTP_READ_TIMEOUT"; then
   status_exec_bot_core="OK"
 else
   status_exec_bot_core="FAIL"
 fi
-if run_capture "$BUNDLE_DIR/snapshots/organizer-worker_ml_canon.txt" "${COMPOSE_CMD[@]}" exec -T organizer-worker sh -lc "echo ML_CORE_URL=\$ML_CORE_URL; ls -la /canon/intents_v2.yml"; then
+if run_capture "$BUNDLE_DIR/snapshots/organizer-worker_ml_canon.txt" "${COMPOSE_CMD[@]}" exec -T organizer-worker sh -lc "echo ML_GATEWAY_URL=\$ML_GATEWAY_URL; ls -la /canon/intents_v2.yml"; then
   status_exec_worker_core="OK"
 else
   status_exec_worker_core="FAIL"

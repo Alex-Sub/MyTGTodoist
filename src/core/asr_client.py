@@ -12,12 +12,12 @@ async def asr_transcribe(
     language: str = "ru",
 ) -> str:
     config = load_asr_config()
-    ml_core_url = config.ml_core_url
+    ml_gateway_url = config.ml_gateway_url
     asr_api_key = config.api_key
     timeout_raw = config.timeout_seconds
 
-    if not ml_core_url:
-        logger.error("ML gateway client is not configured (ML_CORE_URL is empty)")
+    if not ml_gateway_url:
+        logger.error("ML gateway client is not configured (ML_GATEWAY_URL is empty)")
         return ""
 
     try:
@@ -25,8 +25,8 @@ async def asr_transcribe(
     except ValueError:
         timeout = 180.0
 
-    request_url = f"{ml_core_url.rstrip('/')}/voice-command"
-    logger.info("ML gateway config url={} key_set={}", ml_core_url, bool(asr_api_key))
+    request_url = f"{ml_gateway_url.rstrip('/')}/voice-command"
+    logger.info("ML gateway config url={} key_set={}", ml_gateway_url, bool(asr_api_key))
     logger.info(
         "ML voice request: url={} timeout={} key_len={}",
         request_url,

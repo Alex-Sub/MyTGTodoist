@@ -150,6 +150,90 @@ class SheetsClient:
             resp.raise_for_status()
             return missing
 
+    def list_tabs(self, spreadsheet_id: str) -> list[dict[str, Any]]:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(
+                f"{GOOGLE_SHEETS_API}/{spreadsheet_id}",
+                headers=self._headers(),
+                params={"fields": "sheets.properties(sheetId,title)"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        out: list[dict[str, Any]] = []
+        for sheet in (data.get("sheets") or []):
+            props = sheet.get("properties") or {}
+            out.append(
+                {
+                    "sheetId": int(props.get("sheetId")),
+                    "title": str(props.get("title") or "").strip(),
+                }
+            )
+        return out
+
+    def rename_sheet(self, spreadsheet_id: str, *, sheet_id: int, new_title: str) -> None:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(
+                f"{GOOGLE_SHEETS_API}/{spreadsheet_id}:batchUpdate",
+                headers=self._headers(),
+                json={
+                    "requests": [
+                        {
+                            "updateSheetProperties": {
+                                "properties": {"sheetId": int(sheet_id), "title": str(new_title)},
+                                "fields": "title",
+                            }
+                        }
+                    ]
+                },
+            )
+            resp.raise_for_status()
+
+    def delete_sheet(self, spreadsheet_id: str, *, sheet_id: int) -> None:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(
+                f"{GOOGLE_SHEETS_API}/{spreadsheet_id}:batchUpdate",
+                headers=self._headers(),
+                json={
+                    "requests": [
+                        {
+                            "deleteSheet": {
+                                "sheetId": int(sheet_id),
+                            }
+                        }
+                    ]
+                },
+            )
+            resp.raise_for_status()
+
+    def delete_row(self, spreadsheet_id: str, *, sheet_name: str, row_number: int) -> None:
+        sheet_id = self._get_sheet_id(spreadsheet_id, sheet_name)
+        if sheet_id is None:
+            raise RuntimeError(f"sheet not found: {sheet_name}")
+        if int(row_number) <= 1:
+            raise RuntimeError("refusing to delete header row or invalid row number")
+        start_index = int(row_number) - 1
+        end_index = start_index + 1
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(
+                f"{GOOGLE_SHEETS_API}/{spreadsheet_id}:batchUpdate",
+                headers=self._headers(),
+                json={
+                    "requests": [
+                        {
+                            "deleteDimension": {
+                                "range": {
+                                    "sheetId": int(sheet_id),
+                                    "dimension": "ROWS",
+                                    "startIndex": start_index,
+                                    "endIndex": end_index,
+                                }
+                            }
+                        }
+                    ]
+                },
+            )
+            resp.raise_for_status()
+
     def clear_sheet(self, spreadsheet_id: str, sheet_name: str) -> None:
         target = quote(f"'{sheet_name}'", safe="!:'")
         with httpx.Client(timeout=15.0) as client:
@@ -183,11 +267,233 @@ class SheetsClient:
             values.append(list(row))
         target = quote(f"'{sheet_name}'!A1", safe="!:'")
         with httpx.Client(timeout=15.0) as client:
+            clear_target = quote(f"'{sheet_name}'!A:ZZ", safe="!:'")
+            clear_resp = client.post(
+                f"{GOOGLE_SHEETS_API}/{spreadsheet_id}/values/{clear_target}:clear",
+                headers=self._headers(),
+                json={},
+            )
+            clear_resp.raise_for_status()
             resp = client.put(
                 f"{GOOGLE_SHEETS_API}/{spreadsheet_id}/values/{target}",
                 headers=self._headers(),
                 params={"valueInputOption": value_input_option},
                 json={"range": f"'{sheet_name}'!A1", "majorDimension": "ROWS", "values": values},
+            )
+            resp.raise_for_status()
+
+    def append_rows(self, spreadsheet_id: str, a1_range: str, rows: list[list[Any]]) -> None:
+        if not rows:
+            return
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(
+                f"{GOOGLE_SHEETS_API}/{spreadsheet_id}/values/{quote(a1_range, safe='!:')}:append",
+                headers=self._headers(),
+                params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"},
+                json={"range": a1_range, "majorDimension": "ROWS", "values": rows},
+            )
+            resp.raise_for_status()
+
+    def apply_basic_tab_formatting(
+        self,
+        spreadsheet_id: str,
+        *,
+        sheet_name: str,
+        column_count: int,
+        freeze_rows: int = 1,
+        enable_filter: bool = True,
+        auto_resize: bool = True,
+        number_formats: list[dict[str, Any]] | None = None,
+    ) -> None:
+        sheet_id = self._get_sheet_id(spreadsheet_id, sheet_name)
+        if sheet_id is None:
+            return
+        safe_column_count = max(1, int(column_count))
+        requests: list[dict[str, Any]] = [
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": int(sheet_id),
+                        "gridProperties": {
+                            "frozenRowCount": max(0, int(freeze_rows)),
+                        },
+                    },
+                    "fields": "gridProperties.frozenRowCount",
+                }
+            }
+        ]
+        if enable_filter:
+            requests.append(
+                {
+                    "setBasicFilter": {
+                        "filter": {
+                            "range": {
+                                "sheetId": int(sheet_id),
+                                "startRowIndex": 0,
+                                "startColumnIndex": 0,
+                                "endColumnIndex": safe_column_count,
+                            }
+                        }
+                    }
+                }
+            )
+        if auto_resize:
+            requests.append(
+                {
+                    "autoResizeDimensions": {
+                        "dimensions": {
+                            "sheetId": int(sheet_id),
+                            "dimension": "COLUMNS",
+                            "startIndex": 0,
+                            "endIndex": safe_column_count,
+                        }
+                    }
+                }
+            )
+        for spec in list(number_formats or []):
+            start_index = int(spec.get("startIndex") or 0)
+            end_index = int(spec.get("endIndex") or (start_index + 1))
+            pattern = str(spec.get("pattern") or "").strip()
+            fmt_type = str(spec.get("type") or "").strip()
+            if not pattern or not fmt_type or end_index <= start_index:
+                continue
+            requests.append(
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": int(sheet_id),
+                            "startRowIndex": 1,
+                            "startColumnIndex": start_index,
+                            "endColumnIndex": end_index,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "numberFormat": {
+                                    "type": fmt_type,
+                                    "pattern": pattern,
+                                }
+                            }
+                        },
+                        "fields": "userEnteredFormat.numberFormat",
+                    }
+                }
+            )
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(
+                f"{GOOGLE_SHEETS_API}/{spreadsheet_id}:batchUpdate",
+                headers=self._headers(),
+                json={"requests": requests},
+            )
+            resp.raise_for_status()
+
+    def _get_sheet_id(self, spreadsheet_id: str, sheet_name: str) -> int | None:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(
+                f"{GOOGLE_SHEETS_API}/{spreadsheet_id}",
+                headers=self._headers(),
+                params={"fields": "sheets.properties(sheetId,title)"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        for sheet in (data.get("sheets") or []):
+            props = sheet.get("properties") or {}
+            if str(props.get("title") or "").strip() == sheet_name:
+                try:
+                    return int(props.get("sheetId"))
+                except Exception:
+                    return None
+        return None
+
+    def apply_datetime_format(
+        self,
+        spreadsheet_id: str,
+        *,
+        sheet_name: str,
+        date_col: int,
+        time_cols: list[int],
+        updated_col: int,
+        date_col_width_px: int = 90,
+    ) -> None:
+        sheet_id = self._get_sheet_id(spreadsheet_id, sheet_name)
+        if sheet_id is None:
+            return
+
+        requests: list[dict[str, Any]] = []
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "startColumnIndex": int(date_col),
+                        "endColumnIndex": int(date_col) + 1,
+                    },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "numberFormat": {"type": "DATE", "pattern": "dd.MM.yyyy"}
+                            }
+                        },
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            }
+        )
+        for col in time_cols:
+            requests.append(
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 1,
+                            "startColumnIndex": int(col),
+                            "endColumnIndex": int(col) + 1,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "numberFormat": {"type": "TIME", "pattern": "HH:mm"}
+                            }
+                        },
+                        "fields": "userEnteredFormat.numberFormat",
+                    }
+                }
+            )
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "startColumnIndex": int(updated_col),
+                        "endColumnIndex": int(updated_col) + 1,
+                    },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "numberFormat": {"type": "DATE_TIME", "pattern": "dd.MM.yyyy HH:mm"}
+                            }
+                        },
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            }
+        )
+        requests.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": int(date_col),
+                        "endIndex": int(date_col) + 1,
+                    },
+                    "properties": {"pixelSize": int(date_col_width_px)},
+                    "fields": "pixelSize",
+                }
+            }
+        )
+
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(
+                f"{GOOGLE_SHEETS_API}/{spreadsheet_id}:batchUpdate",
+                headers=self._headers(),
+                json={"requests": requests},
             )
             resp.raise_for_status()
 

@@ -4,10 +4,16 @@ import json
 import logging
 import os
 import re
-from datetime import date, datetime
+import hashlib
+import importlib.util
+import sys
+import types
+from datetime import date, datetime, timezone
 from dataclasses import replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo
+from common.date_resolver import extract_date_resolution, normalize_temporal_fields, resolve_date_phrase
 
 import requests
 
@@ -20,10 +26,6 @@ _BRIDGE_ERROR_REPLY = "Сервис обработки временно недо
 _MISSING_RUNTIME_RESULT_REPLY = USER_MSG_REC_EMPTY
 _SUCCESS_DEFAULT_REPLY = USER_MSG_SUCCESS
 _RUNTIME_ERROR_REPLY = USER_MSG_GENERIC_FALLBACK
-_DIRECT_VOICE_NOT_SUPPORTED_REPLY = (
-    "Голосовые сообщения в режиме runtime_core_direct пока не поддерживаются. "
-    "Отправьте команду текстом."
-)
 _VOICE_DOWNLOAD_FAILED_REPLY = (
     "Не удалось обработать аудио. Попробуй отправить голос ещё раз."
 )
@@ -52,6 +54,16 @@ _RU_MONTHS = {
     "ноябр": 11,
     "декабр": 12,
 }
+_TASK_CREATE_CONFIRM_FIELD = "task_create_confirm"
+_TASK_CREATE_DUPLICATE_CONFIRM_FIELD = "task_create_duplicate_confirm"
+
+
+def _safe_idempotency_key(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return digest[-8:]
 
 if TYPE_CHECKING:  # pragma: no cover
     from src.core.config import AppConfig
@@ -66,7 +78,20 @@ def build_runtime_core_direct_handler(
     rec_client: Any,
     local_db: Optional["LocalMainDb"] = None,
 ) -> BridgeHandler:
-    from src.app.runtime import handle_user_attempt_runtime
+    try:
+        from src.app.runtime import handle_user_attempt_runtime
+    except ModuleNotFoundError:
+        src_root = Path(__file__).resolve().parents[2]
+        src_pkg = types.ModuleType("src")
+        src_pkg.__path__ = [str(src_root)]  # type: ignore[attr-defined]
+        sys.modules["src"] = src_pkg
+        runtime_path = src_root / "app" / "runtime.py"
+        spec = importlib.util.spec_from_file_location("app_integration_runtime_module", runtime_path)
+        if spec is None or spec.loader is None:
+            raise
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        handle_user_attempt_runtime = module.handle_user_attempt_runtime
 
     def _handler(req: TelegramRuntimeRequest) -> Dict[str, Any]:
         metadata = dict(req.metadata or {})
@@ -85,11 +110,13 @@ def build_runtime_core_direct_handler(
             audio_mime=req.audio_mime,
             audio_filename=req.audio_filename,
             text=req.text,
+            metadata=metadata,
             local_db=local_db,
             source_chat_id=req.chat_id,
             source_message_id=req.source_message_id,
         )
 
+    setattr(_handler, "_local_db", local_db)
     return _handler
 
 
@@ -107,7 +134,7 @@ def build_runtime_core_direct_handler_from_settings(
     ml_gateway_url: str,
     timeout_sec: float = 20.0,
     http_post: Optional[Callable[..., Any]] = None,
-    direct_voice_enabled: bool = False,
+    direct_voice_enabled: bool = True,
     direct_asr_timeout_sec: Optional[float] = None,
     direct_asr_retries: int = 0,
 ) -> BridgeHandler:
@@ -140,15 +167,12 @@ def build_runtime_core_direct_handler_from_settings(
     _LOG.info("telegram_direct_runtime local_db_path=%s", cfg.local_db_path)
 
     asr_timeout = float(direct_asr_timeout_sec if direct_asr_timeout_sec is not None else timeout_sec)
-    if bool(direct_voice_enabled):
-        asr_client = GatewayAsrClient(
-            base_url=gateway_url,
-            timeout_sec=asr_timeout,
-            retries=int(direct_asr_retries),
-            http_post=http_post,
-        )
-    else:
-        asr_client = _UnsupportedDirectAsrClient()
+    asr_client = GatewayAsrClient(
+        base_url=gateway_url,
+        timeout_sec=asr_timeout,
+        retries=int(direct_asr_retries),
+        http_post=http_post,
+    )
     llm_client = _GatewayChatLlmClient(
         base_url=gateway_url,
         timeout_sec=float(timeout_sec),
@@ -328,11 +352,6 @@ class _StaticLLMClient:
         return out
 
 
-class _UnsupportedDirectAsrClient:
-    def transcribe(self, *args, **kwargs) -> str:
-        raise RuntimeError("direct_mode_voice_not_supported")
-
-
 class _GatewayChatLlmClient:
     def __init__(
         self,
@@ -452,7 +471,7 @@ class RuntimeBridge:
         timeout_sec: float = 20.0,
         http_post: Optional[Callable[..., Any]] = None,
         direct_handler: Optional[BridgeHandler] = None,
-        direct_voice_enabled: bool = False,
+        direct_voice_enabled: bool = True,
     ) -> None:
         # Compat execution path retired: bridge is direct-only.
         # Keep worker_command_url: execution still goes through organizer-worker /runtime/command.
@@ -463,6 +482,7 @@ class RuntimeBridge:
         self.http_post = http_post or requests.post
         self.direct_handler = direct_handler
         self.direct_voice_enabled = bool(direct_voice_enabled)
+        self.direct_local_db = getattr(direct_handler, "_local_db", None) if direct_handler is not None else None
 
     def _meeting_latest_url(self) -> str:
         url = str(self.worker_command_url or "").strip().rstrip("/")
@@ -500,6 +520,8 @@ class RuntimeBridge:
             return kind.capitalize()
 
         s = raw.replace("ё", "е").replace("Ё", "Е")
+        s = s.replace("→", " ")
+        s = re.sub(r"\s*-\>\s*", " ", s)
         s = re.sub(r"[\"'`]", " ", s)
         s = re.sub(
             r"\b(назначь|запланируй|поставь|сделай|создай|добавь|перенеси|сдвинь|поменяй|измени|нужно|надо|хочу)\b",
@@ -512,6 +534,12 @@ class RuntimeBridge:
         s = re.sub(r"\b(?:в|на|к)\s*\d{1,2}(?::\d{2})?\b", " ", s, flags=re.IGNORECASE)
         s = re.sub(r"\bна\s+\d+\s*(?:мин|минута|минуты|минут|час|часа|часов)\b", " ", s, flags=re.IGNORECASE)
         s = re.sub(r"\s+", " ", s).strip(" ,.-")
+        s = re.sub(
+            r"(?:\s*(?:\b(?:в|на|к)\s*\d{1,2}(?::\d{2})?\b|\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b|\b\d{4}-\d{2}-\d{2}\b))+\s*$",
+            "",
+            s,
+            flags=re.IGNORECASE,
+        ).strip(" ,.-")
         if not s:
             return kind.capitalize()
 
@@ -521,13 +549,29 @@ class RuntimeBridge:
         s = re.sub(r"^(?:созвон(?:а|е)?|звонок|колл)\b", "созвон", s, flags=re.IGNORECASE)
         s = re.sub(r"^мероприяти(?:е|я)\b", "мероприятие", s, flags=re.IGNORECASE)
         s = re.sub(
+            r"^(встреча|собрание|созвон|мероприятие)\s+\1\b",
+            r"\1",
+            s,
+            flags=re.IGNORECASE,
+        ).strip()
+        s = re.sub(
             r"^(встреча|собрание|созвон|мероприятие)\s+(?:встреч(?:а|у|е|и)|собрани(?:е|я|ю)|созвон(?:а|е)?|звонок|колл|мероприяти(?:е|я))\b",
             r"\1",
             s,
             flags=re.IGNORECASE,
         ).strip()
 
-        if re.match(r"^(встреча|собрание|созвон|мероприятие)\b", s, flags=re.IGNORECASE):
+        head_match = re.match(r"^(встреча|собрание|созвон|мероприятие)\b", s, flags=re.IGNORECASE)
+        if head_match:
+            head = str(head_match.group(1) or "").strip().lower()
+            if head != kind:
+                s = re.sub(
+                    r"^(встреча|собрание|созвон|мероприятие)\b",
+                    kind,
+                    s,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
             return s[:1].upper() + s[1:]
         return f"{kind.capitalize()} {s}".strip()
 
@@ -604,7 +648,7 @@ class RuntimeBridge:
         try:
             tz = ZoneInfo(str(timezone_name or "UTC"))
         except Exception:
-            tz = ZoneInfo("UTC")
+            tz = timezone.utc
         return datetime.fromisoformat(f"{date_ymd}T{time_hhmm}").replace(tzinfo=tz).isoformat()
 
     @staticmethod
@@ -699,6 +743,19 @@ class RuntimeBridge:
                     "source_event_id": str(source_payload.get("calendar_event_id") or ""),
                 },
             )
+            if reason == "sync_conflict" and isinstance(source_payload.get("conflict"), dict):
+                metadata = dict(req.metadata or {})
+                metadata["runtime_command"] = {
+                    "intent": "meeting.update",
+                    "entities": {
+                        "user_id": str(req.user_id or "").strip(),
+                        "text": text,
+                        "__sync_conflict": dict(source_payload.get("conflict")),
+                    },
+                    "confidence": 0.95,
+                    "rejected": False,
+                }
+                return replace(req, metadata=metadata), None
             if reason == "multiple":
                 candidates_raw = source_payload.get("candidates")
                 candidates_raw = candidates_raw if isinstance(candidates_raw, list) else []
@@ -898,84 +955,42 @@ class RuntimeBridge:
         return out
 
     @staticmethod
-    def _parse_human_date_to_iso(raw_text: Any, *, parser_source: str = "RuntimeBridge._parse_human_date_to_iso") -> str:
-        s = str(raw_text or "").strip().lower().replace("ё", "е")
-        s = re.sub(r"[,\u00a0]+", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        if not s:
+    def _command_value(command: Dict[str, Any], *keys: str) -> Any:
+        entities = RuntimeBridge._entities_from_command(command)
+        for key in keys:
+            if key in command and command.get(key) is not None:
+                return command.get(key)
+            if key in entities and entities.get(key) is not None:
+                return entities.get(key)
+        return None
+
+    def _task_duplicate_check_url(self) -> str:
+        base = str(self.worker_command_url or "").strip().rstrip("/")
+        if not base:
             return ""
-        base = date.today()
-        if s in {"сегодня", "today"}:
-            normalized = base.isoformat()
-            _LOG.info("temporal_date_parsed", extra={"raw_date_text": s, "normalized_date_result": normalized, "parser_source": parser_source})
-            return normalized
-        if s in {"завтра", "tomorrow"}:
-            normalized = date.fromordinal(base.toordinal() + 1).isoformat()
-            _LOG.info("temporal_date_parsed", extra={"raw_date_text": s, "normalized_date_result": normalized, "parser_source": parser_source})
-            return normalized
-        if s == "послезавтра":
-            normalized = date.fromordinal(base.toordinal() + 2).isoformat()
-            _LOG.info("temporal_date_parsed", extra={"raw_date_text": s, "normalized_date_result": normalized, "parser_source": parser_source})
-            return normalized
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-            _LOG.info("temporal_date_parsed", extra={"raw_date_text": s, "normalized_date_result": s, "parser_source": parser_source})
-            return s
-        m = re.fullmatch(r"(\d{1,2})[./-](\d{1,2})(?:[./-](\d{4}))?", s)
-        if m:
-            day = int(m.group(1))
-            month = int(m.group(2))
-            # day+month without year => current year
-            year = int(m.group(3)) if m.group(3) else int(base.year)
-            try:
-                normalized = datetime(year, month, day).date().isoformat()
-            except Exception:
-                normalized = ""
-            _LOG.info("temporal_date_parsed", extra={"raw_date_text": s, "normalized_date_result": normalized, "parser_source": parser_source})
-            return normalized
-        m2 = re.fullmatch(r"(\d{1,2})\s+([а-я]+)(?:\s+(\d{4}))?", s)
-        if m2:
-            day = int(m2.group(1))
-            month_token = str(m2.group(2) or "").strip().rstrip(".")
-            month = None
-            for stem, month_idx in _RU_MONTHS.items():
-                if month_token.startswith(stem):
-                    month = month_idx
-                    break
-            if month is None:
-                return ""
-            # day+month without year => current year
-            year = int(m2.group(3)) if m2.group(3) else int(base.year)
-            try:
-                normalized = datetime(year, month, day).date().isoformat()
-            except Exception:
-                normalized = ""
-            _LOG.info("temporal_date_parsed", extra={"raw_date_text": s, "normalized_date_result": normalized, "parser_source": parser_source})
-            return normalized
-        return ""
+        if base.endswith("/runtime/command"):
+            return base[: -len("/runtime/command")] + "/runtime/task/check_duplicate_create"
+        return base + "/runtime/task/check_duplicate_create"
+
+    @staticmethod
+    def _parse_human_date_to_iso(raw_text: Any, *, parser_source: str = "RuntimeBridge._parse_human_date_to_iso") -> str:
+        resolution = resolve_date_phrase(str(raw_text or ""), now=datetime.combine(date.today(), datetime.min.time()))
+        _LOG.info(
+            "temporal_date_parsed",
+            extra={
+                "raw_date_text": str(raw_text or "").strip(),
+                "normalized_date_result": str(resolution.date or ""),
+                "parser_source": parser_source,
+                "resolver_reason": str(resolution.reason or ""),
+                "needs_clarification": bool(resolution.needs_clarification),
+            },
+        )
+        return str(resolution.date or "")
 
     @staticmethod
     def _extract_explicit_date_from_text(raw_text: Any) -> str:
-        s = str(raw_text or "").strip().lower().replace("ё", "е")
-        s = re.sub(r"[,\u00a0]+", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        if not s:
-            return ""
-        for pattern in (
-            r"\b(сегодня|завтра|послезавтра)\b",
-            r"\b\d{4}-\d{2}-\d{2}\b",
-            r"\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{4})?\b",
-            r"\b\d{1,2}\s+[а-яё]+(?:\s+\d{4})?\b",
-        ):
-            m = re.search(pattern, s)
-            if not m:
-                continue
-            parsed = RuntimeBridge._parse_human_date_to_iso(
-                m.group(0),
-                parser_source="RuntimeBridge._extract_explicit_date_from_text",
-            )
-            if parsed:
-                return parsed
-        return ""
+        resolution = extract_date_resolution(raw_text, now=datetime.combine(date.today(), datetime.min.time()))
+        return str(resolution.date or "")
 
     @staticmethod
     def _normalize_time_hhmm(value: Any) -> str:
@@ -1036,7 +1051,7 @@ class RuntimeBridge:
             or ""
         ).strip()
         explicit_date_from_text = RuntimeBridge._extract_explicit_date_from_text(source_text)
-        if explicit_date_from_text:
+        if explicit_date_from_text and not prefer_draft:
             date_raw = explicit_date_from_text
 
         date_ymd = RuntimeBridge._normalize_date_ymd(date_raw)
@@ -1057,13 +1072,15 @@ class RuntimeBridge:
             try:
                 tz = ZoneInfo(tz_name)
             except Exception:
-                tz = ZoneInfo("UTC")
+                tz = timezone.utc
             try:
                 dt = datetime.fromisoformat(f"{date_ymd}T{time_hhmm}").replace(tzinfo=tz)
                 out["start_at"] = dt.isoformat()
             except Exception:
                 out["start_at"] = f"{date_ymd}T{time_hhmm}"
-        return out
+        normalized = normalize_temporal_fields({"entities": out}, now=datetime.combine(date.today(), datetime.min.time()))
+        entities_normalized = normalized.get("entities")
+        return dict(entities_normalized) if isinstance(entities_normalized, dict) else out
 
     @staticmethod
     def _is_calendar_commit_ok(payload: Dict[str, Any]) -> bool:
@@ -1086,6 +1103,10 @@ class RuntimeBridge:
             "meeting.update",
             "meeting_update",
             "reschedule_meeting",
+            "timeblock.update",
+            "timeblock_update",
+            "timeblock.move",
+            "move_timeblock",
             "block.create",
         }
 
@@ -1116,6 +1137,15 @@ class RuntimeBridge:
             "block.create",
         }:
             return "timeblock.create"
+        if normalized in {
+            "timeblock.update",
+            "timeblock_update",
+            "timeblock.move",
+            "move_timeblock",
+            "update_timeblock",
+            "block.update",
+        }:
+            return "timeblock.update"
         if normalized in {"meeting.comment.update", "meeting_comment_update"}:
             return "meeting.comment.update"
         if normalized in {"task.comment.update", "task_comment_update"}:
@@ -1156,13 +1186,47 @@ class RuntimeBridge:
         user_id = str(req.user_id or "").strip()
         if user_id and not str(entities.get("user_id") or "").strip():
             entities["user_id"] = user_id
+        normalized_command = normalize_temporal_fields(
+            {"intent": intent, "entities": entities, "text": entities.get("text") or req.text or ""},
+            now=datetime.combine(date.today(), datetime.min.time()),
+        )
+        entities = dict(normalized_command.get("entities") or entities)
         if self._is_temporal_intent(intent):
             entities = self._normalize_temporal_entities(
                 entities,
                 timezone_name=str(req.timezone or "UTC"),
                 command=command,
             )
+        if intent == "task.create":
+            raw_due_date = str(command.get("due_date") or entities.get("due_date") or entities.get("date") or entities.get("when") or "").strip()
+            raw_planned_at = str(command.get("planned_at") or entities.get("planned_at") or "").strip()
+            resolved_due_date = str(entities.get("due_date") or "").strip()
+            resolved_planned_at = str(entities.get("planned_at") or "").strip()
+            if resolved_planned_at:
+                entities["planned_at"] = resolved_planned_at
+            else:
+                entities["planned_at"] = None
+            if resolved_due_date:
+                entities["due_date"] = resolved_due_date
+            _LOG.info(
+                "task_create_date_resolution",
+                extra={
+                    "request_id": req.request_id,
+                    "flow_id": req.request_id,
+                    "source": "runtime_bridge",
+                    "intent": intent,
+                    "raw_text": str(entities.get("text") or req.text or ""),
+                    "raw_due_date": raw_due_date,
+                    "extracted_date": str(resolved_due_date or ""),
+                    "resolved_planned_at": str(resolved_planned_at or ""),
+                    "planned_at": str(entities.get("planned_at") or ""),
+                    "summary_planned_at": str(entities.get("planned_at") or ""),
+                    "persisted_planned_at": "",
+                },
+            )
         if intent in {"meeting.create", "meeting.update"}:
+            raw_intent = str(command.get("intent") or "").strip().lower()
+            meeting_kind_locked = bool(command.get("__meeting_kind_locked"))
             source_text = str(
                 entities.get("text")
                 or command.get("__source_text")
@@ -1170,7 +1234,13 @@ class RuntimeBridge:
                 or ""
             ).strip()
             meeting_kind = str(entities.get("meeting_kind") or entities.get("event_kind") or "").strip().lower()
-            if not meeting_kind:
+            if not meeting_kind and intent == "meeting.update":
+                meeting_kind = self._extract_meeting_kind(source_text)
+            if not meeting_kind and raw_intent == "schedule_call":
+                meeting_kind = "созвон"
+            if not meeting_kind and raw_intent in {"schedule_meeting", "create_meeting", "meeting_create"}:
+                meeting_kind = "встреча"
+            if not meeting_kind and not meeting_kind_locked:
                 meeting_kind = self._extract_meeting_kind(source_text)
             if meeting_kind:
                 entities["meeting_kind"] = meeting_kind
@@ -1236,6 +1306,143 @@ class RuntimeBridge:
                 "status_code": status_code,
             }
         return body if isinstance(body, dict) else {"outcome": "direct_invalid_payload"}
+
+    @staticmethod
+    def _clarification_context_key(req: TelegramRuntimeRequest) -> str:
+        chat_id = str(req.chat_id or req.user_id or "").strip()
+        return (
+            f"{req.app_id or 'default_app'}::{req.tenant_id or 'default_tenant'}::"
+            f"{req.channel or 'unknown'}::{chat_id}::{req.user_id or ''}"
+        )
+
+    @staticmethod
+    def _task_create_duplicate_question(existing_task: Dict[str, Any]) -> str:
+        duplicate_date = str(existing_task.get("planned_at") or "").strip()
+        duplicate_parent = str(existing_task.get("parent_task_id") or "").strip()
+        if duplicate_date:
+            lead_text = f"Похоже, такая задача уже есть на {duplicate_date[:10]}"
+        elif duplicate_parent:
+            lead_text = "Такая задача уже есть без срока"
+        else:
+            lead_text = "Такая задача уже есть в InBox"
+        return (
+            f"{lead_text}:\n"
+            f"№ {str(existing_task.get('id') or '').strip() or '-'} — {str(existing_task.get('title') or '').strip() or '-'}\n\n"
+            "Создать ещё одну?"
+        )
+
+    def _precheck_task_create_duplicate_confirmation(
+        self,
+        req: TelegramRuntimeRequest,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not self.worker_command_url:
+            return payload
+        rec = payload.get("rec") if isinstance(payload.get("rec"), dict) else {}
+        missing_field = str(rec.get("missing_field") or payload.get("missing_field") or "").strip()
+        if missing_field != _TASK_CREATE_CONFIRM_FIELD:
+            return payload
+        command = payload.get("command") if isinstance(payload.get("command"), dict) else {}
+        if str(command.get("intent") or "").strip().lower() != "task.create":
+            return payload
+        if bool(command.get("__task_create_confirmed")):
+            return payload
+
+        title = str(self._command_value(command, "title", "task_title", "text") or "").strip()
+        planned_at = self._command_value(command, "planned_at", "due_date", "due_at", "date", "when")
+        planned_at_text = str(planned_at or "").strip()
+        if not str(req.user_id or "").strip() or not title:
+            return payload
+        parent_task_explicit = bool(self._command_value(command, "parent_task_explicit"))
+        parent_task_id: int | None = None
+        if parent_task_explicit:
+            raw_parent_task_id = self._command_value(command, "parent_task_id")
+            if str(raw_parent_task_id or "").strip():
+                try:
+                    parent_task_id = int(raw_parent_task_id)
+                except Exception:
+                    return payload
+        try:
+            response = self.http_post(
+                self._task_duplicate_check_url(),
+                json={
+                    "user_id": str(req.user_id or "").strip(),
+                    "title": title,
+                    "planned_at": (planned_at_text or None),
+                    "parent_task_id": parent_task_id,
+                },
+                timeout=self.timeout_sec,
+            )
+        except Exception:
+            return payload
+        status_code = getattr(response, "status_code", None)
+        try:
+            body = response.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict) or (isinstance(status_code, int) and status_code >= 400):
+            return payload
+        existing_task = body.get("existing_task") if isinstance(body.get("existing_task"), dict) else {}
+        if not bool(body.get("duplicate_found")) or not existing_task:
+            return payload
+        wrapped_response = {
+            "clarifying_question": self._task_create_duplicate_question(existing_task),
+            "user_message": self._task_create_duplicate_question(existing_task),
+            "debug": {
+                "duplicate_found": True,
+                "existing_task": existing_task,
+            },
+        }
+        return self._wrap_task_create_duplicate_confirmation(req, payload, wrapped_response)
+
+    def _wrap_task_create_duplicate_confirmation(
+        self,
+        req: TelegramRuntimeRequest,
+        payload: Dict[str, Any],
+        worker_response: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        question = _first_non_empty_text(
+            worker_response.get("clarifying_question"),
+            worker_response.get("user_message"),
+        ) or "Похоже, такая задача уже есть. Создать ещё одну?"
+        command = payload.get("command") if isinstance(payload.get("command"), dict) else {}
+        command = dict(command)
+        entities = command.get("entities")
+        entities = dict(entities) if isinstance(entities, dict) else {}
+        entities["duplicate_check_override"] = True
+        command["entities"] = entities
+        command["duplicate_check_override"] = True
+        debug = worker_response.get("debug") if isinstance(worker_response.get("debug"), dict) else {}
+        existing_task = debug.get("existing_task") if isinstance(debug.get("existing_task"), dict) else {}
+        if existing_task:
+            command["__task_create_duplicate_existing_task"] = dict(existing_task)
+
+        local_db = self.direct_local_db
+        if local_db is not None:
+            local_db.upsert_clarification_session(
+                context_key=self._clarification_context_key(req),
+                app_id=str(req.app_id or ""),
+                tenant_id=str(req.tenant_id or ""),
+                user_id=str(req.user_id or ""),
+                intent=str(command.get("intent") or "task.create"),
+                payload=command,
+                missing_field=_TASK_CREATE_DUPLICATE_CONFIRM_FIELD,
+                source_message_id=str(req.source_message_id or "") or None,
+                idempotency_key=str(req.request_id or "") or None,
+            )
+
+        return {
+            "outcome": "rec_needs_clarification",
+            "needs_clarification": True,
+            "clarifying_question": question,
+            "user_message": question,
+            "rec": {
+                "outcome": "needs_clarification",
+                "needs_clarification": True,
+                "missing_field": _TASK_CREATE_DUPLICATE_CONFIRM_FIELD,
+            },
+            "command": command,
+        }
 
     def _commit_temporal(self, req: TelegramRuntimeRequest, payload: Dict[str, Any]) -> Dict[str, Any]:
         command = payload.get("command") if isinstance(payload.get("command"), dict) else {}
@@ -1323,7 +1530,27 @@ class RuntimeBridge:
             bool(str(req.text or "").strip()),
             req.audio_bytes is not None,
         )
-        return self._process_direct(req)
+        result = self._process_direct(req)
+        payload = result.raw_runtime_payload if isinstance(result.raw_runtime_payload, dict) else {}
+        command = payload.get("command") if isinstance(payload.get("command"), dict) else {}
+        rec = payload.get("rec") if isinstance(payload.get("rec"), dict) else {}
+        state_family = str(
+            rec.get("missing_field")
+            or payload.get("missing_field")
+            or payload.get("state")
+            or ""
+        ).strip()
+        _LOG.info(
+            "runtime_response_built",
+            extra={
+                "trace_id": str(req.request_id or ""),
+                "idempotency_key": _safe_idempotency_key(str(req.request_id or "")),
+                "state_family": state_family,
+                "intent": str(command.get("intent") or ""),
+                "response_kind": str(result.outcome or ""),
+            },
+        )
+        return result
 
     @staticmethod
     def _is_voice_only_request(req: TelegramRuntimeRequest) -> bool:
@@ -1470,18 +1697,23 @@ class RuntimeBridge:
                     "download_failed": True,
                 },
             )
-        if voice_only:
-            if not voice_direct_enabled:
-                return TelegramRuntimeResult(
-                    outcome="direct_voice_not_supported",
-                    reply_text=_DIRECT_VOICE_NOT_SUPPORTED_REPLY,
-                    telemetry={"mode": self.mode, "voice_direct_supported": False},
-                )
         if self.direct_handler is None:
             return TelegramRuntimeResult(
                 outcome="direct_mode_not_ready",
                 reply_text="Режим runtime_core_direct пока не подключен в этом окружении.",
                 telemetry={"mode": self.mode},
+            )
+        if voice_only:
+            _LOG.info(
+                "voice_routed_to_runtime",
+                extra={
+                    "request_id": req.request_id,
+                    "user_id": req.user_id,
+                    "trace_id": req.request_id,
+                    "audio_present": req.audio_bytes is not None,
+                    "audio_len": len(req.audio_bytes) if req.audio_bytes else 0,
+                    "voice_direct_enabled": voice_direct_enabled,
+                },
             )
         req_for_handler, prebuilt_result = self._maybe_enrich_request_for_meeting_update(req)
         if prebuilt_result is not None:
@@ -1492,12 +1724,21 @@ class RuntimeBridge:
             _LOG.exception("telegram_direct_bridge request_failed: %s", str(exc))
             return self._bridge_error_result(reason="direct_runtime_error", req=req, details=str(exc))
         payload_dict = payload if isinstance(payload, dict) else {"outcome": "direct_invalid_payload"}
+        payload_dict = self._precheck_task_create_duplicate_confirmation(req, payload_dict)
         if self._is_execution_candidate(payload_dict):
             command = payload_dict.get("command") if isinstance(payload_dict.get("command"), dict) else {}
             if self._is_temporal_intent(str(command.get("intent") or "")):
                 payload_dict = self._commit_temporal(req, payload_dict)
             else:
                 payload_dict = self._execute_runtime_command(req, payload_dict)
+                worker_debug = payload_dict.get("debug") if isinstance(payload_dict.get("debug"), dict) else {}
+                if (
+                    str(command.get("intent") or "").strip().lower() == "task.create"
+                    and bool(payload_dict.get("needs_clarification"))
+                    and str(payload_dict.get("missing_field") or "").strip() == _TASK_CREATE_DUPLICATE_CONFIRM_FIELD
+                    and bool(worker_debug.get("duplicate_found"))
+                ):
+                    payload_dict = self._wrap_task_create_duplicate_confirmation(req, payload, payload_dict)
         result = self._from_runtime_payload(payload_dict, fallback_outcome="direct_processed")
         if voice_only:
             telemetry = dict(result.telemetry or {})
@@ -1508,5 +1749,9 @@ class RuntimeBridge:
                 req.request_id,
                 result.outcome,
             )
-            return replace(result, telemetry=telemetry)
+            return replace(
+                result,
+                outcome="direct_processed" if result.outcome == "rec_needs_clarification" else result.outcome,
+                telemetry=telemetry,
+            )
         return result

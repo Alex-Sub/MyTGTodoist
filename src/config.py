@@ -15,7 +15,6 @@ class Settings(BaseSettings):
     log_path: str = "logs/app.log"
     base_url: str = "https://example.com"
     webhook_path: str = "/telegram/webhook"
-    ml_core_url: str = "http://host.docker.internal:19000"
     asr_service_url_legacy: str = ""
     google_client_id: str = ""
     google_client_secret: str = ""
@@ -42,6 +41,12 @@ class Settings(BaseSettings):
     google_sheets_pull_interval_sec: int = 180
     google_sheets_spreadsheet_id: str = ""
     google_sheets_range: str = "Tasks!A1:Z"
+    google_sheets_sync_enabled: bool = False
+    google_sheets_sync_interval_sec: int = 300
+    google_sheets_sync_dry_run: bool = False
+    google_sheets_calendar_past_days: int = 30
+    google_sheets_calendar_future_days: int = 60
+    google_sync_http_port: int = 8010
     google_vitrina_sheet_name: str = "VITRINA_TASKS"
     google_ops_log_sheet_name: str = "OPS_LOG"
     google_vitrina_refresh_interval_sec: int = 3600

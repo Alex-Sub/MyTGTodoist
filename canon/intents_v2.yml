@@ -71,9 +71,30 @@ intents:
   task.create:
     required: ["entities.title"]
     question_on_missing: "Как назвать задачу?"
-    notes: "planned_at и source_msg_id опциональны."
+    notes: "planned_at, source_msg_id и parent_task_id опциональны."
+
+  task.start:
+    meaning: "Взять задачу в работу (перевести в IN_PROGRESS)"
+    required_any:
+      - "entities.task_id"
+      - "entities.task_ref"
+    question_on_missing: "Какую задачу взять в работу?"
+    disambiguation:
+      ref: "entities.task_ref"
+      question_fallback: "Какую именно задачу взять в работу?"
+
+  task.pause:
+    meaning: "Поставить задачу на паузу (перевести в PAUSED)"
+    required_any:
+      - "entities.task_id"
+      - "entities.task_ref"
+    question_on_missing: "Какую задачу поставить на паузу?"
+    disambiguation:
+      ref: "entities.task_ref"
+      question_fallback: "Какую именно задачу поставить на паузу?"
 
   task.complete:
+    meaning: "Завершить задачу (перевести в DONE)"
     required_any:
       - "entities.task_id"
       - "entities.task_ref"
@@ -123,6 +144,21 @@ intents:
       ref: "entities.task_ref"
       question_fallback: "Какую именно задачу обновить?"
 
+  task.parent.update:
+    meaning: "Перенести задачу под другую родительскую задачу"
+    required_any:
+      - "entities.task_id"
+      - "entities.task_ref"
+    required: ["entities.parent_task_id"]
+    question_priority:
+      - if_missing: "entities.task_id|entities.task_ref"
+        ask: "Какую задачу перенести под родителя?"
+      - if_missing: "entities.parent_task_id"
+        ask: "Под какую родительскую задачу перенести?"
+    disambiguation:
+      ref: "entities.task_ref"
+      question_fallback: "Какую именно задачу перенести под родителя?"
+
   task.move_to:
     meaning: "Переместить задачу в структуру (проект/цикл/цель/родитель)"
     required_any:
@@ -153,6 +189,60 @@ intents:
       - "entities.subtask_id"
       - "entities.subtask_ref"
     question_on_missing: "Какую подзадачу завершить?"
+
+  meeting.create:
+    meaning: "Создать самостоятельную встречу/событие в календаре"
+    required: ["entities.start_at", "entities.duration_minutes|entities.duration_min", "entities.user_id"]
+    question_priority:
+      - if_missing: "entities.duration_minutes|entities.duration_min"
+        ask: "На сколько минут запланировать встречу?"
+      - if_missing: "entities.start_at"
+        ask: "На какое время запланировать встречу?"
+      - if_missing: "entities.user_id"
+        ask: "Не удалось определить пользователя для создания встречи."
+
+  meeting.update:
+    meaning: "Перепланировать существующую встречу/событие в календаре"
+    required: ["entities.user_id"]
+    required_one_of_fields:
+      - "entities.start_at"
+      - "entities.start_at_date"
+      - "entities.date"
+      - "entities.start_at_time"
+      - "entities.time"
+      - "entities.duration_minutes"
+      - "entities.duration_min"
+    question_priority:
+      - if_missing: "entities.user_id"
+        ask: "Не удалось определить пользователя для изменения встречи."
+      - if_missing: "entities.start_at|entities.start_at_date|entities.date|entities.start_at_time|entities.time|entities.duration_minutes|entities.duration_min"
+        ask: "Что изменить во встрече: дату, время или длительность?"
+
+  meeting.comment.update:
+    meaning: "Изменить комментарий встречи в календаре"
+    required: ["entities.user_id", "entities.calendar_event_id", "entities.comment_text|entities.comment|entities.description|entities.notes"]
+    question_priority:
+      - if_missing: "entities.user_id"
+        ask: "Не удалось определить пользователя для изменения встречи."
+      - if_missing: "entities.calendar_event_id"
+        ask: "Уточните, какую встречу нужно изменить."
+      - if_missing: "entities.comment_text|entities.comment|entities.description|entities.notes"
+        ask: "Какой комментарий добавить во встречу?"
+
+  task.comment.update:
+    meaning: "Изменить комментарий задачи"
+    required_any:
+      - "entities.task_id"
+      - "entities.task_ref"
+    required: ["entities.comment_text|entities.comment|entities.description|entities.notes"]
+    question_priority:
+      - if_missing: "entities.task_id|entities.task_ref"
+        ask: "Какую задачу нужно изменить?"
+      - if_missing: "entities.comment_text|entities.comment|entities.description|entities.notes"
+        ask: "Какой комментарий добавить к задаче?"
+    disambiguation:
+      ref: "entities.task_ref"
+      question_fallback: "Какую именно задачу нужно изменить?"
 
   timeblock.create:
     meaning: "Создать блок времени для задачи"

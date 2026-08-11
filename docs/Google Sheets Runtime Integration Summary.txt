@@ -1,0 +1,246 @@
+MyTGTodoist — Google Sheets Runtime Integration Summary
+Текущий статус
+
+Google Sheets интеграция работает как отдельный operational UI поверх runtime-системы.
+
+Главный принцип:
+
+Runtime DB = source of truth
+Google Sheets = operational/read-review interface
+
+Прямых записей из Sheets в SQLite нет.
+
+Архитектура
+Основной flow
+runtime DB
+  -> google-sync
+  -> Google Sheets
+
+Google Sheets edits
+  -> reverse review
+  -> operator apply by ChangeId
+  -> organizer-worker /runtime/command
+  -> runtime DB
+  -> export back to Sheets
+Канонические вкладки Google Sheets
+Задачи
+
+Главный task screen.
+
+Содержит:
+
+активные задачи
+planned/unplanned
+статус
+комментарии
+linked blocks count
+timestamps
+
+Поддерживает:
+
+review
+task apply by ChangeId
+InBox
+
+Только triage/unplanned задачи.
+
+Логика:
+
+not DONE/ARCHIVED/CANCELED
+no planned_at
+no parent_id
+no linked time blocks
+Календарь
+
+Read-only unified calendar projection.
+
+Источники:
+
+runtime time_blocks
+live Google Calendar events
+runtime-known meeting refs only when safely identifiable
+
+Типы:
+
+Блок времени
+Встреча
+Событие календаря
+
+Stable IDs:
+
+timeblock:
+meeting_event:<calendar_event_id>
+external_event:<google_event_id>
+
+Apply для календаря заблокирован.
+
+Логи
+
+Bounded operational log sheet.
+
+Хранит:
+
+sync результаты
+created/updated/skipped
+recent exporter activity
+Runtime Sheets Sync
+Канонический exporter
+
+Файл:
+
+src/google/runtime_sheets_sync.py
+
+Использует:
+
+src/google/unified_calendar_export.py
+
+Работает только:
+
+runtime DB -> Sheets
+Reverse Sync
+Review-only слой
+
+Файл:
+
+src/google/runtime_sheets_reverse_sync.py
+
+Команды:
+
+python -m src.google.runtime_sheets_reverse_sync --review
+python -m src.google.runtime_sheets_reverse_sync --review --output review.json
+
+Классификации:
+
+proposed
+confirm_required
+conflict
+invalid
+Apply
+Разрешено только для task changes
+
+CLI:
+
+python -m src.google.runtime_sheets_reverse_sync --apply review.json --change-id CHG-001
+
+Поддержано:
+
+Задача -> task.update
+Комментарий -> task.comment.update
+Статус -> task.set_status
+
+Apply идет через:
+
+organizer-worker /runtime/command
+
+Прямых DB writes нет.
+
+Что заблокировано
+Calendar apply
+
+НЕ поддерживается:
+
+meetings
+timeblocks
+calendar events
+recurring events
+
+Calendar сейчас:
+
+read-only projection
+Telegram
+Команда
+/sheets_review
+
+Read-only summary.
+
+Возвращает:
+
+total
+proposed
+confirm_required
+conflict
+invalid
+первые изменения
+
+НЕ делает:
+
+apply
+DB writes
+worker mutation
+VPS
+Активный env
+deploy/tenants/.env.alexey
+
+.env.prod не является активным tenant env для production VPS.
+
+Internal review endpoint
+http://google-sync:8010/review
+http://google-sync:8010/health
+
+Порт:
+
+8010
+Google Sheets Formatting
+
+Применяется только к canonical tabs:
+
+Задачи
+InBox
+Календарь
+Логи
+
+Есть:
+
+freeze header
+filters
+auto-resize columns
+
+Deprecated tabs:
+
+RuntimeTasks
+RuntimeTimeBlocks
+
+не считаются canonical.
+
+Current VPS State
+
+Проверено на VPS:
+
+Задачи: 43
+InBox: 40
+Календарь: 30
+Логи: active
+
+Календарь:
+
+1 runtime time block
+29 external Google Calendar events
+0 meeting_event rows currently
+Operator Scripts
+Review/apply
+.\scripts\sheets_review_apply.ps1 -Mode review
+.\scripts\sheets_review_apply.ps1 -Mode apply -ChangeId chg-00001
+
+Особенности:
+
+explicit ChangeId required
+no bulk apply by default
+calendar apply blocked
+Проверенные guardrails
+
+Подтверждено:
+
+no direct SQLite writes from Sheets
+no calendar apply
+no bulk apply
+no Sheets -> DB automatic mutation
+runtime DB remains source of truth
+Следующие логичные этапы
+Возможные next steps
+Better meeting runtime read model
+Calendar review-only conflict analysis
+Apps Script UX
+Telegram review improvements
+Better calendar categorization
+Audit/history for apply operations
+Safe bulk task apply with review gates

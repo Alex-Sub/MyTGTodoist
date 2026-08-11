@@ -1,4 +1,10 @@
 services:
   telegram-bot:
+    # NOTE: Docker log rotation enabled to prevent disk overflow on VPS
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
-      WORKER_COMMAND_URL: http://organizer-worker-verify:8002
+      WORKER_COMMAND_URL: http://organizer-worker-verify:8002/runtime/command
