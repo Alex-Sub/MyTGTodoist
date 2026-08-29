@@ -1,3 +1,4 @@
+import concurrent.futures
 import json
 import sqlite3
 import sys
@@ -114,6 +115,26 @@ def test_restart_replay_uses_durable_dedup(runtime_db: Path) -> None:
     assert status == 200
     assert replay["outcome"] == "duplicate"
     assert replay["result_identity"] == first["result_identity"]
+    with sqlite3.connect(str(runtime_db)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+
+
+def test_same_key_concurrency_is_serialized(runtime_db: Path) -> None:
+    payload = _payload(key="telegram:mytg:concurrent")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(worker._runtime_response, [payload] * 8))
+
+    assert all(status == 200 for status, _ in results)
+    assert sorted(response["outcome"] for _, response in results) == [
+        "duplicate",
+        "duplicate",
+        "duplicate",
+        "duplicate",
+        "duplicate",
+        "duplicate",
+        "duplicate",
+        "succeeded",
+    ]
     with sqlite3.connect(str(runtime_db)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
 
