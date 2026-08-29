@@ -31,7 +31,9 @@ def _connect(db_path: str) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    # Journal mode is a database-level setting.  It is initialized during
+    # worker startup; changing it while concurrent request connections open
+    # can itself raise ``database is locked`` before busy_timeout applies.
     conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
