@@ -17,6 +17,9 @@ import urllib.request
 
 import requests
 
+from runtime_server import runtime_command_response
+from shared_runtime import ensure_runtime_schema
+
 
 _SRC_DIR = Path(__file__).resolve().parent / "src"
 _P2_RUNTIME_PATH = _SRC_DIR / "p2_tasks_runtime.py"
@@ -639,6 +642,7 @@ def _init_db() -> None:
         conn.executescript(sql)
         conn.commit()
         _apply_sql_migrations(conn)
+        ensure_runtime_schema(DB_PATH)
         columns_q = {as_dict(row).get("name") for row in conn.execute("PRAGMA table_info(inbox_queue)").fetchall()}
         if "ingested_at" not in columns_q:
             conn.execute("ALTER TABLE inbox_queue ADD COLUMN ingested_at TEXT")
@@ -1801,6 +1805,59 @@ def cmd_create_task(
     return _p2_task_row(task.id)
 
 
+def _runtime_dispatch_intent(intent: str, entities: dict[str, Any]) -> dict[str, Any]:
+    """Adapt the narrow PAP domain command to the existing P2 task runtime."""
+
+    intent_norm = str(intent or "").strip().lower()
+    if intent_norm != "task.create":
+        raise ValueError(f"unsupported runtime intent: {intent_norm or 'empty'}")
+    title = str(entities.get("title") or entities.get("text") or "").strip()
+    if not title:
+        raise ValueError("task title is required")
+    source_msg_id = str(entities.get("source_msg_id") or "").strip() or None
+    parent_type = entities.get("parent_type")
+    parent_id = entities.get("parent_id")
+    result = cmd_create_task(
+        title,
+        source_msg_id=source_msg_id,
+        parent_type=parent_type,
+        parent_id=parent_id,
+    )
+    return {
+        "entity_type": "task",
+        "entity_id": str(result["id"]),
+        "data": result,
+    }
+
+
+def _runtime_recover_result(intent: str, entities: dict[str, Any]) -> dict[str, Any] | None:
+    """Recover a committed task if a worker died after domain commit."""
+
+    if str(intent or "").strip().lower() != "task.create":
+        return None
+    source_msg_id = str(entities.get("source_msg_id") or "").strip()
+    if not source_msg_id:
+        return None
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE source_msg_id = ? ORDER BY id ASC LIMIT 1",
+            (source_msg_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    result = _p2_task_row(int(row["id"]))
+    return {"entity_type": "task", "entity_id": str(result["id"]), "data": result}
+
+
+def _runtime_response(data: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    return runtime_command_response(
+        data,
+        db_path=DB_PATH,
+        dispatch_intent=_runtime_dispatch_intent,
+        recover_result=_runtime_recover_result,
+    )
+
+
 def cmd_create_subtask(
     task_id: int,
     title: str,
@@ -2396,6 +2453,10 @@ class _CommandHandler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802 - stdlib API
         try:
             data = self._read_json()
+            if self.path == "/runtime/command":
+                status, res = _runtime_response(data)
+                self._send_json(status, res)
+                return
             if self.path == "/p2/commands/create_task":
                 res = cmd_create_task(
                     data.get("title") or "",
